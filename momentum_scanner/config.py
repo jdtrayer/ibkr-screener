@@ -108,8 +108,10 @@ FLOAT_HARD_REJECT = False  # False = flag oversized/unknown float, True = drop
 # --------------------------------------------------------------------------
 # Halt detection
 # --------------------------------------------------------------------------
-# Generic tick type 49 = "Halted": 0 not halted, 1 general halt, 2 volatility halt.
-HALTED_GENERIC_TICK = "49"
+# Tick type 49 = "Halted": 0 not halted, 1 general halt, 2 volatility halt.
+# TWS pushes this automatically on a subscribed symbol when it applies -- it is NOT
+# requestable via reqMktData's genericTickList (doing so gets the whole request
+# rejected with error 321), so there is no config knob for it beyond this comment.
 HALT_RESUME_RECENT_MIN = 15  # flag as "recently resumed" for this many minutes after resume
 
 # --------------------------------------------------------------------------

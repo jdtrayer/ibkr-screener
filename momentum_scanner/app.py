@@ -132,7 +132,10 @@ class ScannerApp:
         contract = qualified[0]
         state.conid = contract.conId
 
-        ticker = self.ib.reqMktData(contract, genericTickList=config.HALTED_GENERIC_TICK, snapshot=False)
+        # Halted status (tick 49) is pushed automatically by TWS whenever it applies --
+        # it cannot be requested via genericTickList (IB rejects the whole reqMktData
+        # call with error 321 if you try), so no generic ticks need to be requested here.
+        ticker = self.ib.reqMktData(contract, snapshot=False)
         state.live_subscribed = True
 
         def on_tick(t: Ticker, _state=state):
