@@ -67,6 +67,13 @@ HISTORICAL_FETCH_CONCURRENCY = 5
 # margin against "Historical Market Data Service error - pacing violation".
 HISTORICAL_FETCH_MIN_INTERVAL_SEC = 1.5
 
+# A reqHistoricalData call can time out or come back empty under IB's own
+# pacing/load (no exception raised -- just an empty result), so each
+# baseline fetch gets a few attempts with a pause between them before we
+# give up and leave that symbol without an RVOL baseline this cycle.
+RVOL_FETCH_MAX_ATTEMPTS = 3
+RVOL_FETCH_RETRY_DELAY_SEC = 5.0
+
 # Minimum number of historical days that must have data in a given 5-min
 # bucket before we trust the baseline for that bucket. Early in a session,
 # thinly-traded buckets can otherwise produce a near-zero baseline and an
