@@ -7,7 +7,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import config, spikes
-from .filters import check_dollar_volume, check_float, check_spread
+from .filters import check_spread, display_reason
 from .models import SymbolState
 from .session import Session
 from .tunables import Tunables
@@ -63,16 +63,7 @@ def render(states: list[SymbolState], session: Session, connected: bool, tunable
         reverse=True,
     )
     def _passes(s: SymbolState) -> bool:
-        if s.rvol is None or s.rvol < config.RVOL_DISPLAY_FLOOR:
-            return False
-        if not check_dollar_volume(s):  # base $ volume floor -- always a hard gate
-            return False
-        spread_ok, _ = check_spread(s)
-        if not spread_ok:  # only False when SPREAD_HARD_REJECT is on and over threshold
-            return False
-        if not check_float(s):  # only False when FLOAT_HARD_REJECT is on and over ceiling
-            return False
-        return True
+        return display_reason(s) is None
 
     ranked = [s for s in ranked if _passes(s)]
     ranked = ranked[: config.TOP_DISPLAY_ROWS]

@@ -16,7 +16,7 @@ from textual.widgets import Footer, Header, Static
 
 from . import config, display, floatref, rvol, spikes
 from .controls import TunablesPanel
-from .filters import PersistenceTracker, update_halt_state
+from .filters import PersistenceTracker, display_reason, update_halt_state
 from .models import SymbolState
 from .scanner import ScannerManager
 from .session import Session, current_session
@@ -47,6 +47,8 @@ class ScannerApp(App):
         self.session: Session = Session.CLOSED
         self._pending_hits: dict = {}
         self._tick_count = 0
+        self._logged_no_slot: set[str] = set()
+        self._filter_reasons: dict[str, str | None] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -82,6 +84,7 @@ class ScannerApp(App):
 
         self._process_pending_hits()
         self._evict_unqualified()
+        self._log_filter_transitions()
         self._render()
 
     def _render(self) -> None:
@@ -106,8 +109,10 @@ class ScannerApp(App):
         for symbol in qualified:
             if symbol in self.states:
                 self.states[symbol].scan_rank = hits[symbol].rank if symbol in hits else self.states[symbol].scan_rank
+                self._logged_no_slot.discard(symbol)
                 continue
             if len(self.states) >= config.MAX_LIVE_SYMBOLS:
+                self._log_no_slot(symbol)
                 continue  # no room; will retry next cycle after eviction
             hit = hits.get(symbol)
             if hit is None:
@@ -123,11 +128,43 @@ class ScannerApp(App):
             if self.persistence.state_for(sym).streak >= self.tunables.persistence_required
         }
         for symbol in qualified:
-            if symbol in self.states or len(self.states) >= config.MAX_LIVE_SYMBOLS:
+            if symbol in self.states:
+                self._logged_no_slot.discard(symbol)
+                continue
+            if len(self.states) >= config.MAX_LIVE_SYMBOLS:
+                self._log_no_slot(symbol)
                 continue
             hit = self._pending_hits.get(symbol)
             if hit is not None:
                 asyncio.create_task(self._add_symbol(hit))
+
+    def _log_no_slot(self, symbol: str) -> None:
+        if symbol in self._logged_no_slot:
+            return  # already logged for this symbol; avoid spamming every tick
+        log.info(
+            "%s qualified but no live-symbol slot free (%d/%d in use)",
+            symbol, len(self.states), config.MAX_LIVE_SYMBOLS,
+        )
+        self._logged_no_slot.add(symbol)
+
+    def _log_filter_transitions(self) -> None:
+        """Logs, once per state change, why a live-subscribed symbol is or isn't
+        clearing display.render's row filter -- otherwise a symbol can spike
+        heavily under the hood and stay invisible with no trace in the log."""
+        for symbol, state in self.states.items():
+            if state.tick.last is None:
+                continue  # no live tick yet, nothing meaningful to report
+            reason = display_reason(state)
+            if reason == self._filter_reasons.get(symbol):
+                continue
+            if reason is None:
+                log.info("%s now passing display filters (rvol=%.2fx)", symbol, state.rvol)
+            else:
+                log.info("%s hidden from display: %s", symbol, reason)
+            self._filter_reasons[symbol] = reason
+        for symbol in list(self._filter_reasons):
+            if symbol not in self.states:
+                del self._filter_reasons[symbol]
 
     def _evict_unqualified(self) -> None:
         now = datetime.now(config.TZ)
@@ -182,6 +219,8 @@ class ScannerApp(App):
 
     def _remove_symbol(self, symbol: str) -> None:
         state = self.states.pop(symbol, None)
+        self._logged_no_slot.discard(symbol)
+        self._filter_reasons.pop(symbol, None)
         if state is None:
             return
         ticker = getattr(state, "_ticker", None)

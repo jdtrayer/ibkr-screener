@@ -93,6 +93,28 @@ def check_float(state: SymbolState) -> bool:
     return not (over and config.FLOAT_HARD_REJECT)
 
 
+def display_reason(state: SymbolState) -> str | None:
+    """
+    None if `state` would clear display.render's row filter; otherwise a short
+    human-readable reason it's being hidden. Single source of truth for that
+    filter so app.py can log transitions without duplicating display.py's logic.
+    """
+    if state.rvol is None:
+        return "no rvol (baseline missing or expected volume is 0 for this point in the session)"
+    if state.rvol < config.RVOL_DISPLAY_FLOOR:
+        return f"rvol {state.rvol:.2f}x below display floor {config.RVOL_DISPLAY_FLOOR}x"
+    if not check_dollar_volume(state):
+        dv = state.dollar_volume
+        dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
+        return f"dollar volume {dv_txt} below floor {config.MIN_DOLLAR_VOLUME:,}"
+    spread_ok, spread_pct = check_spread(state)
+    if not spread_ok:
+        return f"spread {spread_pct:.2f}% over hard-reject threshold {config.MAX_SPREAD_PCT}%"
+    if not check_float(state):
+        return f"float {state.float_shares:,.0f} over hard-reject ceiling {config.FLOAT_CEILING_SHARES:,}"
+    return None
+
+
 def update_halt_state(halt: HaltState, halted_value: float, now: datetime | None = None) -> None:
     """
     Feed the latest generic tick 49 ("Halted") value in: 0 not halted,

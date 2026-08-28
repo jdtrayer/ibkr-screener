@@ -13,7 +13,7 @@ import logging
 from momentum_scanner.app import ScannerApp
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     filename="scanner.log",
 )
