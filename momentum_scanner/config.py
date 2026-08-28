@@ -113,11 +113,17 @@ SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long
 # Scalp sizing -- seed values for the runtime-mutable Tunables object. A
 # rough, at-a-glance "does this deserve a closer look" heuristic, not a
 # risk-managed trade plan: shares needed to clear this many dollars of profit,
-# with target set at scalp_rr_ratio times the risk to the spike window's low
-# (the stop). See spikes.scalp_sizing().
+# with target set at scalp_rr_ratio times the risk to the stop level. See
+# spikes.scalp_sizing().
 # --------------------------------------------------------------------------
 SCALP_TARGET_USD = 20.0
 SCALP_RR_RATIO = 2.0   # target = price + (price - stop) * this; reward:risk
+
+# The stop uses the low over this trailing window -- deliberately separate
+# from SPIKE_WINDOW_SEC (20s), which needs to stay short for fast spike
+# detection but produces a near-zero stop distance the moment price pauses
+# for even a few seconds mid-spike (which happens constantly).
+SCALP_STOP_LOOKBACK_SEC = 300.0
 
 # Position-size ceiling (shares * price), separate from risk. Note the
 # implied stop-loss risk is already bounded to SCALP_TARGET_USD /

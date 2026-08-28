@@ -63,21 +63,30 @@ immediately, just not necessarily in its final sorted position until the next re
 ### Scalp sizing
 
 The Scalp column is a rough, at-a-glance heuristic (`spikes.scalp_sizing()`), not a
-risk-managed trade plan: it treats the spike window's low as a stop-loss level and
-scales the target off it by a fixed reward:risk ratio, both of which are assumptions,
-not guarantees. It's meant to answer "is this worth pulling up the chart/L2/T&S for,
-or should I wait" — not to hand you a hard entry/stop.
+risk-managed trade plan: it treats a recent low as a stop-loss level and scales the
+target off it by a fixed reward:risk ratio, both of which are assumptions, not
+guarantees. It's meant to answer "is this worth pulling up the chart/L2/T&S for, or
+should I wait" — not to hand you a hard entry/stop.
 
 ```
-window_min             = lowest price in the live spike-detection window (the stop)
-risk_per_share          = price − window_min
+stop_basis              = lowest price over the trailing scalp_stop_lookback_sec (the stop)
+risk_per_share          = price − stop_basis
 reward_per_share        = risk_per_share × scalp_rr_ratio
 shares_for_target       = scalp_target_usd / reward_per_share
 shares_for_position_cap = scalp_max_position_usd / price
 shares                  = min(shares_for_target, shares_for_position_cap)
 target_price            = price + reward_per_share
-stop_price              = window_min
+stop_price              = stop_basis
 ```
+
+The stop deliberately uses its *own* lookback (`scalp_stop_lookback_sec`, 5 minutes
+by default), separate from `spike_window_sec` (the fast 20-second window used for
+spike *detection*). Reusing the detection window for the stop was the original
+design and it was wrong: that window collapses to near-zero risk the moment price
+pauses for even a few seconds mid-spike, which happens constantly, producing target
+and stop only a penny apart regardless of how big the real move was. Detection
+itself still only looks at the `spike_window_sec`-recent slice of price history, so
+it stays just as fast — only the stop basis got a longer, separate window.
 
 `target_price` is deliberately *not* "assume the last move repeats" — it's set purely
 from the technical stop distance times `scalp_rr_ratio`, so the displayed reward:risk
@@ -145,6 +154,7 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 | Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target used to compute the shares shown in the [Scalp](#scalp-sizing) column |
 | Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple applied to the stop distance to set the target price |
 | Scalp max $ | `scalp_max_position_usd` | $300 | $50–$5000 | $50 | Position-size ceiling (`shares × price`) — the actual guard against unrealistic share counts, separate from the target/R:R math |
+| Scalp stop look | `scalp_stop_lookback_sec` | 5.0m | 1–30m | 30s | Trailing window the stop's low is taken from — deliberately separate from `spike_window_sec` so the stop doesn't collapse to a penny wide when price pauses briefly mid-spike |
 
 ## Related fixed thresholds (`config.py`, restart required)
 
