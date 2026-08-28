@@ -123,6 +123,19 @@ SCALP_TARGET_USD = 20.0
 SCALP_RR_RATIO = 2.0
 
 # --------------------------------------------------------------------------
+# Live-slot occupancy -- evicting dollar-volume "squatters" so the capped
+# live-symbol pool (MAX_LIVE_SYMBOLS) can't fill up with names that never
+# clear MIN_DOLLAR_VOLUME and would be hidden from display anyway. Keyed
+# entirely off the existing $ floor -- deliberately NOT off RVOL, which is
+# unreliable in the first minutes of a session (near-zero baselines).
+# DV_EVICT_SEC / DV_REENTRY_COOLDOWN_SEC seed the runtime-mutable Tunables.
+# --------------------------------------------------------------------------
+DV_EVICT_SEC = 180.0            # continuous seconds below MIN_DOLLAR_VOLUME before eviction
+DV_REENTRY_COOLDOWN_SEC = 300.0  # a DV-evicted/bumped symbol can't re-take a slot for this long
+DV_EVICT_WARMUP_SEC = 60.0      # no DV judgment for this long after subscribing (data may lag)
+DV_SPIKE_HOLD_SEC = 120.0       # a spike within this window exempts a symbol from DV eviction
+
+# --------------------------------------------------------------------------
 # Spread filter
 # --------------------------------------------------------------------------
 MAX_SPREAD_PCT = 1.5      # % of mid price

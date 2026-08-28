@@ -27,6 +27,8 @@ class Tunables:
     scalp_position_usd: float = config.SCALP_POSITION_USD
     scalp_target_usd: float = config.SCALP_TARGET_USD
     scalp_rr_ratio: float = config.SCALP_RR_RATIO
+    dv_evict_sec: float = config.DV_EVICT_SEC
+    dv_reentry_cooldown_sec: float = config.DV_REENTRY_COOLDOWN_SEC
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,8 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("scalp_position_usd", "Scalp size $", 50, 50, 5000, False, lambda v: f"${v:.0f}"),
     TunableSpec("scalp_target_usd", "Scalp target $", 5, 5, 200, False, lambda v: f"${v:.0f}"),
     TunableSpec("scalp_rr_ratio", "Scalp R:R", 0.5, 1.0, 5.0, False, lambda v: f"{v:.1f}:1"),
+    TunableSpec("dv_evict_sec", "DV evict", 30, 60, 900, False, lambda v: f"{v:.0f}s"),
+    TunableSpec("dv_reentry_cooldown_sec", "DV cooldown", 60, 0, 1800, False, lambda v: f"{v:.0f}s"),
 ]
 
 

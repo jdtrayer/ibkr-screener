@@ -61,6 +61,7 @@ def render(
     connected: bool,
     tunables: Tunables,
     row_order: list[str] | None = None,
+    waiting_count: int = 0,
 ) -> Table:
     """
     `row_order` (symbols, best-first) fixes the row ORDER; cell values still
@@ -68,6 +69,10 @@ def render(
     sort every call (e.g. for tests). The caller (app.py) is expected to
     refresh row_order on a slower cadence than this is called, so rows hold
     still between resorts instead of jumping around on every redraw.
+
+    `waiting_count` is the number of symbols that have cleared persistence
+    but currently hold no live-symbol slot (pool full, or sitting out a
+    DV-eviction re-entry cooldown) -- see app.py's _waiting_for_slot_count.
     """
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
     if not connected:
@@ -148,7 +153,12 @@ def render(
             Text(s.scan_source, style="dim"),
         )
 
+    status_bits = [f"Live slots: {len(states)}/{config.MAX_LIVE_SYMBOLS}"]
+    if waiting_count:
+        status_bits.append(f"{waiting_count} waiting for a slot")
     if not ranked:
-        table.caption = "No symbols have cleared persistence + RVOL floor yet…"
+        status_bits.insert(0, "No symbols have cleared persistence + RVOL floor yet…")
+    table.caption = "   ".join(status_bits)
+    table.caption_justify = "right"
 
     return table

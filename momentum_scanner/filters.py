@@ -93,6 +93,84 @@ def check_float(state: SymbolState) -> bool:
     return not (over and config.FLOAT_HARD_REJECT)
 
 
+def update_dv_floor_timer(state: SymbolState, now: datetime | None = None) -> None:
+    """
+    Track how long `state` has been continuously below the $ volume floor.
+    A dollar_volume of None counts as below the floor -- warm-up handling
+    (not judging a symbol before its first ticks arrive) lives in
+    dv_evict_reason, not here, so this timer stays a pure record of fact.
+    """
+    now = now or datetime.now(TZ)
+    if check_dollar_volume(state):
+        state.dv_below_floor_since = None
+    elif state.dv_below_floor_since is None:
+        state.dv_below_floor_since = now
+
+
+def _dv_spike_held(state: SymbolState, now: datetime) -> bool:
+    last = state.spike.last_spike_at
+    return last is not None and (now - last).total_seconds() < config.DV_SPIKE_HOLD_SEC
+
+
+def _dv_judgeable(state: SymbolState, now: datetime) -> bool:
+    """Past warm-up, so its dollar volume (or lack of data) can be held against it."""
+    return (
+        state.subscribed_at is not None
+        and (now - state.subscribed_at).total_seconds() >= config.DV_EVICT_WARMUP_SEC
+    )
+
+
+def dv_evict_reason(state: SymbolState, tunables: Tunables, now: datetime | None = None) -> str | None:
+    """
+    None if `state` may keep its live-symbol slot; otherwise a short reason it
+    should be evicted as a dollar-volume squatter. Never evicts a symbol
+    clearing the $ floor, one still in its post-subscribe warm-up, or one
+    that spiked within the last DV_SPIKE_HOLD_SEC.
+    """
+    now = now or datetime.now(TZ)
+    if state.dv_below_floor_since is None:
+        return None
+    if not _dv_judgeable(state, now):
+        return None
+    if _dv_spike_held(state, now):
+        return None
+    below_sec = (now - state.dv_below_floor_since).total_seconds()
+    if below_sec < tunables.dv_evict_sec:
+        return None
+    dv = state.dollar_volume
+    dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
+    return (
+        f"dollar volume {dv_txt} below floor {config.MIN_DOLLAR_VOLUME:,} "
+        f"for {below_sec:.0f}s (limit {tunables.dv_evict_sec:.0f}s)"
+    )
+
+
+def bump_candidate(
+    states: dict[str, SymbolState], tunables: Tunables, now: datetime | None = None
+) -> SymbolState | None:
+    """
+    The weakest current occupant that may be bumped to admit a newly
+    qualified symbol when all slots are full: past warm-up, currently below
+    the $ volume floor, and not spike-held. Lowest dollar volume wins the
+    eviction (None -- no data despite warm-up -- sorts as weakest of all).
+    Returns None if every occupant is entitled to its slot.
+    """
+    now = now or datetime.now(TZ)
+    # Re-check the floor live rather than trusting dv_below_floor_since alone:
+    # the timer is only refreshed on the tick cadence, and a scan callback can
+    # land between ticks, right after a symbol crossed the floor.
+    candidates = [
+        s for s in states.values()
+        if s.dv_below_floor_since is not None
+        and not check_dollar_volume(s)
+        and _dv_judgeable(s, now)
+        and not _dv_spike_held(s, now)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda s: s.dollar_volume if s.dollar_volume is not None else -1.0)
+
+
 def display_reason(state: SymbolState) -> str | None:
     """
     None if `state` would clear display.render's row filter; otherwise a short

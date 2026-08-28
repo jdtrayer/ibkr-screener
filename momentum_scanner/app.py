@@ -16,7 +16,14 @@ from textual.widgets import Footer, Header, Static
 
 from . import config, display, floatref, rvol, spikes
 from .controls import TunablesPanel
-from .filters import PersistenceTracker, display_reason, update_halt_state
+from .filters import (
+    PersistenceTracker,
+    bump_candidate,
+    display_reason,
+    dv_evict_reason,
+    update_dv_floor_timer,
+    update_halt_state,
+)
 from .models import SymbolState
 from .scanner import ScannerManager
 from .session import Session, current_session
@@ -50,6 +57,7 @@ class ScannerApp(App):
         self._tick_count = 0
         self._logged_no_slot: set[str] = set()
         self._filter_reasons: dict[str, str | None] = {}
+        self._dv_cooldown: dict[str, datetime] = {}  # symbol -> when it was DV-evicted/bumped
         self._row_order: list[str] = []
 
     def compose(self) -> ComposeResult:
@@ -105,9 +113,26 @@ class ScannerApp(App):
 
     def _render(self) -> None:
         table = display.render(
-            list(self.states.values()), self.session, self.ib.isConnected(), self.tunables, self._row_order
+            list(self.states.values()),
+            self.session,
+            self.ib.isConnected(),
+            self.tunables,
+            self._row_order,
+            waiting_count=self._waiting_for_slot_count(),
         )
         self.query_one("#scanner-table", Static).update(table)
+
+    def _waiting_for_slot_count(self) -> int:
+        """Symbols that have cleared persistence but hold no live-symbol slot
+        right now -- pool full with nothing bump-eligible, or sitting out a
+        DV-eviction re-entry cooldown. Recomputed fresh each render rather
+        than tracked incrementally, so it self-corrects if a candidate drops
+        out of the top-N while queued instead of ever getting a slot."""
+        return sum(
+            1 for sym in self._pending_hits
+            if sym not in self.states
+            and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
+        )
 
     # -- session lifecycle -------------------------------------------------
 
@@ -116,6 +141,7 @@ class ScannerApp(App):
         self.session = session
         for symbol in list(self.states.keys()):
             self._remove_symbol(symbol)
+        self._dv_cooldown.clear()
         self.persistence = PersistenceTracker(self.tunables)
         self.scanner_mgr.start(session)
 
@@ -125,42 +151,50 @@ class ScannerApp(App):
         self._pending_hits = hits
         qualified = self.persistence.update(hits)
         for symbol in qualified:
-            if symbol in self.states:
-                self.states[symbol].scan_rank = hits[symbol].rank if symbol in hits else self.states[symbol].scan_rank
-                self._logged_no_slot.discard(symbol)
-                continue
-            if len(self.states) >= config.MAX_LIVE_SYMBOLS:
-                self._log_no_slot(symbol)
-                continue  # no room; will retry next cycle after eviction
-            hit = hits.get(symbol)
-            if hit is None:
-                continue
-            asyncio.create_task(self._add_symbol(hit))
+            self._try_admit(symbol, hits.get(symbol))
 
     def _process_pending_hits(self) -> None:
         # Re-run in case room freed up since the last scan callback.
         if not self._pending_hits:
             return
-        qualified = {
-            sym for sym in self._pending_hits
-            if self.persistence.state_for(sym).streak >= self.tunables.persistence_required
-        }
-        for symbol in qualified:
-            if symbol in self.states:
-                self._logged_no_slot.discard(symbol)
-                continue
-            if len(self.states) >= config.MAX_LIVE_SYMBOLS:
-                self._log_no_slot(symbol)
-                continue
-            hit = self._pending_hits.get(symbol)
+        for symbol, hit in self._pending_hits.items():
+            if self.persistence.state_for(symbol).streak >= self.tunables.persistence_required:
+                self._try_admit(symbol, hit)
+
+    def _try_admit(self, symbol: str, hit) -> None:
+        """Single admission path for both the scan callback and the tick-cadence
+        retry. When the pool is full, bumps the weakest dollar-volume squatter
+        (see filters.bump_candidate) rather than turning the newcomer away."""
+        if symbol in self.states:
             if hit is not None:
-                asyncio.create_task(self._add_symbol(hit))
+                self.states[symbol].scan_rank = hit.rank
+            self._logged_no_slot.discard(symbol)
+            return
+        if hit is None or symbol in self._dv_cooldown:
+            return
+        if len(self.states) >= config.MAX_LIVE_SYMBOLS:
+            now = datetime.now(config.TZ)
+            bump = bump_candidate(self.states, self.tunables, now)
+            if bump is None:
+                self._log_no_slot(symbol)
+                return
+            dv = bump.dollar_volume
+            dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
+            log.info(
+                "Bumped %s (dollar volume %s below floor %s) to admit %s; re-entry barred for %.0fs",
+                bump.symbol, dv_txt, f"{config.MIN_DOLLAR_VOLUME:,}", symbol,
+                self.tunables.dv_reentry_cooldown_sec,
+            )
+            self._remove_symbol(bump.symbol)
+            self._dv_cooldown[bump.symbol] = now
+        asyncio.create_task(self._add_symbol(hit))
 
     def _log_no_slot(self, symbol: str) -> None:
         if symbol in self._logged_no_slot:
             return  # already logged for this symbol; avoid spamming every tick
         log.info(
-            "%s qualified but no live-symbol slot free (%d/%d in use)",
+            "%s qualified but no live-symbol slot free (%d/%d in use, none bump-eligible: "
+            "all clear the $ floor, are warming up, or spiked recently)",
             symbol, len(self.states), config.MAX_LIVE_SYMBOLS,
         )
         self._logged_no_slot.add(symbol)
@@ -186,6 +220,9 @@ class ScannerApp(App):
 
     def _evict_unqualified(self) -> None:
         now = datetime.now(config.TZ)
+        for sym, evicted_at in list(self._dv_cooldown.items()):
+            if (now - evicted_at).total_seconds() >= self.tunables.dv_reentry_cooldown_sec:
+                del self._dv_cooldown[sym]
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
             if self.persistence.state_for(symbol).streak <= 0:
@@ -193,6 +230,16 @@ class ScannerApp(App):
                 continue
             if spikes.ready_to_evict(state.spike, self.tunables, now):
                 self._remove_symbol(symbol)
+                continue
+            update_dv_floor_timer(state, now)
+            reason = dv_evict_reason(state, self.tunables, now)
+            if reason is not None:
+                log.info(
+                    "Evicted %s: %s; re-entry barred for %.0fs",
+                    symbol, reason, self.tunables.dv_reentry_cooldown_sec,
+                )
+                self._remove_symbol(symbol)
+                self._dv_cooldown[symbol] = now
 
     # -- per-symbol lifecycle ----------------------------------------------
 
@@ -221,6 +268,7 @@ class ScannerApp(App):
         # call with error 321 if you try), so no generic ticks need to be requested here.
         ticker = self.ib.reqMktData(contract, snapshot=False)
         state.live_subscribed = True
+        state.subscribed_at = datetime.now(config.TZ)
 
         def on_tick(t: Ticker, _state=state):
             self._apply_tick(_state, t)
