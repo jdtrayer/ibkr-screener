@@ -163,11 +163,21 @@ MAX_SPREAD_PCT = 1.5      # % of mid price
 SPREAD_HARD_REJECT = True  # False = flag with a warning style, True = drop from display entirely
 
 # --------------------------------------------------------------------------
-# Float reference (local file you maintain -- IBKR has no float filter)
+# Float reference (local file you maintain -- IBKR has no float filter, and
+# this account has no Reuters Fundamentals subscription entitling the
+# closest alternative, reqFundamentalData/generic tick 258)
 # --------------------------------------------------------------------------
-FLOAT_REFERENCE_FILE = "./float_reference.csv"   # columns: symbol,float_shares
+FLOAT_REFERENCE_FILE = "./float_reference.csv"   # columns: symbol,float_shares -- always wins over the auto-fetched value
 FLOAT_CEILING_SHARES = 20_000_000
 FLOAT_HARD_REJECT = False  # False = flag oversized/unknown float, True = drop
+
+# Auto-fetched fallback for any symbol not in FLOAT_REFERENCE_FILE, via a
+# direct HTTP call to Yahoo Finance (floatref.py) -- deliberately not the
+# yfinance library, which pulls in ~160MB of pandas/numpy/curl_cffi for one
+# JSON field. Cached to disk since float share counts change rarely
+# (buybacks/offerings, not day to day).
+FLOAT_CACHE_FILE = "./cache/float_cache.json"
+FLOAT_CACHE_MAX_AGE_DAYS = 7.0
 
 # --------------------------------------------------------------------------
 # Halt detection

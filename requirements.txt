@@ -1,3 +1,4 @@
 ib_async>=1.0.1
 rich>=13.7.0
 textual>=0.60
+requests>=2.31.0

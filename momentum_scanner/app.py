@@ -267,11 +267,21 @@ class ScannerApp(App):
         state._ticker = ticker  # keep a reference for cleanup
 
         asyncio.create_task(self._load_baseline(state))
+        asyncio.create_task(self._load_float(state))
 
     async def _load_baseline(self, state: SymbolState) -> None:
         baseline = await rvol.build_baseline(self.ib, state.symbol, self.session)
         if state.symbol in self.states:
             state.baseline = baseline
+
+    async def _load_float(self, state: SymbolState) -> None:
+        if state.float_known:
+            return  # float_reference.csv already covered this one -- manual override wins
+        shares = await floatref.get_float(state.symbol)
+        current = self.states.get(state.symbol)
+        if current is not None and not current.float_known:
+            current.float_shares = shares
+            current.float_known = shares is not None
 
     def _remove_symbol(self, symbol: str) -> None:
         state = self.states.pop(symbol, None)
@@ -304,9 +314,17 @@ class ScannerApp(App):
             update_halt_state(state.halt, halted)
 
     def _apply_float(self, state: SymbolState) -> None:
+        """Applies the CSV override, which always wins and re-applies live on
+        every periodic refresh. If there's no CSV entry, leaves float_known/
+        float_shares alone rather than resetting them -- _load_float's
+        one-time Yahoo fetch (see _add_symbol) fills them in asynchronously,
+        and this must not clobber that result on the next refresh."""
         shares = self.float_map.get(state.symbol.upper())
-        state.float_known = shares is not None
-        state.float_shares = shares
+        if shares is not None:
+            state.float_known = True
+            state.float_shares = shares
+        elif not state.float_known:
+            state.float_shares = None
 
     async def on_unmount(self) -> None:
         self.scanner_mgr.stop()

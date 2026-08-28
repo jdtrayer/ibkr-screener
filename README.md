@@ -18,7 +18,7 @@ Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows
 | **$Vol** | Dollar volume traded this session | `Price × session volume` |
 | | | `session volume` here is `SymbolState.session_volume` (`models.py`): IBKR's raw volume tick never resets at session boundaries (it's one running total from premarket through the close through afterhours), so this is deliberately volume *since we started watching this symbol this session* (a snapshot is taken on its first live tick and subtracted from every reading after). Without this, a stock that did big volume hours ago in an earlier session leg reads as still-hot RVOL/$Vol long after it's gone quiet — e.g. a stock that spikes premarket and then trades nothing would otherwise still show a huge $Vol and RVOL well into the regular session, purely off the stale premarket total. One consequence: a symbol admitted a few minutes into a session (not exactly at its start) will slightly *undercount* for those first few minutes, since volume traded before we were watching it is invisible to us — the opposite direction of error, and much smaller. |
 | **Spread%** | Bid-ask spread as a % of the midpoint | `(ask − bid) / mid × 100` |
-| **Float** | Shares outstanding available to trade | Looked up from `float_reference.csv`, a file you maintain yourself (IBKR has no float filter). `?` means the symbol isn't in that file. |
+| **Float** | Shares outstanding available to trade | Looked up from `float_reference.csv`, a file you maintain yourself — an entry there always wins. For anything not in it, `floatref.get_float()` fetches from Yahoo Finance directly (IBKR has no float data on a standard account -- confirmed via `Error 10358` against both `reqFundamentalData` and generic tick 258, which need a Reuters Fundamentals subscription this account doesn't have) and caches the result to `cache/float_cache.json` for `FLOAT_CACHE_MAX_AGE_DAYS` (7 days). `?` means neither source has a value yet (a fresh symbol's first Yahoo lookup takes a moment) or Yahoo genuinely has no float data for it. |
 | **Scalp** | Rough "does this deserve a closer look" sizing — see [Scalp sizing](#scalp-sizing) below | |
 | **Src** | Which IBKR scan surfaced the symbol | `HOT_BY_VOLUME` or `TOP_PERC_GAIN` (`scanner.py`) |
 
@@ -171,7 +171,9 @@ scanner-side pre-filter), `MIN_DOLLAR_VOLUME` ($5M regular-session display floor
 `MIN_DOLLAR_VOLUME_EXTENDED_HOURS` ($500K premarket/afterhours floor — see [What has
 to be true for a row to show](#what-has-to-be-true-for-a-row-to-show-at-all)),
 `RVOL_DISPLAY_FLOOR` (1.5x), `MAX_SPREAD_PCT`/`SPREAD_HARD_REJECT` (hard-reject on by default),
-`FLOAT_CEILING_SHARES`/`FLOAT_HARD_REJECT`, `MAX_LIVE_SYMBOLS` (25 concurrent
+`FLOAT_CEILING_SHARES`/`FLOAT_HARD_REJECT`, `FLOAT_CACHE_FILE`/`FLOAT_CACHE_MAX_AGE_DAYS`
+(7-day cache for the Yahoo float fallback — see the Float column above),
+`MAX_LIVE_SYMBOLS` (25 concurrent
 live-data subscriptions), `SLOT_BUMP_WARMUP_SEC`/`SLOT_BUMP_SPIKE_HOLD_SEC`
 (bump-eligibility guards — see [Live-slot occupancy](#live-slot-occupancy)),
 `TOP_DISPLAY_ROWS` (20), and `SORT_REFRESH_SEC` (8s row re-sort cadence).
