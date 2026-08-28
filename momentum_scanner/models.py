@@ -1,6 +1,7 @@
 """Shared data structures passed between the scanner, RVOL, filter, and display layers."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -61,6 +62,17 @@ class HaltState:
 
 
 @dataclass
+class SpikeState:
+    """Tracks fast price moves for the SPIKE×N flag. See spikes.py for the logic."""
+
+    price_history: deque = field(default_factory=deque)  # (datetime, price), pruned to spike_window_sec
+    events: list[datetime] = field(default_factory=list)  # spike-trigger timestamps, pruned to spike_lookback_sec
+    session_high: float | None = None
+    last_new_high_at: datetime | None = None
+    last_spike_at: datetime | None = None
+
+
+@dataclass
 class LiveTick:
     last: float | None = None
     bid: float | None = None
@@ -95,6 +107,7 @@ class SymbolState:
     baseline: RvolBaseline | None = None
     tick: LiveTick = field(default_factory=LiveTick)
     halt: HaltState = field(default_factory=HaltState)
+    spike: SpikeState = field(default_factory=SpikeState)
 
     float_shares: float | None = None
     float_known: bool = False

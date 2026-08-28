@@ -100,6 +100,16 @@ PERSISTENCE_REQUIRED = 3         # consecutive qualifying refreshes needed befor
 PERSISTENCE_STREAK_RESET_SEC = 45  # if a symbol misses the top-N for longer than this, its streak resets to 0
 
 # --------------------------------------------------------------------------
+# Spike detection -- seed values for the runtime-mutable Tunables object
+# (momentum_scanner/tunables.py). Nothing reads these directly at runtime;
+# they only set the initial Tunables state.
+# --------------------------------------------------------------------------
+SPIKE_THRESHOLD_PCT = 3.0     # price move within the detection window that counts as a spike
+SPIKE_WINDOW_SEC = 20.0       # detection window; also used as the spike-refire cooldown
+SPIKE_LOOKBACK_SEC = 600.0    # trailing window for the SPIKE×N event count
+SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long -> clear + evict
+
+# --------------------------------------------------------------------------
 # Spread filter
 # --------------------------------------------------------------------------
 MAX_SPREAD_PCT = 1.5      # % of mid price

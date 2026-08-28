@@ -14,6 +14,7 @@ from datetime import datetime
 from . import config
 from .models import HaltState, PersistenceState, SymbolState
 from .scanner import ScanHit
+from .tunables import Tunables
 from .config import TZ
 
 log = logging.getLogger(__name__)
@@ -21,21 +22,23 @@ log = logging.getLogger(__name__)
 
 class PersistenceTracker:
     """
-    Requires a symbol to appear in the top PERSISTENCE_TOP_N of a scan
-    refresh for PERSISTENCE_REQUIRED *consecutive* refreshes before it
-    counts as qualified. A symbol that drops out of the top-N is given a
-    grace window (PERSISTENCE_STREAK_RESET_SEC) before its streak resets,
-    so a single missed refresh due to scanner jitter doesn't punish it --
-    but a symbol that's genuinely gone (not just reordered) still decays.
+    Requires a symbol to appear in the top tunables.persistence_top_n of a
+    scan refresh for tunables.persistence_required *consecutive* refreshes
+    before it counts as qualified. A symbol that drops out of the top-N is
+    given a grace window (tunables.persistence_reset_sec) before its streak
+    resets, so a single missed refresh due to scanner jitter doesn't punish
+    it -- but a symbol that's genuinely gone (not just reordered) still
+    decays. All three thresholds are runtime-mutable via `tunables`.
     """
 
-    def __init__(self):
+    def __init__(self, tunables: Tunables):
+        self.tunables = tunables
         self._state: dict[str, PersistenceState] = {}
 
     def update(self, hits: dict[str, ScanHit]) -> set[str]:
         now = datetime.now(TZ)
         qualifying_symbols = {
-            sym for sym, hit in hits.items() if hit.rank <= config.PERSISTENCE_TOP_N
+            sym for sym, hit in hits.items() if hit.rank <= self.tunables.persistence_top_n
         }
 
         for sym in qualifying_symbols:
@@ -51,12 +54,12 @@ class PersistenceTracker:
             if st.last_seen is None:
                 continue
             gap = (now - st.last_seen).total_seconds()
-            if gap > config.PERSISTENCE_STREAK_RESET_SEC:
+            if gap > self.tunables.persistence_reset_sec:
                 st.streak = 0
                 st.first_qualified_at = None
 
         qualified = {
-            sym for sym, st in self._state.items() if st.streak >= config.PERSISTENCE_REQUIRED
+            sym for sym, st in self._state.items() if st.streak >= self.tunables.persistence_required
         }
         for sym in qualified:
             self._state[sym].displayed = True

@@ -1,13 +1,16 @@
 """Rich terminal table rendering. RVOL is the primary sort key and color driver."""
 from __future__ import annotations
 
+from datetime import datetime
+
 from rich.table import Table
 from rich.text import Text
 
-from . import config
+from . import config, spikes
 from .filters import check_dollar_volume, check_float, check_spread
 from .models import SymbolState
 from .session import Session
+from .tunables import Tunables
 
 
 def rvol_style(rvol: float | None) -> str:
@@ -39,7 +42,7 @@ def _fmt_shares(v: float | None) -> str:
     return f"{v:.0f}"
 
 
-def render(states: list[SymbolState], session: Session, connected: bool) -> Table:
+def render(states: list[SymbolState], session: Session, connected: bool, tunables: Tunables) -> Table:
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
     if not connected:
         title += "  [bold red](DISCONNECTED)[/]"
@@ -74,6 +77,7 @@ def render(states: list[SymbolState], session: Session, connected: bool) -> Tabl
     ranked = [s for s in ranked if _passes(s)]
     ranked = ranked[: config.TOP_DISPLAY_ROWS]
 
+    now = datetime.now(config.TZ)
     for s in ranked:
         style = rvol_style(s.rvol)
         rvol_txt = f"{s.rvol:.1f}x" if s.rvol is not None else "-"
@@ -91,6 +95,9 @@ def render(states: list[SymbolState], session: Session, connected: bool) -> Tabl
             float_style = "yellow" if (s.float_shares or 0) > config.FLOAT_CEILING_SHARES else ""
 
         flags = []
+        spike_n = spikes.active_spike_count(s.spike, tunables, now)
+        if spike_n > 0:
+            flags.append(f"[bold black on orange3]SPIKE×{spike_n}[/]")
         if s.halt.is_halted:
             flags.append("[bold white on red3]HALTED[/]")
         elif s.halt.recently_resumed(config.HALT_RESUME_RECENT_MIN):
