@@ -16,6 +16,7 @@ Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows
 | **Price** | Last trade price | Live `last` tick |
 | **RVOL** | Relative volume vs. this time-of-day's historical norm | `session volume so far / expected cumulative volume at this many minutes into the session`, where "expected" is interpolated from an empirical 20-trading-day curve of average cumulative volume by 5-minute bucket, built per symbol per session type (`rvol.py`). A bucket is only trusted if ≥5 of the 20 days had data for it (`RVOL_MIN_SAMPLE_DAYS`); untrusted buckets contribute 0, which can make RVOL `None` early in a session for thinly-traded names. This is *not* a naive "volume ÷ elapsed time" ratio — it accounts for volume being front-loaded near the open. |
 | **$Vol** | Dollar volume traded this session | `Price × session volume` |
+| | | `session volume` here is `SymbolState.session_volume` (`models.py`): IBKR's raw volume tick never resets at session boundaries (it's one running total from premarket through the close through afterhours), so this is deliberately volume *since we started watching this symbol this session* (a snapshot is taken on its first live tick and subtracted from every reading after). Without this, a stock that did big volume hours ago in an earlier session leg reads as still-hot RVOL/$Vol long after it's gone quiet — e.g. a stock that spikes premarket and then trades nothing would otherwise still show a huge $Vol and RVOL well into the regular session, purely off the stale premarket total. One consequence: a symbol admitted a few minutes into a session (not exactly at its start) will slightly *undercount* for those first few minutes, since volume traded before we were watching it is invisible to us — the opposite direction of error, and much smaller. |
 | **Spread%** | Bid-ask spread as a % of the midpoint | `(ask − bid) / mid × 100` |
 | **Float** | Shares outstanding available to trade | Looked up from `float_reference.csv`, a file you maintain yourself (IBKR has no float filter). `?` means the symbol isn't in that file. |
 | **Scalp** | Rough "does this deserve a closer look" sizing — see [Scalp sizing](#scalp-sizing) below | |
@@ -39,7 +40,7 @@ Two gates apply, in order:
 1. **Persistence** (`filters.PersistenceTracker`) — before a symbol is even live-subscribed, it must rank in the top `persistence_top_n` of a scanner refresh for `persistence_required` *consecutive* refreshes (a short miss is forgiven within `persistence_reset_sec`; see [Tunables](#tunables)).
 2. **Display filter** (`filters.display_reason`) — once live-subscribed, every one of these must pass:
    - RVOL is known and ≥ `RVOL_DISPLAY_FLOOR` (1.5x) — hard gate, not configurable at runtime
-   - `$Vol` ≥ `MIN_DOLLAR_VOLUME` ($5,000,000) — hard gate, not configurable at runtime
+   - `$Vol` ≥ the session's $ floor — hard gate, not configurable at runtime. `MIN_DOLLAR_VOLUME` ($5,000,000) applies to the regular session; `MIN_DOLLAR_VOLUME_EXTENDED_HOURS` ($500,000) applies to premarket/afterhours (`filters.min_dollar_volume_for`). These are genuinely different bars, not the same number applied to a smaller window: extended-hours liquidity is thin by nature, so a $5M floor there would filter out nearly everything, while $500K still rules out a single stray print (e.g. 3,500 shares at ~$6 is ~$21K) — a starting point, worth validating against a real premarket/afterhours session
    - Spread% ≤ `MAX_SPREAD_PCT` (1.5%) **or** `SPREAD_HARD_REJECT` is off (it's on by default — over-threshold spread is hidden entirely, not just flagged; wide spread is a direct cost against a scalp's target and stop, so it's treated the same as failing the $Vol floor)
    - Float ≤ `FLOAT_CEILING_SHARES` (20,000,000) **or unknown** **or** `FLOAT_HARD_REJECT` is off (it is, by default — oversized float just gets the `FLOAT` flag instead of being hidden)
 
@@ -166,8 +167,10 @@ sitting out the re-entry cooldown.
 
 These aren't runtime-tunable but directly affect what you see: `PRICE_MIN`/`PRICE_MAX`
 ($1–$15, applied scanner-side), `SCANNER_SHARE_VOLUME_ABOVE` (300k shares, coarse
-scanner-side pre-filter), `MIN_DOLLAR_VOLUME` ($5M display floor), `RVOL_DISPLAY_FLOOR`
-(1.5x), `MAX_SPREAD_PCT`/`SPREAD_HARD_REJECT` (hard-reject on by default),
+scanner-side pre-filter), `MIN_DOLLAR_VOLUME` ($5M regular-session display floor) and
+`MIN_DOLLAR_VOLUME_EXTENDED_HOURS` ($500K premarket/afterhours floor — see [What has
+to be true for a row to show](#what-has-to-be-true-for-a-row-to-show-at-all)),
+`RVOL_DISPLAY_FLOOR` (1.5x), `MAX_SPREAD_PCT`/`SPREAD_HARD_REJECT` (hard-reject on by default),
 `FLOAT_CEILING_SHARES`/`FLOAT_HARD_REJECT`, `MAX_LIVE_SYMBOLS` (25 concurrent
 live-data subscriptions), `SLOT_BUMP_WARMUP_SEC`/`SLOT_BUMP_SPIKE_HOLD_SEC`
 (bump-eligibility guards — see [Live-slot occupancy](#live-slot-occupancy)),

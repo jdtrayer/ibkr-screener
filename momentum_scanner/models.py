@@ -114,10 +114,32 @@ class SymbolState:
 
     live_subscribed: bool = False
     subscribed_at: datetime | None = None  # when the live mkt-data subscription started
+    volume_offset: float | None = None  # tick.volume at the first tick after subscribing
+
+    @property
+    def session_volume(self) -> float | None:
+        """
+        Volume traded since we started watching this symbol THIS session, not
+        IBKR's raw cumulative day volume (tick.volume never resets at session
+        boundaries -- it's the same running total from premarket through the
+        close through afterhours). Without this, a stock that did big volume
+        in an earlier session leg reads as still-hot volume in the current
+        one, hours after it may have gone dead quiet.
+
+        volume_offset is captured once, on the first tick after subscribing
+        (see app.py's _apply_tick), so if admission happens a few minutes
+        into the session rather than exactly at its start, this slightly
+        UNDER-counts (missing whatever traded before we were watching) --
+        the opposite failure direction from the raw-volume bug, and far
+        smaller in practice.
+        """
+        if self.tick.volume is None or self.volume_offset is None:
+            return None
+        return self.tick.volume - self.volume_offset
 
     @property
     def rvol(self) -> float | None:
-        if self.baseline is None or self.tick.volume is None:
+        if self.baseline is None or self.session_volume is None:
             return None
         from .session import minutes_elapsed
 
@@ -130,10 +152,10 @@ class SymbolState:
         expected = self.baseline.expected_cumulative_volume(mins)
         if not expected or expected <= 0:
             return None
-        return self.tick.volume / expected
+        return self.session_volume / expected
 
     @property
     def dollar_volume(self) -> float | None:
-        if self.tick.last is None or self.tick.volume is None:
+        if self.tick.last is None or self.session_volume is None:
             return None
-        return self.tick.last * self.tick.volume
+        return self.tick.last * self.session_volume

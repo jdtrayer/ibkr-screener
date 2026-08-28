@@ -14,6 +14,7 @@ from datetime import datetime
 from . import config
 from .models import HaltState, PersistenceState, SymbolState
 from .scanner import ScanHit
+from .session import Session
 from .tunables import Tunables
 from .config import TZ
 
@@ -69,10 +70,17 @@ class PersistenceTracker:
         return self._state.setdefault(symbol, PersistenceState())
 
 
-def check_dollar_volume(state: SymbolState) -> bool:
-    """True if the symbol clears the configured $ volume floor."""
+def min_dollar_volume_for(session: Session) -> float:
+    """The $ floor a symbol must clear, given its session -- premarket/afterhours
+    liquidity is thin by nature, so it gets a genuinely lower bar than regular
+    hours rather than the same MIN_DOLLAR_VOLUME applied to a much smaller pool."""
+    return config.MIN_DOLLAR_VOLUME if session == Session.REGULAR else config.MIN_DOLLAR_VOLUME_EXTENDED_HOURS
+
+
+def check_dollar_volume(state: SymbolState, session: Session) -> bool:
+    """True if the symbol clears the $ volume floor for its session."""
     dv = state.dollar_volume
-    return dv is not None and dv >= config.MIN_DOLLAR_VOLUME
+    return dv is not None and dv >= min_dollar_volume_for(session)
 
 
 def check_spread(state: SymbolState) -> tuple[bool, float | None]:
@@ -109,15 +117,16 @@ def _slot_spike_held(state: SymbolState, now: datetime) -> bool:
     return last is not None and (now - last).total_seconds() < config.SLOT_BUMP_SPIKE_HOLD_SEC
 
 
-def _dv_weakness(state: SymbolState) -> float:
+def _dv_weakness(state: SymbolState, session: Session) -> float:
     """0 if clearing the $ floor; otherwise how many floor-multiples below it
     (no data despite warm-up is treated as maximally weak)."""
     dv = state.dollar_volume
     if dv is None:
         return float("inf")
-    if dv >= config.MIN_DOLLAR_VOLUME:
+    floor = min_dollar_volume_for(session)
+    if dv >= floor:
         return 0.0
-    return config.MIN_DOLLAR_VOLUME / max(dv, 1.0)
+    return floor / max(dv, 1.0)
 
 
 def _spread_weakness(state: SymbolState) -> float:
@@ -130,17 +139,19 @@ def _spread_weakness(state: SymbolState) -> float:
     return spread_pct / config.MAX_SPREAD_PCT
 
 
-def bump_reason(state: SymbolState) -> str:
+def bump_reason(state: SymbolState, session: Session) -> str:
     """Human-readable reason `state` was chosen as the bump candidate --
     whichever of the two weakness signals is larger for it."""
-    if _dv_weakness(state) >= _spread_weakness(state):
+    if _dv_weakness(state, session) >= _spread_weakness(state):
         dv = state.dollar_volume
         dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
-        return f"dollar volume {dv_txt} below floor {config.MIN_DOLLAR_VOLUME:,}"
+        return f"dollar volume {dv_txt} below floor {min_dollar_volume_for(session):,}"
     return f"spread {state.tick.spread_pct:.2f}% over max {config.MAX_SPREAD_PCT}%"
 
 
-def bump_candidate(states: dict[str, SymbolState], now: datetime | None = None) -> SymbolState | None:
+def bump_candidate(
+    states: dict[str, SymbolState], session: Session, now: datetime | None = None
+) -> SymbolState | None:
     """
     The weakest current occupant that may be bumped to admit a newly
     qualified symbol when all slots are full -- past warm-up, not spike-held,
@@ -160,13 +171,13 @@ def bump_candidate(states: dict[str, SymbolState], now: datetime | None = None) 
     for s in states.values():
         if not _slot_warmed_up(s, now) or _slot_spike_held(s, now):
             continue
-        score = max(_dv_weakness(s), _spread_weakness(s))
+        score = max(_dv_weakness(s, session), _spread_weakness(s))
         if score > best_score:
             best, best_score = s, score
     return best
 
 
-def display_reason(state: SymbolState) -> str | None:
+def display_reason(state: SymbolState, session: Session) -> str | None:
     """
     None if `state` would clear display.render's row filter; otherwise a short
     human-readable reason it's being hidden. Single source of truth for that
@@ -176,10 +187,10 @@ def display_reason(state: SymbolState) -> str | None:
         return "no rvol (baseline missing or expected volume is 0 for this point in the session)"
     if state.rvol < config.RVOL_DISPLAY_FLOOR:
         return f"rvol {state.rvol:.2f}x below display floor {config.RVOL_DISPLAY_FLOOR}x"
-    if not check_dollar_volume(state):
+    if not check_dollar_volume(state, session):
         dv = state.dollar_volume
         dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
-        return f"dollar volume {dv_txt} below floor {config.MIN_DOLLAR_VOLUME:,}"
+        return f"dollar volume {dv_txt} below floor {min_dollar_volume_for(session):,}"
     spread_ok, spread_pct = check_spread(state)
     if not spread_ok:
         return f"spread {spread_pct:.2f}% over hard-reject threshold {config.MAX_SPREAD_PCT}%"

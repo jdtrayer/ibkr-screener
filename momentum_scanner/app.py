@@ -176,13 +176,13 @@ class ScannerApp(App):
             return
         if len(self.states) >= config.MAX_LIVE_SYMBOLS:
             now = datetime.now(config.TZ)
-            bump = bump_candidate(self.states, now)
+            bump = bump_candidate(self.states, self.session, now)
             if bump is None:
                 self._log_no_slot(symbol)
                 return
             log.info(
                 "Bumped %s (%s) to admit %s; re-entry barred for %.0fs",
-                bump.symbol, bump_reason(bump), symbol,
+                bump.symbol, bump_reason(bump, self.session), symbol,
                 self.tunables.slot_reentry_cooldown_sec,
             )
             self._remove_symbol(bump.symbol)
@@ -206,7 +206,7 @@ class ScannerApp(App):
         for symbol, state in self.states.items():
             if state.tick.last is None:
                 continue  # no live tick yet, nothing meaningful to report
-            reason = display_reason(state)
+            reason = display_reason(state, self.session)
             if reason == self._filter_reasons.get(symbol):
                 continue
             if reason is None:
@@ -295,6 +295,8 @@ class ScannerApp(App):
         if t.ask is not None and not _isnan(t.ask):
             state.tick.ask = t.ask
         if t.volume is not None and not _isnan(t.volume):
+            if state.volume_offset is None:
+                state.volume_offset = t.volume  # first reading -- this session's zero point
             state.tick.volume = t.volume
 
         halted = getattr(t, "halted", None)

@@ -33,8 +33,27 @@ PRICE_MIN = 1.0
 PRICE_MAX = 15.0
 
 # True $ floor, enforced as a POST-filter against live price*volume, since
-# IBKR's ScannerSubscription has no native USD-volume filter tag.
+# IBKR's ScannerSubscription has no native USD-volume filter tag. Applies to
+# the REGULAR session; see MIN_DOLLAR_VOLUME_EXTENDED_HOURS for premarket/
+# afterhours. price*volume here uses SymbolState.dollar_volume, which is
+# scoped to volume traded SINCE THE CURRENT SESSION STARTED (see
+# SymbolState.session_volume) -- not IBKR's raw whole-trading-day volume
+# tick, which never resets at session boundaries and would silently let a
+# stock coast on hours-old regular-session volume through the afterhours
+# floor (or premarket volume through the regular-session floor right at the
+# open), long after it's actually gone quiet.
 MIN_DOLLAR_VOLUME = 5_000_000
+
+# Same idea, but for premarket/afterhours specifically. MIN_DOLLAR_VOLUME
+# was only ever a realistic bar because it was silently being checked
+# against whole-day volume, most of which comes from the regular session --
+# applying it to session-scoped extended-hours volume alone would filter
+# out nearly everything, since extended-hours liquidity is thin by nature,
+# not a sign of a bad candidate. This is a genuinely lower floor: enough to
+# rule out a single stray print (e.g. 3,500 shares at ~$6 is ~$21K), not
+# "regular-session liquid." Starting point -- validate against a real
+# premarket/afterhours session and adjust.
+MIN_DOLLAR_VOLUME_EXTENDED_HOURS = 500_000
 
 # Coarse scanner-SIDE pre-filter (shares, not dollars) to cut noise before
 # we ever pull live data. Keep this well below what you'd expect a real

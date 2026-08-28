@@ -99,7 +99,7 @@ def render(
     table.add_column("Src", justify="left")
 
     def _passes(s: SymbolState) -> bool:
-        return display_reason(s) is None
+        return display_reason(s, session) is None
 
     def _rvol_key(s: SymbolState) -> float:
         return s.rvol if s.rvol is not None else -1
