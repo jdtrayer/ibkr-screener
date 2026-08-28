@@ -1,12 +1,18 @@
 """
 Session-aware IBKR scanner subscriptions.
 
-- Premarket / afterhours: TOP_OPEN_PERC_GAIN (compares last trade to prior
-  close, so it catches prints during extended hours -- TOP_PERC_GAIN alone
-  is regular-hours oriented and comparatively noisy outside RTH).
-- Regular hours: HOT_BY_VOLUME + TOP_PERC_GAIN run concurrently and are
-  merged into one candidate set, since a name can be a volume story before
-  it's a % gain story or vice versa.
+HOT_BY_VOLUME + TOP_PERC_GAIN run concurrently in every open session and are
+merged into one candidate set, since a name can be a volume story before
+it's a % gain story or vice versa.
+
+Previously PREMARKET/AFTERHOURS used TOP_OPEN_PERC_GAIN on the assumption it
+compares last trade to prior close. Live-tested against this account on
+2026-08-28: TOP_OPEN_PERC_GAIN's ranking column is "Change Since Open", which
+needs the 9:30am regular-session open as a reference -- it returned zero rows
+premarket every time, silently, no matter what was actually moving (confirmed
+against real gappers AEMD/CELU). TOP_PERC_GAIN and HOT_BY_VOLUME were
+confirmed live in the same test to carry real premarket data and ranked
+AEMD/CELU near the top, so they're now used across all sessions instead.
 
 Results from all active scanCodes for the session are merged into a single
 dict of symbol -> ScanHit, keyed by the BEST (lowest) rank the symbol
@@ -47,9 +53,7 @@ def _base_subscription(scan_code: str) -> ScannerSubscription:
 
 
 def profiles_for_session(session: Session) -> list[str]:
-    if session in (Session.PREMARKET, Session.AFTERHOURS):
-        return ["TOP_OPEN_PERC_GAIN"]
-    if session is Session.REGULAR:
+    if session in (Session.PREMARKET, Session.REGULAR, Session.AFTERHOURS):
         return ["HOT_BY_VOLUME", "TOP_PERC_GAIN"]
     return []
 
