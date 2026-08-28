@@ -42,17 +42,26 @@ def _fmt_shares(v: float | None) -> str:
     return f"{v:.0f}"
 
 
-def _fmt_scalp(sizing: tuple[int, float, float] | None) -> tuple[str, str]:
-    # No color cue here: shares is now deterministic from price alone
+SCALP_TARGET_STYLE = "green3"  # muted, not pure green -- readable on a dark background
+SCALP_STOP_STYLE = "red3"      # muted, not pure red -- readable on a dark background
+
+
+def _fmt_scalp(sizing: tuple[int, float, float] | None) -> Text:
+    # Shares gets no color cue: it's deterministic from price alone
     # (scalp_position_usd / price), so it no longer reflects the move's
     # quality -- a share-count-based style would just encode price, not
     # signal anything about the setup. See spikes.scalp_sizing docstring.
+    # Target/stop ARE colored, purely so the two numbers are easy to tell
+    # apart at a glance -- not a quality signal like the RVOL tiers are.
     if sizing is None:
-        return "-", "dim"
+        return Text("-", style="dim")
     shares, target, stop = sizing
     # Postfixed units to match the rest of the table's convention (3.0x, 6.4M, 10.0M).
-    txt = f"{_fmt_shares(shares)}sh {target:.2f}tgt {stop:.2f}stp"
-    return txt, ""
+    text = Text(f"{_fmt_shares(shares)}sh ")
+    text.append(f"{target:.2f}tgt", style=SCALP_TARGET_STYLE)
+    text.append(" ")
+    text.append(f"{stop:.2f}stp", style=SCALP_STOP_STYLE)
+    return text
 
 
 def render(
@@ -137,7 +146,7 @@ def render(
             flags.append("[yellow]FLOAT[/]")
         flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
 
-        scalp_txt, scalp_style = _fmt_scalp(
+        scalp_txt = _fmt_scalp(
             spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
         )
 
@@ -149,7 +158,7 @@ def render(
             Text(_fmt_money(s.dollar_volume), style=style),
             Text(spread_txt, style=spread_style),
             Text(float_txt, style=float_style),
-            Text(scalp_txt, style=scalp_style),
+            scalp_txt,
             Text(s.scan_source, style="dim"),
         )
 
