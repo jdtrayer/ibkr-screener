@@ -25,6 +25,7 @@ class Tunables:
     spike_lookback_sec: float = config.SPIKE_LOOKBACK_SEC
     spike_quiet_sec: float = config.SPIKE_QUIET_SEC
     scalp_target_usd: float = config.SCALP_TARGET_USD
+    scalp_rr_ratio: float = config.SCALP_RR_RATIO
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("spike_lookback_sec", "Spike lookback", 60, 60, 3600, False, lambda v: f"{v / 60:.0f}m"),
     TunableSpec("spike_quiet_sec", "Spike quiet", 60, 60, 1800, False, lambda v: f"{v / 60:.0f}m"),
     TunableSpec("scalp_target_usd", "Scalp target $", 5, 5, 200, False, lambda v: f"${v:.0f}"),
+    TunableSpec("scalp_rr_ratio", "Scalp R:R", 0.5, 1.0, 5.0, False, lambda v: f"{v:.1f}:1"),
 ]
 
 

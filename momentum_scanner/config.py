@@ -110,13 +110,14 @@ SPIKE_LOOKBACK_SEC = 600.0    # trailing window for the SPIKE×N event count
 SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long -> clear + evict
 
 # --------------------------------------------------------------------------
-# Scalp sizing -- seed value for the runtime-mutable Tunables object. A rough,
-# at-a-glance "does this deserve a closer look" heuristic, not a risk-managed
-# trade plan: shares needed to clear this many dollars of profit if price
-# keeps moving at its current pace off the spike window's low. See
-# spikes.scalp_sizing().
+# Scalp sizing -- seed values for the runtime-mutable Tunables object. A
+# rough, at-a-glance "does this deserve a closer look" heuristic, not a
+# risk-managed trade plan: shares needed to clear this many dollars of profit,
+# with target set at scalp_rr_ratio times the risk to the spike window's low
+# (the stop). See spikes.scalp_sizing().
 # --------------------------------------------------------------------------
 SCALP_TARGET_USD = 20.0
+SCALP_RR_RATIO = 2.0   # target = price + (price - stop) * this; reward:risk
 
 # --------------------------------------------------------------------------
 # Spread filter

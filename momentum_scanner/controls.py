@@ -15,7 +15,7 @@ from textual.widgets import Button, Static
 from .tunables import TUNABLE_SPECS, Tunables, bump
 
 _PERSISTENCE_ATTRS = {"persistence_required", "persistence_top_n", "persistence_reset_sec"}
-_SCALP_ATTRS = {"scalp_target_usd"}
+_SCALP_ATTRS = {"scalp_target_usd", "scalp_rr_ratio"}
 
 
 class TunablesPanel(Vertical):

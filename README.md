@@ -63,18 +63,24 @@ immediately, just not necessarily in its final sorted position until the next re
 ### Scalp sizing
 
 The Scalp column is a rough, at-a-glance heuristic (`spikes.scalp_sizing()`), not a
-risk-managed trade plan: it assumes the current pace continues and treats the spike
-window's low as support, neither of which is guaranteed. It's meant to answer "is
-this worth pulling up the chart/L2/T&S for, or should I wait" — not to hand you a
-hard entry/stop.
+risk-managed trade plan: it treats the spike window's low as a stop-loss level and
+scales the target off it by a fixed reward:risk ratio, both of which are assumptions,
+not guarantees. It's meant to answer "is this worth pulling up the chart/L2/T&S for,
+or should I wait" — not to hand you a hard entry/stop.
 
 ```
-window_min   = lowest price in the live spike-detection window
-move_pct     = (price − window_min) / window_min
-shares       = scalp_target_usd / (price × move_pct)
-target_price = price × (1 + move_pct)
-stop_price   = window_min
+window_min        = lowest price in the live spike-detection window (the stop)
+risk_per_share     = price − window_min
+reward_per_share   = risk_per_share × scalp_rr_ratio
+shares             = scalp_target_usd / reward_per_share
+target_price       = price + reward_per_share
+stop_price         = window_min
 ```
+
+`target_price` is deliberately *not* "assume the last move repeats" — it's set purely
+from the technical stop distance times `scalp_rr_ratio`, so the displayed reward:risk
+always equals that tunable exactly (2:1 by default), regardless of how big the move
+that triggered the spike was.
 
 Displayed as `{shares}sh {target:.2f}tgt {stop:.2f}stp` — postfixed units (`sh`,
 `tgt`, `stp`) to match the rest of the table's own convention (`3.0x`, `6.4M`, `10.0M`),
@@ -120,7 +126,8 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 
 | Label | Field | Default | Range | Step | Meaning |
 |---|---|---|---|---|---|
-| Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target used to compute the shares/target/stop shown in the [Scalp](#scalp-sizing) column |
+| Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target used to compute the shares shown in the [Scalp](#scalp-sizing) column |
+| Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple applied to the stop distance to set the target price |
 
 ## Related fixed thresholds (`config.py`, restart required)
 
