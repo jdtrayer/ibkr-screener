@@ -47,15 +47,15 @@ def render(states: list[SymbolState], session: Session, connected: bool, tunable
     if not connected:
         title += "  [bold red](DISCONNECTED)[/]"
 
-    table = Table(title=title, expand=True)
+    table = Table(title=title, expand=True, show_lines=True)
     table.add_column("Sym", style="bold")
-    table.add_column("Src", justify="left")
+    table.add_column("Flags", justify="left")
     table.add_column("Price", justify="right")
     table.add_column("RVOL", justify="right")
     table.add_column("$Vol", justify="right")
     table.add_column("Spread%", justify="right")
     table.add_column("Float", justify="right")
-    table.add_column("Flags", justify="left")
+    table.add_column("Src", justify="left")
 
     ranked = sorted(
         states,
@@ -101,13 +101,13 @@ def render(states: list[SymbolState], session: Session, connected: bool, tunable
 
         table.add_row(
             Text(s.symbol, style=style),
-            Text(s.scan_source, style="dim"),
+            flags_txt,
             Text(price_txt, style=style),
             Text(rvol_txt, style=style),
             Text(_fmt_money(s.dollar_volume), style=style),
             Text(spread_txt, style=spread_style),
             Text(float_txt, style=float_style),
-            flags_txt,
+            Text(s.scan_source, style="dim"),
         )
 
     if not ranked:
