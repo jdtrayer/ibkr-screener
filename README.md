@@ -6,16 +6,19 @@ the runtime-adjustable tunables in the sidebar panel.
 
 ## Table columns
 
+Columns appear in this order on screen: Sym, Flags, Price, RVOL, $Vol, Spread%, Float, Src.
+Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows easier to track.
+
 | Column | Meaning | Calculation |
 |---|---|---|
 | **Sym** | Ticker symbol | Colored by RVOL tier (see below) |
-| **Src** | Which IBKR scan surfaced the symbol | `HOT_BY_VOLUME` or `TOP_PERC_GAIN` (`scanner.py`) |
+| **Flags** | See [Flags](#flags) below | |
 | **Price** | Last trade price | Live `last` tick |
 | **RVOL** | Relative volume vs. this time-of-day's historical norm | `session volume so far / expected cumulative volume at this many minutes into the session`, where "expected" is interpolated from an empirical 20-trading-day curve of average cumulative volume by 5-minute bucket, built per symbol per session type (`rvol.py`). A bucket is only trusted if ≥5 of the 20 days had data for it (`RVOL_MIN_SAMPLE_DAYS`); untrusted buckets contribute 0, which can make RVOL `None` early in a session for thinly-traded names. This is *not* a naive "volume ÷ elapsed time" ratio — it accounts for volume being front-loaded near the open. |
 | **$Vol** | Dollar volume traded this session | `Price × session volume` |
 | **Spread%** | Bid-ask spread as a % of the midpoint | `(ask − bid) / mid × 100` |
 | **Float** | Shares outstanding available to trade | Looked up from `float_reference.csv`, a file you maintain yourself (IBKR has no float filter). `?` means the symbol isn't in that file. |
-| **Flags** | See [Flags](#flags) below | |
+| **Src** | Which IBKR scan surfaced the symbol | `HOT_BY_VOLUME` or `TOP_PERC_GAIN` (`scanner.py`) |
 
 ### RVOL color tiers (`config.RVOL_TIERS`)
 
