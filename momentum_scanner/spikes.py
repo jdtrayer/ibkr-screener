@@ -19,19 +19,8 @@ from .tunables import Tunables
 
 
 def update_spike_state(spike: SpikeState, price: float, now: datetime, tunables: Tunables) -> None:
-    """
-    Retains price_history for the LONGER of spike_window_sec (fast detection)
-    and scalp_stop_lookback_sec (a separate, longer window scalp_sizing uses
-    for its stop level) -- these two need different lengths: detection must
-    stay short to catch a fast move, but a stop based on that same short
-    window collapses to near-zero risk the moment price stops moving for even
-    a few seconds mid-spike (constantly, in practice), which is what made
-    scalp_sizing's target/stop come out a penny apart. Spike DETECTION below
-    still only looks at the spike_window_sec-recent slice of this history.
-    """
     spike.price_history.append((now, price))
-    retain_sec = max(tunables.spike_window_sec, tunables.scalp_stop_lookback_sec)
-    cutoff = now - timedelta(seconds=retain_sec)
+    cutoff = now - timedelta(seconds=tunables.spike_window_sec)
     while spike.price_history and spike.price_history[0][0] < cutoff:
         spike.price_history.popleft()
 
@@ -39,8 +28,7 @@ def update_spike_state(spike: SpikeState, price: float, now: datetime, tunables:
         spike.session_high = price
         spike.last_new_high_at = now
 
-    detect_cutoff = now - timedelta(seconds=tunables.spike_window_sec)
-    window_min = min(p for t, p in spike.price_history if t >= detect_cutoff)
+    window_min = min(p for _, p in spike.price_history)
     if window_min <= 0:
         return
 
@@ -63,46 +51,42 @@ def active_spike_count(spike: SpikeState, tunables: Tunables, now: datetime) -> 
     return len(spike.events)
 
 
-def scalp_sizing(spike: SpikeState, price: float, tunables: Tunables) -> tuple[int, float, float] | None:
+def scalp_sizing(price: float, tunables: Tunables) -> tuple[int, float, float] | None:
     """
-    Rough, at-a-glance scalp sizing: the low over the trailing
-    scalp_stop_lookback_sec (NOT the short spike-detection window -- that
-    collapses to near-zero risk the moment price pauses even briefly, which
-    happens constantly mid-spike) is used as a simple technical stop, target
-    is set at tunables.scalp_rr_ratio times that risk (reward:risk, not
-    "assume the last move repeats"), and shares are however many it takes to
-    clear tunables.scalp_target_usd at that per-share reward -- capped so
-    shares * price never exceeds tunables.scalp_max_position_usd. That cap is
-    what actually keeps share counts realistic: the theoretical stop-loss risk
-    is already fixed at scalp_target_usd / scalp_rr_ratio regardless of price,
-    but share count alone can still balloon into unrealistic buying power when
-    the stop distance is small in dollar terms, and that's what the position
-    cap bounds. This is meant to tell a quick story ("worth pulling up the
-    chart/L2/T&S" vs. "wait") -- not a risk-managed trade plan, since the
-    window low is treated as support and the target as reachable, neither of
-    which is guaranteed. When the position cap binds, the actual profit if
-    target is hit is less than scalp_target_usd -- shares * (target - price).
+    Rough, at-a-glance scalp sizing, worked forward purely from the current
+    price and three tunables -- no dependency on recent price history/technical
+    levels at all. Earlier versions derived the stop from a recent low, which
+    produced unrealistically tight (sometimes undefined) stops whenever the
+    stock hadn't pulled back much, which is common during a strong move and
+    isn't actually informative about a sane stop distance anyway.
 
-    Returns (shares, target_price, stop_price), or None if there's not enough
-    live data yet, no room between price and the window low, or the implied
-    share count would be zero.
+    shares       = scalp_position_usd worth of shares at the current price
+    reward/share = scalp_target_usd / shares  (profit if target is hit, using the full position)
+    target_price = price + reward/share
+    risk/share   = reward/share / scalp_rr_ratio
+    stop_price   = price - risk/share
+
+    This is meant to tell a quick story ("worth pulling up the chart/L2/T&S"
+    vs. "wait") -- not a risk-managed trade plan: the target isn't guaranteed
+    reachable and the stop isn't tied to any real support level, it's just
+    algebra that makes the numbers consistent with your position size, profit
+    target, and chosen reward:risk.
+
+    Returns (shares, target_price, stop_price), or None if price is invalid,
+    the implied share count is zero, or the implied stop would be <= 0.
     """
-    if not spike.price_history or price <= 0:
+    if price <= 0:
         return None
-    stop_basis = min(p for _, p in spike.price_history)
-    if stop_basis <= 0 or stop_basis >= price:
-        return None
-    risk_per_share = price - stop_basis
-    reward_per_share = risk_per_share * tunables.scalp_rr_ratio
-    if reward_per_share <= 0:
-        return None
-    shares_for_target = tunables.scalp_target_usd / reward_per_share
-    shares_for_position_cap = tunables.scalp_max_position_usd / price
-    shares = int(min(shares_for_target, shares_for_position_cap))
+    shares = int(tunables.scalp_position_usd / price)
     if shares <= 0:
         return None
+    reward_per_share = tunables.scalp_target_usd / shares
+    risk_per_share = reward_per_share / tunables.scalp_rr_ratio
+    stop_price = price - risk_per_share
+    if stop_price <= 0:
+        return None
     target_price = price + reward_per_share
-    return shares, target_price, stop_basis
+    return shares, target_price, stop_price
 
 
 def ready_to_evict(spike: SpikeState, tunables: Tunables, now: datetime) -> bool:

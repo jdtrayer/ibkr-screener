@@ -63,59 +63,34 @@ immediately, just not necessarily in its final sorted position until the next re
 ### Scalp sizing
 
 The Scalp column is a rough, at-a-glance heuristic (`spikes.scalp_sizing()`), not a
-risk-managed trade plan: it treats a recent low as a stop-loss level and scales the
-target off it by a fixed reward:risk ratio, both of which are assumptions, not
-guarantees. It's meant to answer "is this worth pulling up the chart/L2/T&S for, or
-should I wait" — not to hand you a hard entry/stop.
+risk-managed trade plan. It's meant to answer "is this worth pulling up the
+chart/L2/T&S for, or should I wait" — not to hand you a hard entry/stop.
+
+It's worked forward purely from the current price and three tunables — **no
+dependency on recent price history or technical levels at all**:
 
 ```
-stop_basis              = lowest price over the trailing scalp_stop_lookback_sec (the stop)
-risk_per_share          = price − stop_basis
-reward_per_share        = risk_per_share × scalp_rr_ratio
-shares_for_target       = scalp_target_usd / reward_per_share
-shares_for_position_cap = scalp_max_position_usd / price
-shares                  = min(shares_for_target, shares_for_position_cap)
-target_price            = price + reward_per_share
-stop_price              = stop_basis
+shares       = scalp_position_usd worth of shares at the current price
+reward/share = scalp_target_usd / shares   (profit if target is hit, using the full position)
+target_price = price + reward/share
+risk/share   = reward/share / scalp_rr_ratio
+stop_price   = price − risk/share
 ```
 
-The stop deliberately uses its *own* lookback (`scalp_stop_lookback_sec`, 5 minutes
-by default), separate from `spike_window_sec` (the fast 20-second window used for
-spike *detection*). Reusing the detection window for the stop was the original
-design and it was wrong: that window collapses to near-zero risk the moment price
-pauses for even a few seconds mid-spike, which happens constantly, producing target
-and stop only a penny apart regardless of how big the real move was. Detection
-itself still only looks at the `spike_window_sec`-recent slice of price history, so
-it stays just as fast — only the stop basis got a longer, separate window.
-
-`target_price` is deliberately *not* "assume the last move repeats" — it's set purely
-from the technical stop distance times `scalp_rr_ratio`, so the displayed reward:risk
-always equals that tunable exactly (2:1 by default), regardless of how big the move
-that triggered the spike was.
-
-The theoretical stop-loss risk from `shares_for_target` alone is always exactly
-`scalp_target_usd / scalp_rr_ratio` ($10 by default) no matter the price — that's
-*not* what makes share counts unrealistic. What balloons is notional exposure
-(`shares × price`) when the stop distance is small in dollar terms: a razor-thin
-stop can demand thousands of shares to hit the same fixed theoretical risk, which
-is unrealistic buying power even though the theoretical risk stayed small. That's
-what `scalp_max_position_usd` bounds — e.g. at the $300 default, a $3 stock caps
-at 100 shares and a $1.50 stock caps at 200, regardless of how tight the stop is.
-When the position cap is what's binding, the realized profit if target is hit is
-less than `scalp_target_usd` (`shares × reward_per_share`), since share count was
-capped below what the target formula alone would have sized.
+An earlier version derived the stop from a recent technical low (first the fast
+spike-detection window, then a separate longer lookback). Both were wrong in the
+same way: whenever the stock hadn't pulled back much — common during a strong,
+uninterrupted move — the technical low ended up a penny or two below price, which
+isn't actually informative about a sane stop distance, and sometimes produced no
+stop at all. Solving forward from position size + target + R:R instead means every
+row gets a consistent, sane stop distance (e.g. ~3.3% at the $300/$20/2:1 defaults)
+regardless of what the stock's recent chart looks like.
 
 Displayed as `{shares}sh {target:.2f}tgt {stop:.2f}stp` — postfixed units (`sh`,
 `tgt`, `stp`) to match the rest of the table's own convention (`3.0x`, `6.4M`, `10.0M`),
-not a chosen abbreviation. Shows `-` when there's not yet enough live tick history,
-or when there's no room between price and the window low (flat/no momentum).
-
-The share count also drives a color cue: bold green if ≤500 shares (small size
-already gets you there — attractive), dim if >2000 shares (you'd need serious size
-for the same target off this pace — probably a wait), plain otherwise. In practice
-the position cap keeps shares well under 2000 with default tunables, so the dim
-case mostly shows up only if you raise `scalp_max_position_usd` a lot. Purely
-visual, no filtering — every row still shows regardless of this cue.
+not a chosen abbreviation. Shows `-` only when price itself isn't known yet, when the
+implied share count would be zero, or when the implied stop would be ≤ 0 (a very
+low-priced stock with an aggressive R:R/target combination).
 
 ## Tunables
 
@@ -151,10 +126,9 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 
 | Label | Field | Default | Range | Step | Meaning |
 |---|---|---|---|---|---|
-| Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target used to compute the shares shown in the [Scalp](#scalp-sizing) column |
-| Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple applied to the stop distance to set the target price |
-| Scalp max $ | `scalp_max_position_usd` | $300 | $50–$5000 | $50 | Position-size ceiling (`shares × price`) — the actual guard against unrealistic share counts, separate from the target/R:R math |
-| Scalp stop look | `scalp_stop_lookback_sec` | 5.0m | 1–30m | 30s | Trailing window the stop's low is taken from — deliberately separate from `spike_window_sec` so the stop doesn't collapse to a penny wide when price pauses briefly mid-spike |
+| Scalp size $ | `scalp_position_usd` | $300 | $50–$5000 | $50 | Position size (`shares × price`) used at the current price — your buying-power target for the trade |
+| Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target if the target price is hit, using that position size |
+| Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple — sets the stop distance as `(target − price) / scalp_rr_ratio` |
 
 ## Related fixed thresholds (`config.py`, restart required)
 

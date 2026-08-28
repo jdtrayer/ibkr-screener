@@ -24,10 +24,9 @@ class Tunables:
     spike_window_sec: float = config.SPIKE_WINDOW_SEC
     spike_lookback_sec: float = config.SPIKE_LOOKBACK_SEC
     spike_quiet_sec: float = config.SPIKE_QUIET_SEC
+    scalp_position_usd: float = config.SCALP_POSITION_USD
     scalp_target_usd: float = config.SCALP_TARGET_USD
     scalp_rr_ratio: float = config.SCALP_RR_RATIO
-    scalp_max_position_usd: float = config.SCALP_MAX_POSITION_USD
-    scalp_stop_lookback_sec: float = config.SCALP_STOP_LOOKBACK_SEC
 
 
 @dataclass(frozen=True)
@@ -49,10 +48,9 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("spike_window_sec", "Spike window", 5, 5, 120, False, lambda v: f"{v:.0f}s"),
     TunableSpec("spike_lookback_sec", "Spike lookback", 60, 60, 3600, False, lambda v: f"{v / 60:.0f}m"),
     TunableSpec("spike_quiet_sec", "Spike quiet", 60, 60, 1800, False, lambda v: f"{v / 60:.0f}m"),
+    TunableSpec("scalp_position_usd", "Scalp size $", 50, 50, 5000, False, lambda v: f"${v:.0f}"),
     TunableSpec("scalp_target_usd", "Scalp target $", 5, 5, 200, False, lambda v: f"${v:.0f}"),
     TunableSpec("scalp_rr_ratio", "Scalp R:R", 0.5, 1.0, 5.0, False, lambda v: f"{v:.1f}:1"),
-    TunableSpec("scalp_max_position_usd", "Scalp max $", 50, 50, 5000, False, lambda v: f"${v:.0f}"),
-    TunableSpec("scalp_stop_lookback_sec", "Scalp stop look", 30, 60, 1800, False, lambda v: f"{v / 60:.1f}m"),
 ]
 
 
