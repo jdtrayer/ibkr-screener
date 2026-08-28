@@ -114,7 +114,6 @@ class SymbolState:
 
     live_subscribed: bool = False
     subscribed_at: datetime | None = None  # when the live mkt-data subscription started
-    dv_below_floor_since: datetime | None = None  # start of the current continuous below-$-floor stretch
 
     @property
     def rvol(self) -> float | None:

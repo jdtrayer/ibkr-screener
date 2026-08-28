@@ -40,7 +40,7 @@ Two gates apply, in order:
 2. **Display filter** (`filters.display_reason`) — once live-subscribed, every one of these must pass:
    - RVOL is known and ≥ `RVOL_DISPLAY_FLOOR` (1.5x) — hard gate, not configurable at runtime
    - `$Vol` ≥ `MIN_DOLLAR_VOLUME` ($5,000,000) — hard gate, not configurable at runtime
-   - Spread% ≤ `MAX_SPREAD_PCT` (1.5%) **or** `SPREAD_HARD_REJECT` is off (it is, by default — over-threshold spread just gets the `WIDE` flag instead of being hidden)
+   - Spread% ≤ `MAX_SPREAD_PCT` (1.5%) **or** `SPREAD_HARD_REJECT` is off (it's on by default — over-threshold spread is hidden entirely, not just flagged; wide spread is a direct cost against a scalp's target and stop, so it's treated the same as failing the $Vol floor)
    - Float ≤ `FLOAT_CEILING_SHARES` (20,000,000) **or unknown** **or** `FLOAT_HARD_REJECT` is off (it is, by default — oversized float just gets the `FLOAT` flag instead of being hidden)
 
 Rows that pass are capped to the top `TOP_DISPLAY_ROWS` (20). Row *order* is by RVOL
@@ -57,7 +57,7 @@ immediately, just not necessarily in its final sorted position until the next re
 | `SPIKE×N` | N spike events in the trailing lookback window — see [Spike detection](#spike-detection) |
 | `HALTED` | Symbol is currently halted (IBKR tick 49 = 1 general halt or 2 volatility halt) |
 | `RESUMED` | Halt resumed within the last `HALT_RESUME_RECENT_MIN` (15) minutes — flags the post-halt catalyst window |
-| `WIDE` | Spread% is over `MAX_SPREAD_PCT` (1.5%) — cosmetic unless `SPREAD_HARD_REJECT` is enabled |
+| `WIDE` | Spread% is over `MAX_SPREAD_PCT` (1.5%) — with `SPREAD_HARD_REJECT` on by default, a row showing this flag is about to drop off the table (and becomes bump-eligible for a live slot — see [Live-slot occupancy](#live-slot-occupancy)) |
 | `FLOAT` | Float is over `FLOAT_CEILING_SHARES` (20M) — cosmetic unless `FLOAT_HARD_REJECT` is enabled |
 
 ### Scalp sizing
@@ -122,6 +122,38 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 - `SPIKE×N` counts events still within the trailing `spike_lookback_sec`.
 - A symbol becomes eligible for eviction once it has spiked at least once **and** both of the following hold for `spike_quiet_sec`: no new spike, and no new session high. This is independent of the persistence streak — a symbol can be evicted purely for going quiet after spiking.
 
+### Live-slot occupancy
+
+| Label | Field | Default | Range | Step | Meaning |
+|---|---|---|---|---|---|
+| Slot cooldown | `slot_reentry_cooldown_sec` | 300s | 0–1800s | 60s | How long a bumped symbol is barred from re-taking a live slot (0 disables the cooldown) |
+
+`MAX_LIVE_SYMBOLS` (25) caps how many symbols can hold a live `reqMktData`
+subscription at once — clearing the persistence/scanner gate only earns a
+symbol a *ticket*, not a guaranteed slot. When the pool is full and a new
+symbol qualifies, `filters.bump_candidate()` looks for the weakest current
+occupant that's failing either the `$Vol` floor or the spread ceiling and
+evicts *that one* to make room — never a symbol that's clearing both.
+
+This is **demand-driven only, with no idle timer**: an occupant failing
+`$Vol` or spread keeps its slot indefinitely as long as nothing better is
+waiting for it — it's just hidden from the table (see [What has to be true
+for a row to show](#what-has-to-be-true-for-a-row-to-show-at-all)). It's
+only evicted the instant a newly-qualified symbol needs the room. Two
+guards apply before a symbol is even eligible to be bumped, both fixed
+(`config.py`, restart required): `SLOT_BUMP_WARMUP_SEC` (60s grace period
+after subscribing, so a symbol with no data yet isn't judged) and
+`SLOT_BUMP_SPIKE_HOLD_SEC` (120s — a symbol that spiked recently is exempt,
+so a transient dip in dollar volume or a momentarily wide print mid-move
+doesn't cost it the slot). Weakness on the two axes is normalized to "how
+many threshold-multiples past the line," so whichever signal is
+proportionally worse wins the eviction regardless of which one it is.
+
+The table caption shows `Live slots: X/25` and, when nonzero, `N waiting
+for a slot` — symbols that have cleared persistence but currently hold no
+live slot, whether from a full pool with nothing bump-eligible or from
+sitting out the re-entry cooldown.
+
 ### Scalp
 
 | Label | Field | Default | Range | Step | Meaning |
@@ -135,6 +167,8 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 These aren't runtime-tunable but directly affect what you see: `PRICE_MIN`/`PRICE_MAX`
 ($1–$15, applied scanner-side), `SCANNER_SHARE_VOLUME_ABOVE` (300k shares, coarse
 scanner-side pre-filter), `MIN_DOLLAR_VOLUME` ($5M display floor), `RVOL_DISPLAY_FLOOR`
-(1.5x), `MAX_SPREAD_PCT`/`SPREAD_HARD_REJECT`, `FLOAT_CEILING_SHARES`/`FLOAT_HARD_REJECT`,
-`MAX_LIVE_SYMBOLS` (25 concurrent live-data subscriptions), `TOP_DISPLAY_ROWS` (20), and
-`SORT_REFRESH_SEC` (8s row re-sort cadence).
+(1.5x), `MAX_SPREAD_PCT`/`SPREAD_HARD_REJECT` (hard-reject on by default),
+`FLOAT_CEILING_SHARES`/`FLOAT_HARD_REJECT`, `MAX_LIVE_SYMBOLS` (25 concurrent
+live-data subscriptions), `SLOT_BUMP_WARMUP_SEC`/`SLOT_BUMP_SPIKE_HOLD_SEC`
+(bump-eligibility guards — see [Live-slot occupancy](#live-slot-occupancy)),
+`TOP_DISPLAY_ROWS` (20), and `SORT_REFRESH_SEC` (8s row re-sort cadence).

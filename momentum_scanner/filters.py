@@ -93,82 +93,77 @@ def check_float(state: SymbolState) -> bool:
     return not (over and config.FLOAT_HARD_REJECT)
 
 
-def update_dv_floor_timer(state: SymbolState, now: datetime | None = None) -> None:
-    """
-    Track how long `state` has been continuously below the $ volume floor.
-    A dollar_volume of None counts as below the floor -- warm-up handling
-    (not judging a symbol before its first ticks arrive) lives in
-    dv_evict_reason, not here, so this timer stays a pure record of fact.
-    """
-    now = now or datetime.now(TZ)
-    if check_dollar_volume(state):
-        state.dv_below_floor_since = None
-    elif state.dv_below_floor_since is None:
-        state.dv_below_floor_since = now
-
-
-def _dv_spike_held(state: SymbolState, now: datetime) -> bool:
-    last = state.spike.last_spike_at
-    return last is not None and (now - last).total_seconds() < config.DV_SPIKE_HOLD_SEC
-
-
-def _dv_judgeable(state: SymbolState, now: datetime) -> bool:
-    """Past warm-up, so its dollar volume (or lack of data) can be held against it."""
+def _slot_warmed_up(state: SymbolState, now: datetime) -> bool:
+    """Past the post-subscribe grace period, so missing/thin data can be held
+    against it rather than punishing a symbol that just hasn't ticked yet."""
     return (
         state.subscribed_at is not None
-        and (now - state.subscribed_at).total_seconds() >= config.DV_EVICT_WARMUP_SEC
+        and (now - state.subscribed_at).total_seconds() >= config.SLOT_BUMP_WARMUP_SEC
     )
 
 
-def dv_evict_reason(state: SymbolState, tunables: Tunables, now: datetime | None = None) -> str | None:
-    """
-    None if `state` may keep its live-symbol slot; otherwise a short reason it
-    should be evicted as a dollar-volume squatter. Never evicts a symbol
-    clearing the $ floor, one still in its post-subscribe warm-up, or one
-    that spiked within the last DV_SPIKE_HOLD_SEC.
-    """
-    now = now or datetime.now(TZ)
-    if state.dv_below_floor_since is None:
-        return None
-    if not _dv_judgeable(state, now):
-        return None
-    if _dv_spike_held(state, now):
-        return None
-    below_sec = (now - state.dv_below_floor_since).total_seconds()
-    if below_sec < tunables.dv_evict_sec:
-        return None
+def _slot_spike_held(state: SymbolState, now: datetime) -> bool:
+    """Exempt from bumping -- it spiked recently, so a transient dip in dollar
+    volume or a momentarily wide print shouldn't cost it the slot mid-move."""
+    last = state.spike.last_spike_at
+    return last is not None and (now - last).total_seconds() < config.SLOT_BUMP_SPIKE_HOLD_SEC
+
+
+def _dv_weakness(state: SymbolState) -> float:
+    """0 if clearing the $ floor; otherwise how many floor-multiples below it
+    (no data despite warm-up is treated as maximally weak)."""
     dv = state.dollar_volume
-    dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
-    return (
-        f"dollar volume {dv_txt} below floor {config.MIN_DOLLAR_VOLUME:,} "
-        f"for {below_sec:.0f}s (limit {tunables.dv_evict_sec:.0f}s)"
-    )
+    if dv is None:
+        return float("inf")
+    if dv >= config.MIN_DOLLAR_VOLUME:
+        return 0.0
+    return config.MIN_DOLLAR_VOLUME / max(dv, 1.0)
 
 
-def bump_candidate(
-    states: dict[str, SymbolState], tunables: Tunables, now: datetime | None = None
-) -> SymbolState | None:
+def _spread_weakness(state: SymbolState) -> float:
+    """0 if within the spread ceiling or spread is simply unknown (quotes lag
+    trades on some feeds -- absence isn't held against it, unlike dollar
+    volume); otherwise how many ceiling-multiples over it."""
+    spread_pct = state.tick.spread_pct
+    if spread_pct is None or spread_pct <= config.MAX_SPREAD_PCT:
+        return 0.0
+    return spread_pct / config.MAX_SPREAD_PCT
+
+
+def bump_reason(state: SymbolState) -> str:
+    """Human-readable reason `state` was chosen as the bump candidate --
+    whichever of the two weakness signals is larger for it."""
+    if _dv_weakness(state) >= _spread_weakness(state):
+        dv = state.dollar_volume
+        dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
+        return f"dollar volume {dv_txt} below floor {config.MIN_DOLLAR_VOLUME:,}"
+    return f"spread {state.tick.spread_pct:.2f}% over max {config.MAX_SPREAD_PCT}%"
+
+
+def bump_candidate(states: dict[str, SymbolState], now: datetime | None = None) -> SymbolState | None:
     """
     The weakest current occupant that may be bumped to admit a newly
-    qualified symbol when all slots are full: past warm-up, currently below
-    the $ volume floor, and not spike-held. Lowest dollar volume wins the
-    eviction (None -- no data despite warm-up -- sorts as weakest of all).
-    Returns None if every occupant is entitled to its slot.
+    qualified symbol when all slots are full -- past warm-up, not spike-held,
+    and failing either the $ volume floor or the spread ceiling. This is the
+    ONLY eviction path for these two signals -- deliberately no idle timer --
+    so an occupant that's actually failing keeps its slot indefinitely as
+    long as nothing better is waiting for it; hidden from display (see
+    display_reason) but otherwise left alone.
+
+    Weakness on each axis is normalized to "how many threshold-multiples past
+    the line" so the two signals compare on equal footing rather than one
+    axis silently always winning; the single worst offender across both is
+    returned. None if every occupant is entitled to its slot.
     """
     now = now or datetime.now(TZ)
-    # Re-check the floor live rather than trusting dv_below_floor_since alone:
-    # the timer is only refreshed on the tick cadence, and a scan callback can
-    # land between ticks, right after a symbol crossed the floor.
-    candidates = [
-        s for s in states.values()
-        if s.dv_below_floor_since is not None
-        and not check_dollar_volume(s)
-        and _dv_judgeable(s, now)
-        and not _dv_spike_held(s, now)
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda s: s.dollar_volume if s.dollar_volume is not None else -1.0)
+    best, best_score = None, 0.0
+    for s in states.values():
+        if not _slot_warmed_up(s, now) or _slot_spike_held(s, now):
+            continue
+        score = max(_dv_weakness(s), _spread_weakness(s))
+        if score > best_score:
+            best, best_score = s, score
+    return best
 
 
 def display_reason(state: SymbolState) -> str | None:

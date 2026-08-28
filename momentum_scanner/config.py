@@ -123,23 +123,25 @@ SCALP_TARGET_USD = 20.0
 SCALP_RR_RATIO = 2.0
 
 # --------------------------------------------------------------------------
-# Live-slot occupancy -- evicting dollar-volume "squatters" so the capped
-# live-symbol pool (MAX_LIVE_SYMBOLS) can't fill up with names that never
-# clear MIN_DOLLAR_VOLUME and would be hidden from display anyway. Keyed
-# entirely off the existing $ floor -- deliberately NOT off RVOL, which is
-# unreliable in the first minutes of a session (near-zero baselines).
-# DV_EVICT_SEC / DV_REENTRY_COOLDOWN_SEC seed the runtime-mutable Tunables.
+# Live-slot occupancy -- letting the capped live-symbol pool (MAX_LIVE_SYMBOLS)
+# get bumped clear of "squatters" (below MIN_DOLLAR_VOLUME or over
+# MAX_SPREAD_PCT) that would be hidden from display anyway. Deliberately
+# demand-driven, no idle timer: a squatter keeps its slot indefinitely as
+# long as nothing better is waiting -- it's only bumped the instant a newly
+# qualified symbol needs the room and this is the weakest occupant. Also
+# deliberately NOT keyed off RVOL, which is unreliable in the first minutes
+# of a session (near-zero baselines produce meaningless multiples).
+# SLOT_REENTRY_COOLDOWN_SEC seeds the runtime-mutable Tunables.
 # --------------------------------------------------------------------------
-DV_EVICT_SEC = 180.0            # continuous seconds below MIN_DOLLAR_VOLUME before eviction
-DV_REENTRY_COOLDOWN_SEC = 300.0  # a DV-evicted/bumped symbol can't re-take a slot for this long
-DV_EVICT_WARMUP_SEC = 60.0      # no DV judgment for this long after subscribing (data may lag)
-DV_SPIKE_HOLD_SEC = 120.0       # a spike within this window exempts a symbol from DV eviction
+SLOT_REENTRY_COOLDOWN_SEC = 300.0  # a bumped symbol can't re-take a slot for this long
+SLOT_BUMP_WARMUP_SEC = 60.0        # no bump judgment for this long after subscribing (data may lag)
+SLOT_BUMP_SPIKE_HOLD_SEC = 120.0   # a spike within this window exempts a symbol from being bumped
 
 # --------------------------------------------------------------------------
 # Spread filter
 # --------------------------------------------------------------------------
 MAX_SPREAD_PCT = 1.5      # % of mid price
-SPREAD_HARD_REJECT = False  # False = flag with a warning style, True = drop from display entirely
+SPREAD_HARD_REJECT = True  # False = flag with a warning style, True = drop from display entirely
 
 # --------------------------------------------------------------------------
 # Float reference (local file you maintain -- IBKR has no float filter)
