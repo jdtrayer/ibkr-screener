@@ -51,6 +51,36 @@ def active_spike_count(spike: SpikeState, tunables: Tunables, now: datetime) -> 
     return len(spike.events)
 
 
+def scalp_sizing(spike: SpikeState, price: float, tunables: Tunables) -> tuple[int, float, float] | None:
+    """
+    Rough, at-a-glance scalp sizing off the live spike window: shares needed to
+    clear tunables.scalp_target_usd if price keeps moving at its current pace,
+    using the spike window's low as both the move's starting point and a
+    simple technical stop. This is meant to tell a quick story ("worth pulling
+    up the chart/L2/T&S" vs. "wait") -- not a risk-managed trade plan, since it
+    assumes the recent pace continues and treats the window low as support,
+    neither of which is guaranteed.
+
+    Returns (shares, target_price, stop_price), or None if there's not enough
+    live data yet, no room between price and the window low, or the implied
+    share count would be zero.
+    """
+    if not spike.price_history or price <= 0:
+        return None
+    window_min = min(p for _, p in spike.price_history)
+    if window_min <= 0 or window_min >= price:
+        return None
+    move_pct = (price - window_min) / window_min
+    per_share_gain = price * move_pct
+    if per_share_gain <= 0:
+        return None
+    shares = int(tunables.scalp_target_usd / per_share_gain)
+    if shares <= 0:
+        return None
+    target_price = price * (1 + move_pct)
+    return shares, target_price, window_min
+
+
 def ready_to_evict(spike: SpikeState, tunables: Tunables, now: datetime) -> bool:
     if spike.last_spike_at is None:
         return False  # never spiked -- this eviction path doesn't apply

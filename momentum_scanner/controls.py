@@ -15,6 +15,7 @@ from textual.widgets import Button, Static
 from .tunables import TUNABLE_SPECS, Tunables, bump
 
 _PERSISTENCE_ATTRS = {"persistence_required", "persistence_top_n", "persistence_reset_sec"}
+_SCALP_ATTRS = {"scalp_target_usd"}
 
 
 class TunablesPanel(Vertical):
@@ -57,7 +58,12 @@ class TunablesPanel(Vertical):
             yield self._row(spec)
         yield Static("Spike", classes="section-header")
         for spec in TUNABLE_SPECS:
-            if spec.attr in _PERSISTENCE_ATTRS:
+            if spec.attr in _PERSISTENCE_ATTRS or spec.attr in _SCALP_ATTRS:
+                continue
+            yield self._row(spec)
+        yield Static("Scalp", classes="section-header")
+        for spec in TUNABLE_SPECS:
+            if spec.attr not in _SCALP_ATTRS:
                 continue
             yield self._row(spec)
 

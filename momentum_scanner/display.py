@@ -42,7 +42,43 @@ def _fmt_shares(v: float | None) -> str:
     return f"{v:.0f}"
 
 
-def render(states: list[SymbolState], session: Session, connected: bool, tunables: Tunables) -> Table:
+# Rough visual cue only (see spikes.scalp_sizing docstring): a small share
+# count means the recent move is already doing a lot of work toward the
+# target (attractive at a glance); a large one means you'd need serious size
+# for the same target off this pace (probably a "wait" for now).
+_SCALP_ATTRACTIVE_SHARES = 500
+_SCALP_STRETCHED_SHARES = 2000
+
+
+def _fmt_scalp(sizing: tuple[int, float, float] | None) -> tuple[str, str]:
+    if sizing is None:
+        return "-", "dim"
+    shares, target, stop = sizing
+    # Postfixed units to match the rest of the table's convention (3.0x, 6.4M, 10.0M).
+    txt = f"{_fmt_shares(shares)}sh {target:.2f}tgt {stop:.2f}stp"
+    if shares <= _SCALP_ATTRACTIVE_SHARES:
+        style = "bold green3"
+    elif shares <= _SCALP_STRETCHED_SHARES:
+        style = ""
+    else:
+        style = "dim"
+    return txt, style
+
+
+def render(
+    states: list[SymbolState],
+    session: Session,
+    connected: bool,
+    tunables: Tunables,
+    row_order: list[str] | None = None,
+) -> Table:
+    """
+    `row_order` (symbols, best-first) fixes the row ORDER; cell values still
+    reflect live state regardless. Pass None to fall back to a fresh live-RVOL
+    sort every call (e.g. for tests). The caller (app.py) is expected to
+    refresh row_order on a slower cadence than this is called, so rows hold
+    still between resorts instead of jumping around on every redraw.
+    """
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
     if not connected:
         title += "  [bold red](DISCONNECTED)[/]"
@@ -55,18 +91,25 @@ def render(states: list[SymbolState], session: Session, connected: bool, tunable
     table.add_column("$Vol", justify="right")
     table.add_column("Spread%", justify="right")
     table.add_column("Float", justify="right")
+    table.add_column("Scalp", justify="left")
     table.add_column("Src", justify="left")
 
-    ranked = sorted(
-        states,
-        key=lambda s: (s.rvol if s.rvol is not None else -1),
-        reverse=True,
-    )
     def _passes(s: SymbolState) -> bool:
         return display_reason(s) is None
 
-    ranked = [s for s in ranked if _passes(s)]
-    ranked = ranked[: config.TOP_DISPLAY_ROWS]
+    def _rvol_key(s: SymbolState) -> float:
+        return s.rvol if s.rvol is not None else -1
+
+    passing_by_symbol = {s.symbol: s for s in states if _passes(s)}
+    if row_order:
+        ordered = [passing_by_symbol.pop(sym) for sym in row_order if sym in passing_by_symbol]
+    else:
+        ordered = []
+    # Anything not covered by row_order yet (newly qualified since the last
+    # resort) is appended by live RVOL so it's visible immediately rather than
+    # waiting for the next periodic resort.
+    newcomers = sorted(passing_by_symbol.values(), key=_rvol_key, reverse=True)
+    ranked = (ordered + newcomers)[: config.TOP_DISPLAY_ROWS]
 
     now = datetime.now(config.TZ)
     for s in ranked:
@@ -99,6 +142,10 @@ def render(states: list[SymbolState], session: Session, connected: bool, tunable
             flags.append("[yellow]FLOAT[/]")
         flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
 
+        scalp_txt, scalp_style = _fmt_scalp(
+            spikes.scalp_sizing(s.spike, s.tick.last, tunables) if s.tick.last is not None else None
+        )
+
         table.add_row(
             Text(s.symbol, style=style),
             flags_txt,
@@ -107,6 +154,7 @@ def render(states: list[SymbolState], session: Session, connected: bool, tunable
             Text(_fmt_money(s.dollar_volume), style=style),
             Text(spread_txt, style=spread_style),
             Text(float_txt, style=float_style),
+            Text(scalp_txt, style=scalp_style),
             Text(s.scan_source, style="dim"),
         )
 

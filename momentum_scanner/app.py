@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 SESSION_CHECK_EVERY_N_TICKS = int(30 / config.DISPLAY_REFRESH_SEC) or 1
 FLOAT_REFRESH_EVERY_N_TICKS = int(60 / config.DISPLAY_REFRESH_SEC) or 1
+SORT_REFRESH_EVERY_N_TICKS = int(config.SORT_REFRESH_SEC / config.DISPLAY_REFRESH_SEC) or 1
 
 
 class ScannerApp(App):
@@ -49,6 +50,7 @@ class ScannerApp(App):
         self._tick_count = 0
         self._logged_no_slot: set[str] = set()
         self._filter_reasons: dict[str, str | None] = {}
+        self._row_order: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -85,10 +87,26 @@ class ScannerApp(App):
         self._process_pending_hits()
         self._evict_unqualified()
         self._log_filter_transitions()
+
+        if self._tick_count % SORT_REFRESH_EVERY_N_TICKS == 0 or not self._row_order:
+            self._resort()
+
         self._render()
 
+    def _resort(self) -> None:
+        """Recompute row ORDER by live RVOL. Called on a slower cadence than
+        _render() so rows hold still between resorts -- see display.render's
+        row_order docstring."""
+        self._row_order = sorted(
+            self.states,
+            key=lambda sym: (self.states[sym].rvol if self.states[sym].rvol is not None else -1),
+            reverse=True,
+        )
+
     def _render(self) -> None:
-        table = display.render(list(self.states.values()), self.session, self.ib.isConnected(), self.tunables)
+        table = display.render(
+            list(self.states.values()), self.session, self.ib.isConnected(), self.tunables, self._row_order
+        )
         self.query_one("#scanner-table", Static).update(table)
 
     # -- session lifecycle -------------------------------------------------

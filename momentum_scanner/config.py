@@ -110,6 +110,15 @@ SPIKE_LOOKBACK_SEC = 600.0    # trailing window for the SPIKE×N event count
 SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long -> clear + evict
 
 # --------------------------------------------------------------------------
+# Scalp sizing -- seed value for the runtime-mutable Tunables object. A rough,
+# at-a-glance "does this deserve a closer look" heuristic, not a risk-managed
+# trade plan: shares needed to clear this many dollars of profit if price
+# keeps moving at its current pace off the spike window's low. See
+# spikes.scalp_sizing().
+# --------------------------------------------------------------------------
+SCALP_TARGET_USD = 20.0
+
+# --------------------------------------------------------------------------
 # Spread filter
 # --------------------------------------------------------------------------
 MAX_SPREAD_PCT = 1.5      # % of mid price
@@ -144,3 +153,8 @@ MAX_LIVE_SYMBOLS = 25
 # --------------------------------------------------------------------------
 DISPLAY_REFRESH_SEC = 2.0   # rich.Live redraw cadence
 TOP_DISPLAY_ROWS = 20       # rows rendered in the table
+
+# Row ORDER is re-sorted by RVOL at this cadence instead of every redraw, so
+# rows hold still while their cell values (price, RVOL, flags) keep updating
+# live in place -- avoids rows jumping around every 2s on minor RVOL noise.
+SORT_REFRESH_SEC = 8.0
