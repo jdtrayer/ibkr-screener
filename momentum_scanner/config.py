@@ -119,6 +119,14 @@ SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long
 SCALP_TARGET_USD = 20.0
 SCALP_RR_RATIO = 2.0   # target = price + (price - stop) * this; reward:risk
 
+# Position-size ceiling (shares * price), separate from risk. Note the
+# implied stop-loss risk is already bounded to SCALP_TARGET_USD /
+# SCALP_RR_RATIO by construction regardless of this -- this cap exists
+# because share count can still balloon (unrealistic buying power) when the
+# stop distance is small in dollar terms, even though that theoretical risk
+# stays fixed.
+SCALP_MAX_POSITION_USD = 300.0
+
 # --------------------------------------------------------------------------
 # Spread filter
 # --------------------------------------------------------------------------

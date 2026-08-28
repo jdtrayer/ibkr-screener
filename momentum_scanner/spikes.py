@@ -57,10 +57,17 @@ def scalp_sizing(spike: SpikeState, price: float, tunables: Tunables) -> tuple[i
     window's low is used as a simple technical stop, target is set at
     tunables.scalp_rr_ratio times that risk (reward:risk, not "assume the last
     move repeats"), and shares are however many it takes to clear
-    tunables.scalp_target_usd at that per-share reward. This is meant to tell
-    a quick story ("worth pulling up the chart/L2/T&S" vs. "wait") -- not a
-    risk-managed trade plan, since the window low is treated as support and
-    the target as reachable, neither of which is guaranteed.
+    tunables.scalp_target_usd at that per-share reward -- capped so
+    shares * price never exceeds tunables.scalp_max_position_usd. That cap is
+    what actually keeps share counts realistic: the theoretical stop-loss risk
+    is already fixed at scalp_target_usd / scalp_rr_ratio regardless of price,
+    but share count alone can still balloon into unrealistic buying power when
+    the stop distance is small in dollar terms, and that's what the position
+    cap bounds. This is meant to tell a quick story ("worth pulling up the
+    chart/L2/T&S" vs. "wait") -- not a risk-managed trade plan, since the
+    window low is treated as support and the target as reachable, neither of
+    which is guaranteed. When the position cap binds, the actual profit if
+    target is hit is less than scalp_target_usd -- shares * (target - price).
 
     Returns (shares, target_price, stop_price), or None if there's not enough
     live data yet, no room between price and the window low, or the implied
@@ -75,7 +82,9 @@ def scalp_sizing(spike: SpikeState, price: float, tunables: Tunables) -> tuple[i
     reward_per_share = risk_per_share * tunables.scalp_rr_ratio
     if reward_per_share <= 0:
         return None
-    shares = int(tunables.scalp_target_usd / reward_per_share)
+    shares_for_target = tunables.scalp_target_usd / reward_per_share
+    shares_for_position_cap = tunables.scalp_max_position_usd / price
+    shares = int(min(shares_for_target, shares_for_position_cap))
     if shares <= 0:
         return None
     target_price = price + reward_per_share

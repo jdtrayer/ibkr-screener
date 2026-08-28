@@ -69,18 +69,32 @@ not guarantees. It's meant to answer "is this worth pulling up the chart/L2/T&S 
 or should I wait" — not to hand you a hard entry/stop.
 
 ```
-window_min        = lowest price in the live spike-detection window (the stop)
-risk_per_share     = price − window_min
-reward_per_share   = risk_per_share × scalp_rr_ratio
-shares             = scalp_target_usd / reward_per_share
-target_price       = price + reward_per_share
-stop_price         = window_min
+window_min             = lowest price in the live spike-detection window (the stop)
+risk_per_share          = price − window_min
+reward_per_share        = risk_per_share × scalp_rr_ratio
+shares_for_target       = scalp_target_usd / reward_per_share
+shares_for_position_cap = scalp_max_position_usd / price
+shares                  = min(shares_for_target, shares_for_position_cap)
+target_price            = price + reward_per_share
+stop_price              = window_min
 ```
 
 `target_price` is deliberately *not* "assume the last move repeats" — it's set purely
 from the technical stop distance times `scalp_rr_ratio`, so the displayed reward:risk
 always equals that tunable exactly (2:1 by default), regardless of how big the move
 that triggered the spike was.
+
+The theoretical stop-loss risk from `shares_for_target` alone is always exactly
+`scalp_target_usd / scalp_rr_ratio` ($10 by default) no matter the price — that's
+*not* what makes share counts unrealistic. What balloons is notional exposure
+(`shares × price`) when the stop distance is small in dollar terms: a razor-thin
+stop can demand thousands of shares to hit the same fixed theoretical risk, which
+is unrealistic buying power even though the theoretical risk stayed small. That's
+what `scalp_max_position_usd` bounds — e.g. at the $300 default, a $3 stock caps
+at 100 shares and a $1.50 stock caps at 200, regardless of how tight the stop is.
+When the position cap is what's binding, the realized profit if target is hit is
+less than `scalp_target_usd` (`shares × reward_per_share`), since share count was
+capped below what the target formula alone would have sized.
 
 Displayed as `{shares}sh {target:.2f}tgt {stop:.2f}stp` — postfixed units (`sh`,
 `tgt`, `stp`) to match the rest of the table's own convention (`3.0x`, `6.4M`, `10.0M`),
@@ -89,7 +103,9 @@ or when there's no room between price and the window low (flat/no momentum).
 
 The share count also drives a color cue: bold green if ≤500 shares (small size
 already gets you there — attractive), dim if >2000 shares (you'd need serious size
-for the same target off this pace — probably a wait), plain otherwise. Purely
+for the same target off this pace — probably a wait), plain otherwise. In practice
+the position cap keeps shares well under 2000 with default tunables, so the dim
+case mostly shows up only if you raise `scalp_max_position_usd` a lot. Purely
 visual, no filtering — every row still shows regardless of this cue.
 
 ## Tunables
@@ -128,6 +144,7 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 |---|---|---|---|---|---|
 | Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target used to compute the shares shown in the [Scalp](#scalp-sizing) column |
 | Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple applied to the stop distance to set the target price |
+| Scalp max $ | `scalp_max_position_usd` | $300 | $50–$5000 | $50 | Position-size ceiling (`shares × price`) — the actual guard against unrealistic share counts, separate from the target/R:R math |
 
 ## Related fixed thresholds (`config.py`, restart required)
 
