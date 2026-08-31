@@ -4,3 +4,4 @@ __pycache__/
 venv/
 cache/
 scanner.log
+premarket_scan_check.log
