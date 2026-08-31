@@ -176,9 +176,18 @@ need different fixes:
 A second table under the main one, rendered by the snapshot scorer
 (`scorer.py`) — the first slice of the two-tier redesign in which the IB scan
 lists provide *membership only* and the ranking is computed by us. Every
-`SCORE_REFRESH_SEC` (30s) the full candidate pool (ALL rows of the merged scan
-lists, up to `SCORER_POOL_MAX` = 100 — deliberately not gated by the
-persistence top-N) is batch-snapshotted and scored:
+`SCORE_REFRESH_SEC` (30s) the full candidate pool (up to `SCORER_POOL_MAX` =
+150 — deliberately not gated by the persistence top-N) is batch-snapshotted
+and scored. The pool is the union of ALL rows of every subscribed scan list —
+the two admission lists plus **pool-only discovery lists**
+(`scanner.pool_only_profiles_for_session`): `HIGH_STVOLUME_5MIN` in every
+session, and `TOP_AFTER_HOURS_PERC_GAIN` in afterhours. Pool-only rows never
+feed the persistence/admission gate — partly to keep the live pipeline
+unchanged while the scorer is under observation, and partly because
+`HIGH_STVOLUME_5MIN` ranks *absolute* 5-minute volume, so in-price-band
+megacaps (Ford made its top 5 in live testing) would otherwise qualify for
+live slots; the scorer's velocity-vs-dollars math handles them, the top-N
+gate would not.
 
 ```
 score = 2.0 × move%/min                 (price velocity between sweeps)

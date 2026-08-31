@@ -182,12 +182,14 @@ class ScannerApp(App):
 
     # -- scanner callback (fires on ScanDataList.updateEvent) --------------
 
-    def _on_scan_update(self, hits: dict) -> None:
+    def _on_scan_update(self, hits: dict, pool_symbols: set) -> None:
         self._pending_hits = hits
-        # The scorer takes ALL rows as pool membership -- deliberately not
-        # gated by the persistence top-N, which is exactly the filter that
-        # buried LABT (rank 41-45) while it was the top afterhours mover.
-        self.scorer.update_pool(hits.keys())
+        # The scorer takes ALL rows of ALL lists as pool membership --
+        # including the pool-only discovery lists (scanner.py's
+        # pool_only_profiles_for_session) that never feed the persistence
+        # gate, which is exactly the filter that buried LABT (rank 41-45)
+        # while it was the top afterhours mover.
+        self.scorer.update_pool(pool_symbols)
         qualified = self.persistence.update(hits)
         for symbol in qualified:
             self._try_admit(symbol, hits.get(symbol))

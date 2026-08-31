@@ -176,7 +176,11 @@ SLOT_BUMP_SPIKE_HOLD_SEC = 120.0   # a spike within this window exempts a symbol
 # --------------------------------------------------------------------------
 SCORE_REFRESH_SEC = 30.0          # sweep cadence (live test: 20 symbols filled in 1.4s)
 SCORER_POOL_TTL_SEC = 300.0       # drop a candidate this long after it left every scan list
-SCORER_POOL_MAX = 100             # hard cap on pool size (most recently seen win)
+# Sized to fit the union of all subscribed lists (4 lists x 50 rows measured
+# ~151 unique symbols live in afterhours) so the cap doesn't trim arbitrarily
+# among same-refresh candidates. Sweeps may stretch past SCORE_REFRESH_SEC at
+# this size (~16-19s per 100 measured); the re-entry guard just skips a tick.
+SCORER_POOL_MAX = 150
 SCORER_SNAPSHOT_CHUNK = 40        # snapshots in flight at once (stay under mkt-data lines)
 SCORER_HISTORY_KEEP_SEC = 240.0   # rolling window of readings kept per symbol
 SCORER_MIN_SPAN_SEC = 20.0        # min seconds between oldest/newest reading before scoring
