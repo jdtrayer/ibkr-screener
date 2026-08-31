@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from ib_async import IB, Stock, Ticker
 from textual.app import App, ComposeResult
@@ -15,7 +15,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, Static
 
 from . import config, display, floatref, rvol, spikes
-from .controls import SymbolActionsPanel, TunablesPanel
+from .controls import TunablesPanel
 from .scorer import SnapshotScorer
 from .filters import (
     PersistenceTracker,
@@ -49,9 +49,6 @@ class ScannerApp(App):
     #tunables-panel {
         height: 1fr;
     }
-    #symbol-actions-panel {
-        height: 14;
-    }
     """
 
     def __init__(self):
@@ -69,8 +66,6 @@ class ScannerApp(App):
         self._filter_reasons: dict[str, str | None] = {}
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
-        self._ignored_today: set[str] = set()
-        self._ignored_until: dict[str, datetime] = {}  # symbol -> when its short ignore expires
         self.scorer = SnapshotScorer(self.ib)
 
     def compose(self) -> ComposeResult:
@@ -81,7 +76,6 @@ class ScannerApp(App):
                 yield Static(id="scorer-table")
             with Vertical(id="side-panel"):
                 yield TunablesPanel(self.tunables, id="tunables-panel")
-                yield SymbolActionsPanel(id="symbol-actions-panel")
         yield Footer()
 
     async def connect(self) -> None:
@@ -147,7 +141,6 @@ class ScannerApp(App):
         self.query_one("#scorer-table", Static).update(
             display.render_scorer(self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at)
         )
-        self.query_one(SymbolActionsPanel).refresh_status(self._ignored_today, set(self._ignored_until))
 
     def _waiting_for_slot_count(self) -> int:
         """Symbols that have cleared persistence and are genuinely blocked by a
@@ -161,8 +154,6 @@ class ScannerApp(App):
             1 for sym in self._pending_hits
             if sym not in self.states
             and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
-            and sym not in self._ignored_today
-            and sym not in self._ignored_until
             and sym not in self._slot_cooldown
         )
 
@@ -219,8 +210,6 @@ class ScannerApp(App):
             if hit is not None:
                 self.states[symbol].scan_rank = hit.rank
             self._logged_no_slot.discard(symbol)
-            return
-        if symbol in self._ignored_today or symbol in self._ignored_until:
             return
         if hit is None:
             return
@@ -286,9 +275,6 @@ class ScannerApp(App):
             if (now - evicted_at).total_seconds() >= self.tunables.slot_reentry_cooldown_sec:
                 del self._slot_cooldown[sym]
                 self._logged_no_slot.discard(sym)  # let a fresh block reason log again
-        for sym, until in list(self._ignored_until.items()):
-            if now >= until:
-                del self._ignored_until[sym]
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
             if self.persistence.state_for(symbol).streak <= 0:
@@ -306,30 +292,6 @@ class ScannerApp(App):
                     symbol, self.tunables.spike_quiet_sec,
                 )
                 self._remove_symbol(symbol)
-
-    # -- manual symbol ignore (SymbolActionsPanel) --------------------------
-
-    def on_symbol_actions_panel_action(self, message: SymbolActionsPanel.Action) -> None:
-        if message.action == "clear":
-            self._unignore_symbol(message.symbol)
-        else:
-            self._ignore_symbol(message.symbol, daily=(message.action == "daily"))
-
-    def _ignore_symbol(self, symbol: str, *, daily: bool) -> None:
-        if daily:
-            self._ignored_today.add(symbol)
-            log.info("%s added to today's ignore list", symbol)
-        else:
-            until = datetime.now(config.TZ) + timedelta(seconds=config.IGNORE_SHORT_SEC)
-            self._ignored_until[symbol] = until
-            log.info("%s ignored for %.0fs", symbol, config.IGNORE_SHORT_SEC)
-        if symbol in self.states:
-            self._remove_symbol(symbol)
-
-    def _unignore_symbol(self, symbol: str) -> None:
-        self._ignored_today.discard(symbol)
-        self._ignored_until.pop(symbol, None)
-        log.info("%s removed from ignore list", symbol)
 
     # -- per-symbol lifecycle ----------------------------------------------
 

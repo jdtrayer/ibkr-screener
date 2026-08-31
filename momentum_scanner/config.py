@@ -157,16 +157,6 @@ SLOT_BUMP_WARMUP_SEC = 60.0        # no bump judgment for this long after subscr
 SLOT_BUMP_SPIKE_HOLD_SEC = 120.0   # a spike within this window exempts a symbol from being bumped
 
 # --------------------------------------------------------------------------
-# Manual symbol ignore (sidebar panel) -- a user-triggered hold-out, distinct
-# from every filter/eviction mechanism above. "Today" means for the rest of
-# this run (cleared only by restarting the app for a new trading day, not by
-# a session transition within the same day) -- for a symbol under a trade
-# restriction. The short form is for something too volatile to touch right
-# now but not disqualified outright.
-# --------------------------------------------------------------------------
-IGNORE_SHORT_SEC = 300.0  # how long a manual short-ignore holds a symbol out of admission
-
-# --------------------------------------------------------------------------
 # Tier-1 snapshot scorer (observation-only slice of the two-tier redesign).
 # Candidates from the merged scan lists (ALL rows, not just the persistence
 # top-N) are batch-snapshotted every SCORE_REFRESH_SEC and ranked by OUR OWN

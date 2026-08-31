@@ -171,23 +171,6 @@ need different fixes:
 | Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target if the target price is hit, using that position size |
 | Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple — sets the stop distance as `(target − price) / scalp_rr_ratio` |
 
-### Manual symbol ignore
-
-A second sidebar panel (`SymbolActionsPanel`, `controls.py`) below the tunables
-lets you hold a symbol out of live tracking by hand — type it into the box and
-pick a button:
-
-| Button | Effect |
-|---|---|
-| `5m` | Blocks admission for `IGNORE_SHORT_SEC` (300s, `config.py`), then expires automatically |
-| `Today` | Blocks admission for the rest of this run — cleared only by restarting the app, not by a session change (premarket → regular → afterhours) within the same day |
-| `Clear` | Removes the symbol from both ignore lists immediately |
-
-Either ignore also immediately drops the symbol from live tracking if it's
-currently held (same path as any other eviction). This is independent of
-every automatic filter/eviction mechanism above — it's the only user-initiated
-one. The panel's status line echoes what's currently ignored.
-
 ### Tier-1 snapshot scorer (observation)
 
 A second table under the main one, rendered by the snapshot scorer
@@ -226,5 +209,4 @@ to be true for a row to show](#what-has-to-be-true-for-a-row-to-show-at-all)),
 (7-day cache for the Yahoo float fallback — see the Float column above),
 `SLOT_BUMP_WARMUP_SEC`/`SLOT_BUMP_SPIKE_HOLD_SEC`
 (bump-eligibility guards — see [Live-slot occupancy](#live-slot-occupancy)),
-`TOP_DISPLAY_ROWS` (20), `SORT_REFRESH_SEC` (8s row re-sort cadence), and
-`IGNORE_SHORT_SEC` (300s — see [Manual symbol ignore](#manual-symbol-ignore)).
+`TOP_DISPLAY_ROWS` (20), and `SORT_REFRESH_SEC` (8s row re-sort cadence).
