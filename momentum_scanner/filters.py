@@ -214,4 +214,7 @@ def update_halt_state(halt: HaltState, halted_value: float, now: datetime | None
         halt.last_transition_at = now
         halt.last_resume_at = now
 
+    if is_halted_now:
+        halt.kind = int(halted_value)  # 1 general, 2 volatility -- drives the countdown display
+
     halt.is_halted = is_halted_now

@@ -57,7 +57,7 @@ immediately, just not necessarily in its final sorted position until the next re
 | Flag | Meaning |
 |---|---|
 | `SPIKE×N` | N spike events in the trailing lookback window — see [Spike detection](#spike-detection) |
-| `HALTED` | Symbol is currently halted (IBKR tick 49 = 1 general halt or 2 volatility halt) |
+| `HALTED` | Symbol is currently halted (IBKR tick 49 = 1 general halt or 2 volatility halt). Volatility (LULD) halts show elapsed plus an estimated time remaining against the standard 5-minute clock, then the ~10-minute extension (`HALTED 3:12 ~1:48 left`, tiers in `HALT_EXPECTED_DURATIONS_MIN`); general halts and halts that outlive both tiers show elapsed only, since there's no standard clock to count against. Estimates are `~` because reopen times vary, and a symbol subscribed mid-halt starts its clock at first observation |
 | `RESUMED` | Halt resumed within the last `HALT_RESUME_RECENT_MIN` (15) minutes — flags the post-halt catalyst window |
 | `WIDE` | Spread% is over `MAX_SPREAD_PCT` (1.5%) — with `SPREAD_HARD_REJECT` on by default, a row showing this flag is about to drop off the table (and becomes bump-eligible for a live slot — see [Live-slot occupancy](#live-slot-occupancy)) |
 | `FLOAT` | Float is over `FLOAT_CEILING_SHARES` (20M) — cosmetic unless `FLOAT_HARD_REJECT` is enabled |

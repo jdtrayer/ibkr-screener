@@ -51,8 +51,12 @@ class PersistenceState:
 @dataclass
 class HaltState:
     is_halted: bool = False
+    # While halted, last_transition_at is when the halt STARTED -- or when we
+    # first observed it, if the symbol was already halted at subscribe time
+    # (elapsed then undercounts, which is why the display marks estimates ~).
     last_transition_at: datetime | None = None
     last_resume_at: datetime | None = None
+    kind: int | None = None  # IB tick 49 value: 1 general halt, 2 volatility (LULD) halt
 
     def recently_resumed(self, within_minutes: float) -> bool:
         if self.is_halted or self.last_resume_at is None:

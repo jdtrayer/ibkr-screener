@@ -42,6 +42,33 @@ def _fmt_shares(v: float | None) -> str:
     return f"{v:.0f}"
 
 
+def _mmss(seconds: float) -> str:
+    s = max(int(seconds), 0)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _fmt_halt_flag(halt, now: datetime) -> str:
+    """
+    HALTED flag with a countdown for volatility (LULD) halts, which normally
+    run 5 minutes and commonly extend to ~10 (config.HALT_EXPECTED_DURATIONS_MIN):
+    shows elapsed plus estimated time left against the first tier the halt
+    hasn't outlived. General halts (kind 1) have no standard clock, and a halt
+    that outlives every tier is anyone's guess -- both show elapsed only.
+    Estimates are prefixed ~ because reopen times vary and a symbol subscribed
+    mid-halt starts its clock late.
+    """
+    started = halt.last_transition_at
+    if started is None:
+        return "[bold white on red3]HALTED[/]"
+    elapsed = (now - started).total_seconds()
+    if halt.kind == 2:
+        for tier_min in config.HALT_EXPECTED_DURATIONS_MIN:
+            tier = tier_min * 60
+            if elapsed < tier:
+                return f"[bold white on red3]HALTED {_mmss(elapsed)} ~{_mmss(tier - elapsed)} left[/]"
+    return f"[bold white on red3]HALTED {_mmss(elapsed)}[/]"
+
+
 SCALP_TARGET_STYLE = "green3"  # muted, not pure green -- readable on a dark background
 SCALP_STOP_STYLE = "red3"      # muted, not pure red -- readable on a dark background
 
@@ -150,7 +177,7 @@ def render(
         if spike_n > 0:
             flags.append(f"[bold black on orange3]SPIKE×{spike_n}[/]")
         if s.halt.is_halted:
-            flags.append("[bold white on red3]HALTED[/]")
+            flags.append(_fmt_halt_flag(s.halt, now))
         elif s.halt.recently_resumed(config.HALT_RESUME_RECENT_MIN):
             flags.append("[bold black on yellow]RESUMED[/]")
         if spread_pct is not None and spread_pct > config.MAX_SPREAD_PCT:

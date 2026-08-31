@@ -238,6 +238,14 @@ FLOAT_CACHE_MAX_AGE_DAYS = 7.0
 # rejected with error 321), so there is no config knob for it beyond this comment.
 HALT_RESUME_RECENT_MIN = 15  # flag as "recently resumed" for this many minutes after resume
 
+# Volatility (LULD) halts run on a fairly standard clock: 5 minutes, commonly
+# extended to ~10. The HALTED flag shows an estimated time remaining against
+# whichever tier the halt hasn't outlived yet; past the last tier (or for
+# general halts, which have no standard clock) it shows elapsed time only.
+# Estimates only -- actual reopen times vary, and a symbol subscribed
+# mid-halt starts its clock at first observation (undercounting elapsed).
+HALT_EXPECTED_DURATIONS_MIN = (5.0, 10.0)
+
 # --------------------------------------------------------------------------
 # Live market-data budget
 # --------------------------------------------------------------------------
