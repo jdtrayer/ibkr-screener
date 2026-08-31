@@ -188,6 +188,32 @@ currently held (same path as any other eviction). This is independent of
 every automatic filter/eviction mechanism above — it's the only user-initiated
 one. The panel's status line echoes what's currently ignored.
 
+### Tier-1 snapshot scorer (observation)
+
+A second table under the main one, rendered by the snapshot scorer
+(`scorer.py`) — the first slice of the two-tier redesign in which the IB scan
+lists provide *membership only* and the ranking is computed by us. Every
+`SCORE_REFRESH_SEC` (30s) the full candidate pool (ALL rows of the merged scan
+lists, up to `SCORER_POOL_MAX` = 100 — deliberately not gated by the
+persistence top-N) is batch-snapshotted and scored:
+
+```
+score = 2.0 × move%/min                 (price velocity between sweeps)
+      + 1.5 × log10($/min ÷ $50K)       (short-window dollar flow, per decade)
+      + 1.0 × min(gap% / 30, 1)         (saturating prior-close-gap context)
+      − 1.0 × max(spread% − 0.5, 0)     (quote-cost penalty)
+```
+
+Worked examples at the default weights: a mover doing +1.5%/min on $600K/min
+with a 40% gap and 0.62% spread scores **+5.50**; a dead name (+0.05%/min,
+$20K/min, 3% spread) scores **−2.83**; a fast riser on no volume with a 6%
+spread scores **−2.67**. `⚡` marks a fast-lane candidate (≥ 2%/min right now).
+
+This table is **observation only** — it does not affect admission, eviction,
+or the main table. Weights and cadences live in `config.py` (restart to
+change). Sweep history is cached to `cache/scorer_history.json` and survives
+same-day restarts; it's discarded on the first sweep of a new trading day.
+
 ## Related fixed thresholds (`config.py`, restart required)
 
 These aren't runtime-tunable but directly affect what you see: `PRICE_MIN`/`PRICE_MAX`

@@ -185,3 +185,52 @@ def render(
     table.caption_justify = "right"
 
     return table
+
+
+def _score_style(score: float) -> str:
+    if score >= 3.0:
+        return "bold green3"
+    if score >= 1.0:
+        return "green"
+    if score < 0.0:
+        return "dim"
+    return "white"
+
+
+def render_scorer(rows, pool_size: int, last_sweep_at: datetime | None) -> Table:
+    """
+    The Tier-1 snapshot scorer's observation table (see scorer.py). Rendered
+    below the main table for side-by-side comparison -- this ranking is OURS
+    (computed from snapshot sweeps), deliberately independent of both IB's
+    scan ranks and the persistence gate, and does not drive admission yet.
+    """
+    swept = f"swept {last_sweep_at:%H:%M:%S}" if last_sweep_at else "no sweep yet"
+    table = Table(
+        title=f"Scorer (observation) — pool {pool_size} — {swept}",
+        expand=True,
+    )
+    table.add_column("#", justify="right")
+    table.add_column("Sym", style="bold")
+    table.add_column("Score", justify="right")
+    table.add_column("Move/min", justify="right")
+    table.add_column("$/min", justify="right")
+    table.add_column("Gap%", justify="right")
+    table.add_column("Spread%", justify="right")
+    table.add_column("Fast", justify="left")
+
+    for i, r in enumerate(rows[: config.SCORER_TOP_DISPLAY]):
+        style = _score_style(r.score)
+        table.add_row(
+            Text(str(i + 1)),
+            Text(r.symbol, style=style),
+            Text(f"{r.score:+.2f}", style=style),
+            Text(f"{r.move_pct_per_min:+.2f}%"),
+            Text(_fmt_money(r.dollar_per_min)),
+            Text(f"{r.gap_pct:+.1f}%" if r.gap_pct is not None else "-"),
+            Text(f"{r.spread_pct:.2f}" if r.spread_pct is not None else "-"),
+            Text("⚡" if r.fast_lane else ""),
+        )
+    if not rows:
+        table.caption = "Waiting for two sweeps per symbol…"
+        table.caption_justify = "right"
+    return table

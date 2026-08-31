@@ -16,6 +16,7 @@ from textual.widgets import Footer, Header, Static
 
 from . import config, display, floatref, rvol, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
+from .scorer import SnapshotScorer
 from .filters import (
     PersistenceTracker,
     bump_candidate,
@@ -70,12 +71,14 @@ class ScannerApp(App):
         self._row_order: list[str] = []
         self._ignored_today: set[str] = set()
         self._ignored_until: dict[str, datetime] = {}  # symbol -> when its short ignore expires
+        self.scorer = SnapshotScorer(self.ib)
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
             with VerticalScroll(id="scanner-table-scroll"):
                 yield Static(id="scanner-table")
+                yield Static(id="scorer-table")
             with Vertical(id="side-panel"):
                 yield TunablesPanel(self.tunables, id="tunables-panel")
                 yield SymbolActionsPanel(id="symbol-actions-panel")
@@ -92,6 +95,11 @@ class ScannerApp(App):
         self.scanner_mgr.on_update(self._on_scan_update)
         self._render()
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
+        self.set_interval(config.SCORE_REFRESH_SEC, self._scorer_tick)
+
+    def _scorer_tick(self) -> None:
+        # sweep() is re-entry-guarded internally, so a slow sweep can't stack.
+        asyncio.create_task(self.scorer.sweep())
 
     def _tick(self) -> None:
         self._tick_count += 1
@@ -136,6 +144,9 @@ class ScannerApp(App):
             cooldown_count=self._cooldown_wait_count(),
         )
         self.query_one("#scanner-table", Static).update(table)
+        self.query_one("#scorer-table", Static).update(
+            display.render_scorer(self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at)
+        )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_today, set(self._ignored_until))
 
     def _waiting_for_slot_count(self) -> int:
@@ -182,6 +193,10 @@ class ScannerApp(App):
 
     def _on_scan_update(self, hits: dict) -> None:
         self._pending_hits = hits
+        # The scorer takes ALL rows as pool membership -- deliberately not
+        # gated by the persistence top-N, which is exactly the filter that
+        # buried LABT (rank 41-45) while it was the top afterhours mover.
+        self.scorer.update_pool(hits.keys())
         qualified = self.persistence.update(hits)
         for symbol in qualified:
             self._try_admit(symbol, hits.get(symbol))

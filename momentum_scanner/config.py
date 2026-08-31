@@ -167,6 +167,46 @@ SLOT_BUMP_SPIKE_HOLD_SEC = 120.0   # a spike within this window exempts a symbol
 IGNORE_SHORT_SEC = 300.0  # how long a manual short-ignore holds a symbol out of admission
 
 # --------------------------------------------------------------------------
+# Tier-1 snapshot scorer (observation-only slice of the two-tier redesign).
+# Candidates from the merged scan lists (ALL rows, not just the persistence
+# top-N) are batch-snapshotted every SCORE_REFRESH_SEC and ranked by OUR OWN
+# computed signals -- IB's scan rank is membership only, never scoring. This
+# slice renders a second table for side-by-side comparison against the
+# current pipeline; it does NOT drive admission yet.
+#
+# score = SCORE_W_MOVE   * move%/min                      (velocity between sweeps)
+#       + SCORE_W_DOLLAR * log10($/min / SCORE_DOLLAR_REF) (per decade of real flow)
+#       + SCORE_W_GAP    * min(gap% / SCORE_GAP_CAP, 1)    (saturating context)
+#       - SCORE_W_SPREAD * max(spread% - SCORE_SPREAD_FREE, 0)
+#
+# Worked examples at these weights: a LABT-like mover (1.5%/min, $600K/min,
+# 40% gap, 0.62% spread) scores +5.50; a dead name (0.05%/min, $20K/min, 5%
+# gap, 3% spread) scores -2.83; a fast riser on no volume with a 6% spread
+# scores -2.67 (junk correctly suppressed by the dollar and spread terms).
+# --------------------------------------------------------------------------
+SCORE_REFRESH_SEC = 30.0          # sweep cadence (live test: 20 symbols filled in 1.4s)
+SCORER_POOL_TTL_SEC = 300.0       # drop a candidate this long after it left every scan list
+SCORER_POOL_MAX = 100             # hard cap on pool size (most recently seen win)
+SCORER_SNAPSHOT_CHUNK = 40        # snapshots in flight at once (stay under mkt-data lines)
+SCORER_HISTORY_KEEP_SEC = 240.0   # rolling window of readings kept per symbol
+SCORER_MIN_SPAN_SEC = 20.0        # min seconds between oldest/newest reading before scoring
+SCORE_W_MOVE = 2.0                # points per +1% price move per minute
+SCORE_W_DOLLAR = 1.5              # points per decade of $/min above the reference
+SCORE_DOLLAR_REF_PER_MIN = 50_000.0  # $/min that scores 0 dollar-term points
+SCORE_W_GAP = 1.0                 # max points from the gap-vs-prior-close bonus
+SCORE_GAP_CAP_PCT = 30.0          # gap% at which the gap bonus saturates
+SCORE_W_SPREAD = 1.0              # points lost per 1% of spread over the free allowance
+SCORE_SPREAD_FREE_PCT = 0.5       # spread% under this costs nothing
+SCORE_FAST_MOVE_PCT_PER_MIN = 2.0 # move%/min that flags a candidate as fast-lane
+SCORER_TOP_DISPLAY = 10           # rows shown in the observation table
+
+# Sweep history survives restarts within the same trading day (the user
+# restarts often mid-session); readings are junk across days since IB's
+# volume tick resets overnight, so the cache is date-stamped and discarded
+# on the first sweep of a new day.
+SCORER_STATE_FILE = "./cache/scorer_history.json"
+
+# --------------------------------------------------------------------------
 # Spread filter
 # --------------------------------------------------------------------------
 MAX_SPREAD_PCT = 1.5      # % of mid price
