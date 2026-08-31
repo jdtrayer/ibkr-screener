@@ -78,6 +78,7 @@ def render(
     tunables: Tunables,
     row_order: list[str] | None = None,
     waiting_count: int = 0,
+    cooldown_count: int = 0,
 ) -> Table:
     """
     `row_order` (symbols, best-first) fixes the row ORDER; cell values still
@@ -86,9 +87,13 @@ def render(
     refresh row_order on a slower cadence than this is called, so rows hold
     still between resorts instead of jumping around on every redraw.
 
-    `waiting_count` is the number of symbols that have cleared persistence
-    but currently hold no live-symbol slot (pool full, or sitting out a
-    DV-eviction re-entry cooldown) -- see app.py's _waiting_for_slot_count.
+    `waiting_count` is the number of symbols that have cleared persistence but
+    are blocked by a genuinely full pool -- raising max_live_symbols admits
+    these. `cooldown_count` is symbols sitting out a re-entry cooldown after
+    being bumped -- unrelated to capacity, raising max_live_symbols does NOT
+    admit these. Kept as separate numbers so the caption doesn't conflate a
+    capacity problem with a cooldown timer -- see app.py's
+    _waiting_for_slot_count / _cooldown_wait_count.
     """
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
     if not connected:
@@ -172,6 +177,8 @@ def render(
     status_bits = [f"Live slots: {len(states)}/{tunables.max_live_symbols}"]
     if waiting_count:
         status_bits.append(f"{waiting_count} waiting for a slot")
+    if cooldown_count:
+        status_bits.append(f"{cooldown_count} in re-entry cooldown")
     if not ranked:
         status_bits.insert(0, "No symbols have cleared persistence + RVOL floor yet…")
     table.caption = "   ".join(status_bits)

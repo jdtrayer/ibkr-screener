@@ -133,20 +133,38 @@ class ScannerApp(App):
             self.tunables,
             self._row_order,
             waiting_count=self._waiting_for_slot_count(),
+            cooldown_count=self._cooldown_wait_count(),
         )
         self.query_one("#scanner-table", Static).update(table)
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_today, set(self._ignored_until))
 
     def _waiting_for_slot_count(self) -> int:
-        """Symbols that have cleared persistence but hold no live-symbol slot
-        right now -- pool full with nothing bump-eligible, or sitting out a
-        bump re-entry cooldown. Recomputed fresh each render rather than
-        tracked incrementally, so it self-corrects if a candidate drops out
-        of the top-N while queued instead of ever getting a slot."""
+        """Symbols that have cleared persistence and are genuinely blocked by a
+        full pool with nothing bump-eligible -- raising max_live_symbols (or a
+        weaker occupant showing up) is what unblocks these. Excludes symbols
+        sitting out a re-entry cooldown; see _cooldown_wait_count for those.
+        Recomputed fresh each render rather than tracked incrementally, so it
+        self-corrects if a candidate drops out of the top-N while queued
+        instead of ever getting a slot."""
         return sum(
             1 for sym in self._pending_hits
             if sym not in self.states
             and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
+            and sym not in self._ignored_today
+            and sym not in self._ignored_until
+            and sym not in self._slot_cooldown
+        )
+
+    def _cooldown_wait_count(self) -> int:
+        """Symbols that have cleared persistence but are barred from re-taking
+        a slot for slot_reentry_cooldown_sec after being bumped -- unlike
+        _waiting_for_slot_count, raising max_live_symbols does NOT admit these;
+        only waiting out the cooldown does."""
+        return sum(
+            1 for sym in self._pending_hits
+            if sym not in self.states
+            and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
+            and sym in self._slot_cooldown
         )
 
     # -- session lifecycle -------------------------------------------------
@@ -189,7 +207,19 @@ class ScannerApp(App):
             return
         if symbol in self._ignored_today or symbol in self._ignored_until:
             return
-        if hit is None or symbol in self._slot_cooldown:
+        if hit is None:
+            return
+        if symbol in self._slot_cooldown:
+            if symbol not in self._logged_no_slot:
+                remaining = self.tunables.slot_reentry_cooldown_sec - (
+                    datetime.now(config.TZ) - self._slot_cooldown[symbol]
+                ).total_seconds()
+                log.info(
+                    "%s qualified but held out by re-entry cooldown (%.0fs remaining) -- "
+                    "NOT capacity-blocked, raising max_live_symbols won't admit it",
+                    symbol, max(remaining, 0.0),
+                )
+                self._logged_no_slot.add(symbol)
             return
         if len(self.states) >= self.tunables.max_live_symbols:
             now = datetime.now(config.TZ)
@@ -240,15 +270,26 @@ class ScannerApp(App):
         for sym, evicted_at in list(self._slot_cooldown.items()):
             if (now - evicted_at).total_seconds() >= self.tunables.slot_reentry_cooldown_sec:
                 del self._slot_cooldown[sym]
+                self._logged_no_slot.discard(sym)  # let a fresh block reason log again
         for sym, until in list(self._ignored_until.items()):
             if now >= until:
                 del self._ignored_until[sym]
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
             if self.persistence.state_for(symbol).streak <= 0:
+                log.info(
+                    "%s evicted: persistence streak decayed to 0 (out of scanner top-N for "
+                    "over %.0fs) -- will lose its RVOL/$Vol history if re-admitted later",
+                    symbol, self.tunables.persistence_reset_sec,
+                )
                 self._remove_symbol(symbol)
                 continue
             if spikes.ready_to_evict(state.spike, self.tunables, now):
+                log.info(
+                    "%s evicted: spike-quiet for %.0fs (no new spike or session high) -- "
+                    "will lose its RVOL/$Vol history if re-admitted later",
+                    symbol, self.tunables.spike_quiet_sec,
+                )
                 self._remove_symbol(symbol)
 
     # -- manual symbol ignore (SymbolActionsPanel) --------------------------
@@ -292,6 +333,7 @@ class ScannerApp(App):
             self._remove_symbol(hit.symbol)
             return
         if not qualified:
+            log.info("%s dropped: IB could not qualify a contract for it", hit.symbol)
             self._remove_symbol(hit.symbol)
             return
         contract = qualified[0]
@@ -303,6 +345,11 @@ class ScannerApp(App):
         ticker = self.ib.reqMktData(contract, snapshot=False)
         state.live_subscribed = True
         state.subscribed_at = datetime.now(config.TZ)
+        log.info(
+            "%s admitted to live tracking (%d/%d slots, scan_rank=%s, source=%s) -- "
+            "RVOL/$Vol start from zero and rebuild from here",
+            hit.symbol, len(self.states), self.tunables.max_live_symbols, hit.rank, hit.source,
+        )
 
         def on_tick(t: Ticker, _state=state):
             self._apply_tick(_state, t)

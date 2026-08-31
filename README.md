@@ -152,10 +152,16 @@ doesn't cost it the slot). Weakness on the two axes is normalized to "how
 many threshold-multiples past the line," so whichever signal is
 proportionally worse wins the eviction regardless of which one it is.
 
-The table caption shows `Live slots: X/N` (N = `max_live_symbols`) and, when nonzero, `N waiting
-for a slot` — symbols that have cleared persistence but currently hold no
-live slot, whether from a full pool with nothing bump-eligible or from
-sitting out the re-entry cooldown.
+The table caption shows `Live slots: X/N` (N = `max_live_symbols`) and, when
+nonzero, two separate counts — deliberately not merged into one, since they
+need different fixes:
+- `N waiting for a slot` — cleared persistence, genuinely blocked by a full
+  pool with nothing bump-eligible. Raising `max_live_symbols` admits these.
+- `N in re-entry cooldown` — cleared persistence but barred from re-taking a
+  slot for `slot_reentry_cooldown_sec` after being bumped. Unrelated to
+  capacity — raising `max_live_symbols` does **not** admit these, only
+  waiting out the cooldown does. `scanner.log` logs each one once ("qualified
+  but held out by re-entry cooldown (Ns remaining)") the moment it's blocked.
 
 ### Scalp
 
