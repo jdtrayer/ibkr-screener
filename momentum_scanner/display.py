@@ -46,22 +46,29 @@ SCALP_TARGET_STYLE = "green3"  # muted, not pure green -- readable on a dark bac
 SCALP_STOP_STYLE = "red3"      # muted, not pure red -- readable on a dark background
 
 
-def _fmt_scalp(sizing: tuple[int, float, float] | None) -> Text:
-    # Shares gets no color cue: it's deterministic from price alone
+def _fmt_scalp_shares(sizing: tuple[int, float, float] | None) -> Text:
+    # No color cue: shares is deterministic from price alone
     # (scalp_position_usd / price), so it no longer reflects the move's
     # quality -- a share-count-based style would just encode price, not
     # signal anything about the setup. See spikes.scalp_sizing docstring.
-    # Target/stop ARE colored, purely so the two numbers are easy to tell
-    # apart at a glance -- not a quality signal like the RVOL tiers are.
     if sizing is None:
         return Text("-", style="dim")
-    shares, target, stop = sizing
-    # Postfixed units to match the rest of the table's convention (3.0x, 6.4M, 10.0M).
-    text = Text(f"{_fmt_shares(shares)}sh ")
-    text.append(f"{target:.2f}tgt", style=SCALP_TARGET_STYLE)
-    text.append(" ")
-    text.append(f"{stop:.2f}stp", style=SCALP_STOP_STYLE)
-    return text
+    shares, _target, _stop = sizing
+    return Text(_fmt_shares(shares))
+
+
+def _fmt_scalp_target(sizing: tuple[int, float, float] | None) -> Text:
+    if sizing is None:
+        return Text("-", style="dim")
+    _shares, target, _stop = sizing
+    return Text(f"{target:.2f}", style=SCALP_TARGET_STYLE)
+
+
+def _fmt_scalp_stop(sizing: tuple[int, float, float] | None) -> Text:
+    if sizing is None:
+        return Text("-", style="dim")
+    _shares, _target, stop = sizing
+    return Text(f"{stop:.2f}", style=SCALP_STOP_STYLE)
 
 
 def render(
@@ -95,8 +102,9 @@ def render(
     table.add_column("$Vol", justify="right")
     table.add_column("Spread%", justify="right")
     table.add_column("Float", justify="right")
-    table.add_column("Scalp", justify="left")
-    table.add_column("Src", justify="left")
+    table.add_column("Shares", justify="right")
+    table.add_column("Target", justify="right")
+    table.add_column("Stop", justify="right")
 
     def _passes(s: SymbolState) -> bool:
         return display_reason(s, session) is None
@@ -146,9 +154,7 @@ def render(
             flags.append("[yellow]FLOAT[/]")
         flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
 
-        scalp_txt = _fmt_scalp(
-            spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
-        )
+        sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
 
         table.add_row(
             Text(s.symbol, style=style),
@@ -158,11 +164,12 @@ def render(
             Text(_fmt_money(s.dollar_volume), style=style),
             Text(spread_txt, style=spread_style),
             Text(float_txt, style=float_style),
-            scalp_txt,
-            Text(s.scan_source, style="dim"),
+            _fmt_scalp_shares(sizing),
+            _fmt_scalp_target(sizing),
+            _fmt_scalp_stop(sizing),
         )
 
-    status_bits = [f"Live slots: {len(states)}/{config.MAX_LIVE_SYMBOLS}"]
+    status_bits = [f"Live slots: {len(states)}/{tunables.max_live_symbols}"]
     if waiting_count:
         status_bits.append(f"{waiting_count} waiting for a slot")
     if not ranked:

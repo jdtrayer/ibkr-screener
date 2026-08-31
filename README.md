@@ -6,7 +6,7 @@ the runtime-adjustable tunables in the sidebar panel.
 
 ## Table columns
 
-Columns appear in this order on screen: Sym, Flags, Price, RVOL, $Vol, Spread%, Float, Scalp, Src.
+Columns appear in this order on screen: Sym, Flags, Price, RVOL, $Vol, Spread%, Float, Shares, Target, Stop.
 Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows easier to track.
 
 | Column | Meaning | Calculation |
@@ -19,8 +19,9 @@ Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows
 | | | `session volume` here is `SymbolState.session_volume` (`models.py`): IBKR's raw volume tick never resets at session boundaries (it's one running total from premarket through the close through afterhours), so this is deliberately volume *since we started watching this symbol this session* (a snapshot is taken on its first live tick and subtracted from every reading after). Without this, a stock that did big volume hours ago in an earlier session leg reads as still-hot RVOL/$Vol long after it's gone quiet — e.g. a stock that spikes premarket and then trades nothing would otherwise still show a huge $Vol and RVOL well into the regular session, purely off the stale premarket total. One consequence: a symbol admitted a few minutes into a session (not exactly at its start) will slightly *undercount* for those first few minutes, since volume traded before we were watching it is invisible to us — the opposite direction of error, and much smaller. |
 | **Spread%** | Bid-ask spread as a % of the midpoint | `(ask − bid) / mid × 100` |
 | **Float** | Shares outstanding available to trade | Looked up from `float_reference.csv`, a file you maintain yourself — an entry there always wins. For anything not in it, `floatref.get_float()` fetches from Yahoo Finance directly (IBKR has no float data on a standard account -- confirmed via `Error 10358` against both `reqFundamentalData` and generic tick 258, which need a Reuters Fundamentals subscription this account doesn't have) and caches the result to `cache/float_cache.json` for `FLOAT_CACHE_MAX_AGE_DAYS` (7 days). `?` means neither source has a value yet (a fresh symbol's first Yahoo lookup takes a moment) or Yahoo genuinely has no float data for it. |
-| **Scalp** | Rough "does this deserve a closer look" sizing — see [Scalp sizing](#scalp-sizing) below | |
-| **Src** | Which IBKR scan surfaced the symbol | `HOT_BY_VOLUME` or `TOP_PERC_GAIN` (`scanner.py`) |
+| **Shares** | Rough "does this deserve a closer look" sizing — see [Scalp sizing](#scalp-sizing) below | `scalp_position_usd / price` |
+| **Target** | Scalp target price | See [Scalp sizing](#scalp-sizing) below |
+| **Stop** | Scalp stop price | See [Scalp sizing](#scalp-sizing) below |
 
 ### RVOL color tiers (`config.RVOL_TIERS`)
 
@@ -128,8 +129,9 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 | Label | Field | Default | Range | Step | Meaning |
 |---|---|---|---|---|---|
 | Slot cooldown | `slot_reentry_cooldown_sec` | 300s | 0–1800s | 60s | How long a bumped symbol is barred from re-taking a live slot (0 disables the cooldown) |
+| Live slots | `max_live_symbols` | 25 | 5–100 | 5 | How many symbols can hold a live `reqMktData` subscription at once |
 
-`MAX_LIVE_SYMBOLS` (25) caps how many symbols can hold a live `reqMktData`
+`max_live_symbols` caps how many symbols can hold a live `reqMktData`
 subscription at once — clearing the persistence/scanner gate only earns a
 symbol a *ticket*, not a guaranteed slot. When the pool is full and a new
 symbol qualifies, `filters.bump_candidate()` looks for the weakest current
@@ -150,7 +152,7 @@ doesn't cost it the slot). Weakness on the two axes is normalized to "how
 many threshold-multiples past the line," so whichever signal is
 proportionally worse wins the eviction regardless of which one it is.
 
-The table caption shows `Live slots: X/25` and, when nonzero, `N waiting
+The table caption shows `Live slots: X/N` (N = `max_live_symbols`) and, when nonzero, `N waiting
 for a slot` — symbols that have cleared persistence but currently hold no
 live slot, whether from a full pool with nothing bump-eligible or from
 sitting out the re-entry cooldown.
@@ -163,6 +165,23 @@ sitting out the re-entry cooldown.
 | Scalp target $ | `scalp_target_usd` | $20 | $5–$200 | $5 | Dollar profit target if the target price is hit, using that position size |
 | Scalp R:R | `scalp_rr_ratio` | 2.0:1 | 1.0–5.0 | 0.5 | Reward:risk multiple — sets the stop distance as `(target − price) / scalp_rr_ratio` |
 
+### Manual symbol ignore
+
+A second sidebar panel (`SymbolActionsPanel`, `controls.py`) below the tunables
+lets you hold a symbol out of live tracking by hand — type it into the box and
+pick a button:
+
+| Button | Effect |
+|---|---|
+| `5m` | Blocks admission for `IGNORE_SHORT_SEC` (300s, `config.py`), then expires automatically |
+| `Today` | Blocks admission for the rest of this run — cleared only by restarting the app, not by a session change (premarket → regular → afterhours) within the same day |
+| `Clear` | Removes the symbol from both ignore lists immediately |
+
+Either ignore also immediately drops the symbol from live tracking if it's
+currently held (same path as any other eviction). This is independent of
+every automatic filter/eviction mechanism above — it's the only user-initiated
+one. The panel's status line echoes what's currently ignored.
+
 ## Related fixed thresholds (`config.py`, restart required)
 
 These aren't runtime-tunable but directly affect what you see: `PRICE_MIN`/`PRICE_MAX`
@@ -173,7 +192,7 @@ to be true for a row to show](#what-has-to-be-true-for-a-row-to-show-at-all)),
 `RVOL_DISPLAY_FLOOR` (1.5x), `MAX_SPREAD_PCT`/`SPREAD_HARD_REJECT` (hard-reject on by default),
 `FLOAT_CEILING_SHARES`/`FLOAT_HARD_REJECT`, `FLOAT_CACHE_FILE`/`FLOAT_CACHE_MAX_AGE_DAYS`
 (7-day cache for the Yahoo float fallback — see the Float column above),
-`MAX_LIVE_SYMBOLS` (25 concurrent
-live-data subscriptions), `SLOT_BUMP_WARMUP_SEC`/`SLOT_BUMP_SPIKE_HOLD_SEC`
+`SLOT_BUMP_WARMUP_SEC`/`SLOT_BUMP_SPIKE_HOLD_SEC`
 (bump-eligibility guards — see [Live-slot occupancy](#live-slot-occupancy)),
-`TOP_DISPLAY_ROWS` (20), and `SORT_REFRESH_SEC` (8s row re-sort cadence).
+`TOP_DISPLAY_ROWS` (20), `SORT_REFRESH_SEC` (8s row re-sort cadence), and
+`IGNORE_SHORT_SEC` (300s — see [Manual symbol ignore](#manual-symbol-ignore)).
