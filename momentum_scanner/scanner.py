@@ -77,10 +77,11 @@ def pool_only_profiles_for_session(session: Session) -> list[str]:
     TOP_AFTER_HOURS_PERC_GAIN ranks by change since the 4pm close -- confirmed
     live 2026-08-31 to surface real afterhours movers (LABT #1, WETO #3) that
     the whole-day-volume-contaminated HOT_BY_VOLUME buried at rank 41-45.
-    HIGH_OPEN_GAP is the premarket analog but is deliberately NOT here yet:
-    its ranking freezes at the 9:30 open, and whether it tracks the live gap
-    during premarket is unverified until a 4:00-9:25am run of
-    premarket_scan_check.py says so.
+    HIGH_OPEN_GAP was considered as the premarket analog but is excluded for
+    good: a 2026-09-01 06:43am ET run of premarket_scan_check.py confirmed it
+    returns zero rows premarket (same silent-empty failure as
+    TOP_OPEN_PERC_GAIN), on top of its known afterhours behavior of freezing
+    at the 9:30 open.
     """
     if session == Session.AFTERHOURS:
         return ["HIGH_STVOLUME_5MIN", "TOP_AFTER_HOURS_PERC_GAIN"]
