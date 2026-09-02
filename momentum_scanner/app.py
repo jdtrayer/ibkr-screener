@@ -19,13 +19,16 @@ from .controls import TunablesPanel
 from .scorer import SnapshotScorer
 from .filters import (
     PersistenceTracker,
+    ScorerAdmission,
     bump_candidate,
     bump_reason,
     display_reason,
+    slot_warmed_up,
+    spike_held,
     update_halt_state,
 )
 from .models import SymbolState
-from .scanner import ScannerManager
+from .scanner import ScanHit, ScannerManager
 from .session import Session, current_session
 from .tunables import Tunables
 
@@ -67,6 +70,7 @@ class ScannerApp(App):
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
         self.scorer = SnapshotScorer(self.ib)
+        self.scorer_admission = ScorerAdmission(self.tunables)
         self._reconnecting = False
 
     def compose(self) -> ComposeResult:
@@ -121,7 +125,11 @@ class ScannerApp(App):
 
     def _scorer_tick(self) -> None:
         # sweep() is re-entry-guarded internally, so a slow sweep can't stack.
-        asyncio.create_task(self.scorer.sweep())
+        asyncio.create_task(self._scorer_sweep_and_admit())
+
+    async def _scorer_sweep_and_admit(self) -> None:
+        await self.scorer.sweep()
+        self._scorer_admit()
 
     def _tick(self) -> None:
         self._tick_count += 1
@@ -238,7 +246,12 @@ class ScannerApp(App):
         squatter is only ever touched when something better needs its slot."""
         if symbol in self.states:
             if hit is not None:
+                # A hit from the admission-eligible scans means this symbol
+                # genuinely earned its spot -- graduate it out of a reserved
+                # scorer slot (if it came in that way) so that slot frees up
+                # for the next scorer candidate, without re-subscribing it.
                 self.states[symbol].scan_rank = hit.rank
+                self.states[symbol].scan_source = hit.source
             self._logged_no_slot.discard(symbol)
             return
         if hit is None:
@@ -255,9 +268,12 @@ class ScannerApp(App):
                 )
                 self._logged_no_slot.add(symbol)
             return
-        if len(self.states) >= self.tunables.max_live_symbols:
+        # scorer_reserved_slots are set aside for _scorer_admit -- this path
+        # (the scan-rank persistence gate) never bumps into or out of them.
+        non_scorer_states = {s: st for s, st in self.states.items() if st.scan_source != "SCORER"}
+        if len(non_scorer_states) >= self.tunables.max_live_symbols - self.tunables.scorer_reserved_slots:
             now = datetime.now(config.TZ)
-            bump = bump_candidate(self.states, self.session, now)
+            bump = bump_candidate(non_scorer_states, self.session, now)
             if bump is None:
                 self._log_no_slot(symbol)
                 return
@@ -268,6 +284,62 @@ class ScannerApp(App):
             )
             self._remove_symbol(bump.symbol)
             self._slot_cooldown[bump.symbol] = now
+        asyncio.create_task(self._add_symbol(hit))
+
+    def _scorer_admit(self) -> None:
+        """Fills up to tunables.scorer_reserved_slots live slots from the
+        Tier-1 scorer's own ranking (scorer.ranked(), which includes the
+        pool-only lists) instead of the scan-rank persistence gate -- see
+        config.py's SCORER_RESERVED_SLOTS for the motivating case. Pressure-
+        only: an existing reserved occupant is bumped only when a confirmed
+        new candidate needs its slot and it's the weakest one, never on a
+        timer, mirroring bump_candidate's philosophy for the main gate."""
+        ranked = self.scorer.ranked()
+        non_scorer_live = {s for s, st in self.states.items() if st.scan_source != "SCORER"}
+        ready = self.scorer_admission.update(ranked, non_scorer_live)
+        if not ready:
+            return
+
+        ranked_by_symbol = {r.symbol: r for r in ranked}
+        now = datetime.now(config.TZ)
+        swapped = False
+        for row in ready:
+            symbol = row.symbol
+            if symbol in self.states or symbol in self._slot_cooldown:
+                continue
+
+            scorer_syms = [s for s, st in self.states.items() if st.scan_source == "SCORER"]
+            if len(scorer_syms) < self.tunables.scorer_reserved_slots:
+                self._admit_scorer_candidate(row)
+                continue
+
+            if swapped:
+                continue  # at most one reserved-slot swap per sweep, to limit churn
+            bumpable = [
+                s for s in scorer_syms
+                if slot_warmed_up(self.states[s], now) and not spike_held(self.states[s], now)
+            ]
+            if not bumpable:
+                continue
+            weakest = min(bumpable, key=lambda s: ranked_by_symbol[s].score if s in ranked_by_symbol else float("-inf"))
+            weakest_score = ranked_by_symbol[weakest].score if weakest in ranked_by_symbol else float("-inf")
+            if row.score <= weakest_score:
+                continue
+            log.info(
+                "Bumped %s (scorer slot, score %.2f) to admit %s (score %.2f); re-entry barred for %.0fs",
+                weakest, weakest_score, symbol, row.score, self.tunables.slot_reentry_cooldown_sec,
+            )
+            self._remove_symbol(weakest)
+            self._slot_cooldown[weakest] = now
+            self._admit_scorer_candidate(row)
+            swapped = True
+
+    def _admit_scorer_candidate(self, row) -> None:
+        log.info(
+            "%s qualified via Tier-1 scorer (score=%.2f, move=%.2f%%/min, fast_lane=%s) for a reserved slot",
+            row.symbol, row.score, row.move_pct_per_min, row.fast_lane,
+        )
+        hit = ScanHit(symbol=row.symbol, con_id=0, rank=None, source="SCORER")
         asyncio.create_task(self._add_symbol(hit))
 
     def _log_no_slot(self, symbol: str) -> None:
@@ -307,7 +379,11 @@ class ScannerApp(App):
                 self._logged_no_slot.discard(sym)  # let a fresh block reason log again
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
-            if self.persistence.state_for(symbol).streak <= 0:
+            # Scorer-admitted symbols (state.scan_source == "SCORER") never
+            # entered via the scan-rank persistence gate, so they have no
+            # streak to decay -- _scorer_admit's pressure-only swap is their
+            # only eviction path (besides spike-quiet below).
+            if state.scan_source != "SCORER" and self.persistence.state_for(symbol).streak <= 0:
                 log.info(
                     "%s evicted: persistence streak decayed to 0 (out of scanner top-N for "
                     "over %.0fs) -- will lose its RVOL/$Vol history if re-admitted later",

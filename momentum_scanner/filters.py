@@ -14,6 +14,7 @@ from datetime import datetime
 from . import config
 from .models import HaltState, PersistenceState, SymbolState
 from .scanner import ScanHit
+from .scorer import ScoreRow
 from .session import Session
 from .tunables import Tunables
 from .config import TZ
@@ -70,6 +71,38 @@ class PersistenceTracker:
         return self._state.setdefault(symbol, PersistenceState())
 
 
+class ScorerAdmission:
+    """
+    Tracks which pool-only candidates (symbols the Tier-1 scorer sees --
+    including scanner.py's pool-only lists -- but that HOT_BY_VOLUME/
+    TOP_PERC_GAIN haven't ranked highly enough for PersistenceTracker) have
+    earned one of tunables.scorer_reserved_slots live slots. A candidate must
+    hold a top-scorer_reserved_slots score rank for SCORER_ADMIT_SWEEPS
+    consecutive sweeps, unless it's flagged fast_lane (extreme move%/min),
+    which admits on the very sweep it first appears -- same anti-flicker/
+    fast-lane split used for spike detection. See snapshot_scorer_design
+    memory / config.py's SCORER_RESERVED_SLOTS for the motivating case.
+    """
+
+    def __init__(self, tunables: Tunables):
+        self.tunables = tunables
+        self._streak: dict[str, int] = {}
+
+    def update(self, ranked: list[ScoreRow], already_live: set[str]) -> list[ScoreRow]:
+        top = [r for r in ranked if r.symbol not in already_live][: self.tunables.scorer_reserved_slots]
+        top_symbols = {r.symbol for r in top}
+        for sym in list(self._streak):
+            if sym not in top_symbols:
+                del self._streak[sym]
+
+        ready = []
+        for r in top:
+            self._streak[r.symbol] = self._streak.get(r.symbol, 0) + 1
+            if r.fast_lane or self._streak[r.symbol] >= config.SCORER_ADMIT_SWEEPS:
+                ready.append(r)
+        return ready
+
+
 def min_dollar_volume_for(session: Session) -> float:
     """The $ floor a symbol must clear, given its session -- premarket/afterhours
     liquidity is thin by nature, so it gets a genuinely lower bar than regular
@@ -101,7 +134,7 @@ def check_float(state: SymbolState) -> bool:
     return not (over and config.FLOAT_HARD_REJECT)
 
 
-def _slot_warmed_up(state: SymbolState, now: datetime) -> bool:
+def slot_warmed_up(state: SymbolState, now: datetime) -> bool:
     """Past the post-subscribe grace period, so missing/thin data can be held
     against it rather than punishing a symbol that just hasn't ticked yet."""
     return (
@@ -110,7 +143,7 @@ def _slot_warmed_up(state: SymbolState, now: datetime) -> bool:
     )
 
 
-def _slot_spike_held(state: SymbolState, now: datetime) -> bool:
+def spike_held(state: SymbolState, now: datetime) -> bool:
     """Exempt from bumping -- it spiked recently, so a transient dip in dollar
     volume or a momentarily wide print shouldn't cost it the slot mid-move."""
     last = state.spike.last_spike_at
@@ -169,7 +202,7 @@ def bump_candidate(
     now = now or datetime.now(TZ)
     best, best_score = None, 0.0
     for s in states.values():
-        if not _slot_warmed_up(s, now) or _slot_spike_held(s, now):
+        if not slot_warmed_up(s, now) or spike_held(s, now):
             continue
         score = max(_dv_weakness(s, session), _spread_weakness(s))
         if score > best_score:

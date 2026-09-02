@@ -252,6 +252,21 @@ HALT_EXPECTED_DURATIONS_MIN = (5.0, 10.0)
 # tier is commonly ~100 lines; other open windows consume lines too).
 MAX_LIVE_SYMBOLS = 30
 
+# Of MAX_LIVE_SYMBOLS, this many are reserved for the Tier-1 scorer's own
+# top candidates (scorer.py's ranked(), which includes the pool-only lists --
+# see scanner.py's pool_only_profiles_for_session) instead of the scan-rank
+# persistence gate. Concrete motivating case: BTQ on 2026-09-02 was a real
+# live mover (rank 35 on HIGH_STVOLUME_5MIN) that never cracked the top 50 of
+# HOT_BY_VOLUME/TOP_PERC_GAIN, so it never got a live tick subscription at
+# all under the scan-rank-only gate.
+SCORER_RESERVED_SLOTS = 3
+
+# A scorer candidate must hold a top-SCORER_RESERVED_SLOTS rank for this many
+# consecutive sweeps before it earns a reserved slot, unless it's flagged
+# fast_lane (see SCORE_FAST_MOVE_PCT_PER_MIN), which admits immediately --
+# same anti-flicker/fast-lane split as spike detection.
+SCORER_ADMIT_SWEEPS = 2
+
 # --------------------------------------------------------------------------
 # Refresh cadence
 # --------------------------------------------------------------------------

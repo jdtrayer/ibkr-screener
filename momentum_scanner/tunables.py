@@ -29,6 +29,7 @@ class Tunables:
     scalp_rr_ratio: float = config.SCALP_RR_RATIO
     slot_reentry_cooldown_sec: float = config.SLOT_REENTRY_COOLDOWN_SEC
     max_live_symbols: int = config.MAX_LIVE_SYMBOLS
+    scorer_reserved_slots: int = config.SCORER_RESERVED_SLOTS
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("scalp_rr_ratio", "Scalp R:R", 0.5, 1.0, 5.0, False, lambda v: f"{v:.1f}:1"),
     TunableSpec("slot_reentry_cooldown_sec", "Slot cooldown", 60, 0, 1800, False, lambda v: f"{v:.0f}s"),
     TunableSpec("max_live_symbols", "Live slots", 5, 5, 100, True, str),
+    TunableSpec("scorer_reserved_slots", "Scorer slots", 1, 0, 10, True, str),
 ]
 
 
