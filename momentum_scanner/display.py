@@ -123,7 +123,9 @@ def render(
     _waiting_for_slot_count / _cooldown_wait_count.
     """
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
-    if not connected:
+    if connected:
+        title += "  [bold green](CONNECTED)[/]"
+    else:
         title += "  [bold red](DISCONNECTED)[/]"
 
     table = Table(title=title, expand=True, show_lines=True)

@@ -67,6 +67,7 @@ class ScannerApp(App):
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
         self.scorer = SnapshotScorer(self.ib)
+        self._reconnecting = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -84,12 +85,39 @@ class ScannerApp(App):
 
     async def on_mount(self) -> None:
         await self.connect()
+        self.ib.disconnectedEvent += self._on_disconnected
         self.float_map = floatref.load()
         self._reconfigure_for_session(current_session())
         self.scanner_mgr.on_update(self._on_scan_update)
         self._render()
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
         self.set_interval(config.SCORE_REFRESH_SEC, self._scorer_tick)
+
+    def _on_disconnected(self) -> None:
+        log.warning("Lost connection to IB -- will retry every %ds until it's back", config.RECONNECT_RETRY_SEC)
+        if not self._reconnecting:
+            asyncio.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        """Scanner subscriptions and live market data both die with the socket
+        and ib_async does not resubscribe them on its own, so once the
+        connection is back this drops all live state and restarts the scanner
+        for the current session -- same as a session change, and for the same
+        reason: whatever ticked during the outage is gone, so there's nothing
+        worth preserving in self.states."""
+        self._reconnecting = True
+        try:
+            while not self.ib.isConnected():
+                try:
+                    await self.connect()
+                except Exception:
+                    log.warning("Reconnect attempt failed, retrying in %ds", config.RECONNECT_RETRY_SEC)
+                    await asyncio.sleep(config.RECONNECT_RETRY_SEC)
+            log.info("Reconnected to IB -- restarting scanner for session %s", self.session.value)
+            self._reconfigure_for_session(self.session)
+            self._render()
+        finally:
+            self._reconnecting = False
 
     def _scorer_tick(self) -> None:
         # sweep() is re-entry-guarded internally, so a slow sweep can't stack.

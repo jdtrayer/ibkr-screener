@@ -16,6 +16,10 @@ IB_HOST = "127.0.0.1"
 IB_PORT = 7497          # 7497 = TWS paper, 7496 = TWS live, 4002 = Gateway paper, 4001 = Gateway live
 IB_CLIENT_ID = 17
 
+# How long to wait between reconnect attempts after TWS/Gateway drops the
+# socket (e.g. a TWS restart) -- ib_async does not auto-reconnect on its own.
+RECONNECT_RETRY_SEC = 5
+
 # --------------------------------------------------------------------------
 # Session detection (America/New_York, DST-safe via zoneinfo)
 # --------------------------------------------------------------------------
