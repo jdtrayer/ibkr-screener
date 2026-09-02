@@ -34,7 +34,7 @@ class TunablesPanel(VerticalScroll):
         margin-top: 1;
     }
     TunablesPanel Horizontal {
-        height: 3;
+        height: 2;
         align: left middle;
     }
     TunablesPanel .tunable-label {
@@ -47,6 +47,8 @@ class TunablesPanel(VerticalScroll):
     TunablesPanel Button {
         min-width: 3;
         width: 3;
+        min-height: 2;
+        height: 2;
     }
     """
 
