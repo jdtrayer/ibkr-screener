@@ -250,7 +250,7 @@ HALT_EXPECTED_DURATIONS_MIN = (5.0, 10.0)
 # Cap on symbols with an active streaming reqMktData subscription at once.
 # Keep comfortably under your TWS/Gateway market-data-line limit (default
 # tier is commonly ~100 lines; other open windows consume lines too).
-MAX_LIVE_SYMBOLS = 25
+MAX_LIVE_SYMBOLS = 30
 
 # --------------------------------------------------------------------------
 # Refresh cadence
