@@ -49,6 +49,7 @@ class TunablesPanel(VerticalScroll):
         width: 3;
         min-height: 2;
         height: 2;
+        border: none !important;
     }
     """
 
