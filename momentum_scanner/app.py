@@ -53,7 +53,7 @@ class ScannerApp(App):
         height: 1fr;
     }
     #symbol-actions-panel {
-        height: 8;
+        height: 14;
     }
     """
 

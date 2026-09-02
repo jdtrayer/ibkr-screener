@@ -19,7 +19,7 @@ from .tunables import TUNABLE_SPECS, Tunables, bump
 
 _PERSISTENCE_ATTRS = {"persistence_required", "persistence_top_n", "persistence_reset_sec"}
 _SCALP_ATTRS = {"scalp_position_usd", "scalp_target_usd", "scalp_rr_ratio"}
-_SLOT_ATTRS = {"slot_reentry_cooldown_sec", "max_live_symbols"}
+_SLOT_ATTRS = {"slot_reentry_cooldown_sec", "max_live_symbols", "scorer_reserved_slots", "scorer_admit_min_score"}
 
 
 class TunablesPanel(VerticalScroll):
