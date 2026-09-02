@@ -77,11 +77,14 @@ class ScorerAdmission:
     including scanner.py's pool-only lists -- but that HOT_BY_VOLUME/
     TOP_PERC_GAIN haven't ranked highly enough for PersistenceTracker) have
     earned one of tunables.scorer_reserved_slots live slots. A candidate must
-    hold a top-scorer_reserved_slots score rank for SCORER_ADMIT_SWEEPS
-    consecutive sweeps, unless it's flagged fast_lane (extreme move%/min),
-    which admits on the very sweep it first appears -- same anti-flicker/
-    fast-lane split used for spike detection. See snapshot_scorer_design
-    memory / config.py's SCORER_RESERVED_SLOTS for the motivating case.
+    clear tunables.scorer_admit_min_score (score 0 is the flat baseline --
+    average $/min flow, zero move -- so this excludes pure noise-fill; see
+    config.py's SCORER_ADMIT_MIN_SCORE) AND hold a top-scorer_reserved_slots
+    rank for SCORER_ADMIT_SWEEPS consecutive sweeps, unless it's flagged
+    fast_lane (extreme move%/min), which admits on the very sweep it first
+    appears -- same anti-flicker/fast-lane split used for spike detection.
+    See snapshot_scorer_design memory / config.py's SCORER_RESERVED_SLOTS for
+    the motivating case.
     """
 
     def __init__(self, tunables: Tunables):
@@ -89,7 +92,11 @@ class ScorerAdmission:
         self._streak: dict[str, int] = {}
 
     def update(self, ranked: list[ScoreRow], already_live: set[str]) -> list[ScoreRow]:
-        top = [r for r in ranked if r.symbol not in already_live][: self.tunables.scorer_reserved_slots]
+        eligible = [
+            r for r in ranked
+            if r.symbol not in already_live and r.score >= self.tunables.scorer_admit_min_score
+        ]
+        top = eligible[: self.tunables.scorer_reserved_slots]
         top_symbols = {r.symbol for r in top}
         for sym in list(self._streak):
             if sym not in top_symbols:

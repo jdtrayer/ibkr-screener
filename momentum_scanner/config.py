@@ -267,6 +267,16 @@ SCORER_RESERVED_SLOTS = 3
 # same anti-flicker/fast-lane split as spike detection.
 SCORER_ADMIT_SWEEPS = 2
 
+# A candidate must clear this score to be considered for a reserved slot at
+# all -- score 0 is the flat baseline (average $/min flow, zero move), so
+# without a floor a reserved slot can end up occupied by pure noise-fill
+# (observed live 2026-09-02: WOOF admitted at score -0.03, below flat, only
+# because the prior occupant had decayed further). 1.0 keeps genuinely
+# moving names (e.g. 0.5%/min move at 2x reference $/min flow = 1.45) while
+# excluding noise-fill; if nothing clears it, reserved slots sit empty
+# rather than being force-filled.
+SCORER_ADMIT_MIN_SCORE = 1.0
+
 # --------------------------------------------------------------------------
 # Refresh cadence
 # --------------------------------------------------------------------------
