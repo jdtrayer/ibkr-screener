@@ -161,6 +161,16 @@ SLOT_BUMP_WARMUP_SEC = 60.0        # no bump judgment for this long after subscr
 SLOT_BUMP_SPIKE_HOLD_SEC = 120.0   # a spike within this window exempts a symbol from being bumped
 
 # --------------------------------------------------------------------------
+# Manual non-tradable list (sidebar panel) -- a user-triggered hold-out,
+# distinct from every automatic filter/eviction mechanism above. There's no
+# IBKR-queryable "not tradable" signal (broker-side restrictions, e.g. no
+# borrow) -- see backlog_2026_09_02 item #1 -- so this is a plain manual
+# add, auto-expiring after NON_TRADABLE_IGNORE_SEC so a stale entry doesn't
+# silently suppress a symbol forever.
+# --------------------------------------------------------------------------
+NON_TRADABLE_IGNORE_SEC = 24 * 3600.0  # 24h
+
+# --------------------------------------------------------------------------
 # Tier-1 snapshot scorer (observation-only slice of the two-tier redesign).
 # Candidates from the merged scan lists (ALL rows, not just the persistence
 # top-N) are batch-snapshotted every SCORE_REFRESH_SEC and ranked by OUR OWN

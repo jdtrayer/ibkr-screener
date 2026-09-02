@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ib_async import IB, Stock, Ticker
 from textual.app import App, ComposeResult
@@ -15,7 +15,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, Static
 
 from . import config, display, floatref, rvol, spikes
-from .controls import TunablesPanel
+from .controls import SymbolActionsPanel, TunablesPanel
 from .scorer import SnapshotScorer
 from .filters import (
     PersistenceTracker,
@@ -52,6 +52,9 @@ class ScannerApp(App):
     #tunables-panel {
         height: 1fr;
     }
+    #symbol-actions-panel {
+        height: 8;
+    }
     """
 
     def __init__(self):
@@ -72,6 +75,7 @@ class ScannerApp(App):
         self.scorer = SnapshotScorer(self.ib)
         self.scorer_admission = ScorerAdmission(self.tunables)
         self._scorer_pending: set[str] = set()  # admit tasks created but not yet landed in self.states
+        self._ignored_until: dict[str, datetime] = {}  # symbol -> when its manual non-tradable hold expires
         self._reconnecting = False
 
     def compose(self) -> ComposeResult:
@@ -82,6 +86,7 @@ class ScannerApp(App):
                 yield Static(id="scorer-table")
             with Vertical(id="side-panel"):
                 yield TunablesPanel(self.tunables, id="tunables-panel")
+                yield SymbolActionsPanel(id="symbol-actions-panel")
         yield Footer()
 
     async def connect(self) -> None:
@@ -178,6 +183,7 @@ class ScannerApp(App):
         self.query_one("#scorer-table", Static).update(
             display.render_scorer(self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at)
         )
+        self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))
 
     def _waiting_for_slot_count(self) -> int:
         """Symbols that have cleared persistence and are genuinely blocked by a
@@ -255,6 +261,8 @@ class ScannerApp(App):
                 self.states[symbol].scan_source = hit.source
             self._logged_no_slot.discard(symbol)
             return
+        if symbol in self._ignored_until:
+            return
         if hit is None:
             return
         if symbol in self._slot_cooldown:
@@ -306,7 +314,12 @@ class ScannerApp(App):
         swapped = False
         for row in ready:
             symbol = row.symbol
-            if symbol in self.states or symbol in self._slot_cooldown or symbol in self._scorer_pending:
+            if (
+                symbol in self.states
+                or symbol in self._slot_cooldown
+                or symbol in self._scorer_pending
+                or symbol in self._ignored_until
+            ):
                 continue
 
             scorer_syms = [s for s, st in self.states.items() if st.scan_source == "SCORER"]
@@ -389,6 +402,10 @@ class ScannerApp(App):
             if (now - evicted_at).total_seconds() >= self.tunables.slot_reentry_cooldown_sec:
                 del self._slot_cooldown[sym]
                 self._logged_no_slot.discard(sym)  # let a fresh block reason log again
+        for sym, until in list(self._ignored_until.items()):
+            if now >= until:
+                del self._ignored_until[sym]
+                log.info("%s non-tradable hold expired (24h elapsed)", sym)
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
             # Scorer-admitted symbols (state.scan_source == "SCORER") never
@@ -411,10 +428,33 @@ class ScannerApp(App):
                 )
                 self._remove_symbol(symbol)
 
+    # -- manual non-tradable list (SymbolActionsPanel) ----------------------
+
+    def on_symbol_actions_panel_action(self, message: SymbolActionsPanel.Action) -> None:
+        if message.action == "clear":
+            self._unignore_symbol(message.symbol)
+        else:
+            self._ignore_symbol(message.symbol)
+
+    def _ignore_symbol(self, symbol: str) -> None:
+        until = datetime.now(config.TZ) + timedelta(seconds=config.NON_TRADABLE_IGNORE_SEC)
+        self._ignored_until[symbol] = until
+        log.info("%s marked non-tradable, held out of admission for %.0fh", symbol, config.NON_TRADABLE_IGNORE_SEC / 3600)
+        if symbol in self.states:
+            self._remove_symbol(symbol)
+
+    def _unignore_symbol(self, symbol: str) -> None:
+        if self._ignored_until.pop(symbol, None) is not None:
+            log.info("%s removed from non-tradable list", symbol)
+
     # -- per-symbol lifecycle ----------------------------------------------
 
     async def _add_symbol(self, hit) -> None:
-        if hit.symbol in self.states or len(self.states) >= self.tunables.max_live_symbols:
+        if (
+            hit.symbol in self.states
+            or len(self.states) >= self.tunables.max_live_symbols
+            or hit.symbol in self._ignored_until
+        ):
             return
         state = SymbolState(symbol=hit.symbol, scan_rank=hit.rank, scan_source=hit.source)
         self._apply_float(state)
