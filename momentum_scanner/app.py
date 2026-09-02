@@ -71,6 +71,7 @@ class ScannerApp(App):
         self._row_order: list[str] = []
         self.scorer = SnapshotScorer(self.ib)
         self.scorer_admission = ScorerAdmission(self.tunables)
+        self._scorer_pending: set[str] = set()  # admit tasks created but not yet landed in self.states
         self._reconnecting = False
 
     def compose(self) -> ComposeResult:
@@ -305,11 +306,15 @@ class ScannerApp(App):
         swapped = False
         for row in ready:
             symbol = row.symbol
-            if symbol in self.states or symbol in self._slot_cooldown:
+            if symbol in self.states or symbol in self._slot_cooldown or symbol in self._scorer_pending:
                 continue
 
             scorer_syms = [s for s, st in self.states.items() if st.scan_source == "SCORER"]
-            if len(scorer_syms) < self.tunables.scorer_reserved_slots:
+            # _scorer_pending covers admits from earlier in THIS loop whose
+            # _add_symbol task hasn't run yet -- without it, two candidates
+            # both see the same not-yet-taken slot as free in the same pass.
+            occupied = len(scorer_syms) + len(self._scorer_pending - set(scorer_syms))
+            if occupied < self.tunables.scorer_reserved_slots:
                 self._admit_scorer_candidate(row)
                 continue
 
@@ -340,7 +345,14 @@ class ScannerApp(App):
             row.symbol, row.score, row.move_pct_per_min, row.fast_lane,
         )
         hit = ScanHit(symbol=row.symbol, con_id=0, rank=None, source="SCORER")
-        asyncio.create_task(self._add_symbol(hit))
+        self._scorer_pending.add(row.symbol)
+        asyncio.create_task(self._add_symbol_scorer(hit))
+
+    async def _add_symbol_scorer(self, hit) -> None:
+        try:
+            await self._add_symbol(hit)
+        finally:
+            self._scorer_pending.discard(hit.symbol)
 
     def _log_no_slot(self, symbol: str) -> None:
         if symbol in self._logged_no_slot:
