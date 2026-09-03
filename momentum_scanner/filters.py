@@ -179,6 +179,23 @@ def _spread_weakness(state: SymbolState) -> float:
     return spread_pct / config.MAX_SPREAD_PCT
 
 
+def is_dead_on_bump(state: SymbolState, session: Session, fraction: float) -> bool:
+    """True if `state` is being bumped primarily for dollar-volume weakness
+    (not spread) AND its dollar volume is negligible -- at or below
+    `fraction` of the session's floor -- rather than merely a dip below it.
+    Distinguishes a symbol that's genuinely never traded while it held the
+    slot (see config.py's DEAD_DV_FRACTION/DEAD_HOLD_SEC -- confirmed live
+    2026-09-02 with TYA cycling admit/bump/re-admit 10+ times, always at
+    ~$0 dollar volume) from one that just cooled off from real activity."""
+    if _dv_weakness(state, session) < _spread_weakness(state):
+        return False  # bumped mainly for spread, not dead volume
+    dv = state.dollar_volume
+    if dv is None:
+        return True
+    floor = min_dollar_volume_for(session)
+    return dv <= floor * fraction
+
+
 def bump_reason(state: SymbolState, session: Session) -> str:
     """Human-readable reason `state` was chosen as the bump candidate --
     whichever of the two weakness signals is larger for it."""

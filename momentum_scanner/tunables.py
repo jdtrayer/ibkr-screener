@@ -31,6 +31,7 @@ class Tunables:
     max_live_symbols: int = config.MAX_LIVE_SYMBOLS
     scorer_reserved_slots: int = config.SCORER_RESERVED_SLOTS
     scorer_admit_min_score: float = config.SCORER_ADMIT_MIN_SCORE
+    dead_hold_sec: float = config.DEAD_HOLD_SEC
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("max_live_symbols", "Live slots", 5, 5, 100, True, str),
     TunableSpec("scorer_reserved_slots", "Scorer slots", 1, 0, 10, True, str),
     TunableSpec("scorer_admit_min_score", "Scorer min score", 0.25, -5.0, 5.0, False, lambda v: f"{v:+.2f}"),
+    TunableSpec("dead_hold_sec", "Dead hold", 300, 300, 7200, False, lambda v: f"{v / 60:.0f}m"),
 ]
 
 

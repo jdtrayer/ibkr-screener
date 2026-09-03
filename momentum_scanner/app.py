@@ -23,6 +23,7 @@ from .filters import (
     bump_candidate,
     bump_reason,
     display_reason,
+    is_dead_on_bump,
     slot_warmed_up,
     spike_held,
     update_halt_state,
@@ -76,6 +77,7 @@ class ScannerApp(App):
         self.scorer_admission = ScorerAdmission(self.tunables)
         self._scorer_pending: set[str] = set()  # admit tasks created but not yet landed in self.states
         self._ignored_until: dict[str, datetime] = {}  # symbol -> when its manual non-tradable hold expires
+        self._dead_hold: dict[str, datetime] = {}  # symbol -> when its auto dead-hold expires (see filters.is_dead_on_bump)
         self._reconnecting = False
 
     def compose(self) -> ComposeResult:
@@ -220,6 +222,7 @@ class ScannerApp(App):
         for symbol in list(self.states.keys()):
             self._remove_symbol(symbol)
         self._slot_cooldown.clear()
+        self._dead_hold.clear()  # "dead" was judged against the old session's $ floor -- doesn't carry over
         self.persistence = PersistenceTracker(self.tunables)
         self.scanner_mgr.start(session)
 
@@ -261,7 +264,7 @@ class ScannerApp(App):
                 self.states[symbol].scan_source = hit.source
             self._logged_no_slot.discard(symbol)
             return
-        if symbol in self._ignored_until:
+        if symbol in self._ignored_until or symbol in self._dead_hold:
             return
         if hit is None:
             return
@@ -286,11 +289,19 @@ class ScannerApp(App):
             if bump is None:
                 self._log_no_slot(symbol)
                 return
-            log.info(
-                "Bumped %s (%s) to admit %s; re-entry barred for %.0fs",
-                bump.symbol, bump_reason(bump, self.session), symbol,
-                self.tunables.slot_reentry_cooldown_sec,
-            )
+            reason = bump_reason(bump, self.session)
+            if is_dead_on_bump(bump, self.session, config.DEAD_DV_FRACTION):
+                self._dead_hold[bump.symbol] = now + timedelta(seconds=self.tunables.dead_hold_sec)
+                log.info(
+                    "Bumped %s (%s, genuinely dead) to admit %s; held out %.0fm instead of the "
+                    "normal re-entry cooldown -- re-qualifying via scan rank alone won't readmit it",
+                    bump.symbol, reason, symbol, self.tunables.dead_hold_sec / 60,
+                )
+            else:
+                log.info(
+                    "Bumped %s (%s) to admit %s; re-entry barred for %.0fs",
+                    bump.symbol, reason, symbol, self.tunables.slot_reentry_cooldown_sec,
+                )
             self._remove_symbol(bump.symbol)
             self._slot_cooldown[bump.symbol] = now
         asyncio.create_task(self._add_symbol(hit))
@@ -319,6 +330,7 @@ class ScannerApp(App):
                 or symbol in self._slot_cooldown
                 or symbol in self._scorer_pending
                 or symbol in self._ignored_until
+                or symbol in self._dead_hold
             ):
                 continue
 
@@ -406,6 +418,11 @@ class ScannerApp(App):
             if now >= until:
                 del self._ignored_until[sym]
                 log.info("%s non-tradable hold expired (24h elapsed)", sym)
+        for sym, until in list(self._dead_hold.items()):
+            if now >= until:
+                del self._dead_hold[sym]
+                self._logged_no_slot.discard(sym)
+                log.info("%s dead-hold expired (%.0fm elapsed)", sym, self.tunables.dead_hold_sec / 60)
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
             # Scorer-admitted symbols (state.scan_source == "SCORER") never
@@ -454,6 +471,7 @@ class ScannerApp(App):
             hit.symbol in self.states
             or len(self.states) >= self.tunables.max_live_symbols
             or hit.symbol in self._ignored_until
+            or hit.symbol in self._dead_hold
         ):
             return
         state = SymbolState(symbol=hit.symbol, scan_rank=hit.rank, scan_source=hit.source)

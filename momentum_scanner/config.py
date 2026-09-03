@@ -160,6 +160,18 @@ SLOT_REENTRY_COOLDOWN_SEC = 300.0  # a bumped symbol can't re-take a slot for th
 SLOT_BUMP_WARMUP_SEC = 60.0        # no bump judgment for this long after subscribing (data may lag)
 SLOT_BUMP_SPIKE_HOLD_SEC = 120.0   # a spike within this window exempts a symbol from being bumped
 
+# A symbol re-qualifying via IB's scan rank (e.g. HOT_BY_VOLUME's whole-day-
+# cumulative-volume ranking never resetting -- see session_scoped_volume)
+# despite having genuinely zero current activity wastes a live slot and an
+# RVOL-baseline rebuild every re-entry cycle. Confirmed live 2026-09-02: TYA
+# cycled admit -> bump -> cooldown -> re-admit 10+ times in ~3.5 hours,
+# always at dollar volume near zero (never a borderline dip), always
+# immediately hidden by the RVOL display floor. DEAD_HOLD_SEC seeds the
+# runtime-mutable Tunables; DEAD_DV_FRACTION does not (an engineering
+# threshold, not something to tune mid-session).
+DEAD_DV_FRACTION = 0.02   # dollar volume at/below this fraction of the session floor counts as genuinely dead, not just weak
+DEAD_HOLD_SEC = 45 * 60.0  # how long a genuinely-dead eviction holds the symbol out, instead of the normal SLOT_REENTRY_COOLDOWN_SEC
+
 # --------------------------------------------------------------------------
 # Manual non-tradable list (sidebar panel) -- a user-triggered hold-out,
 # distinct from every automatic filter/eviction mechanism above. There's no
