@@ -97,6 +97,14 @@ HISTORICAL_FETCH_MIN_INTERVAL_SEC = 1.5
 RVOL_FETCH_MAX_ATTEMPTS = 3
 RVOL_FETCH_RETRY_DELAY_SEC = 5.0
 
+# If a whole attempt-wave above is exhausted, the failure is usually premarket
+# historical-data congestion rather than something specific to the symbol
+# (observed hitting a different symbol most sessions), so it's worth one more
+# wave after a longer cooldown before writing the symbol off as RVOL-blind
+# for the rest of the session.
+RVOL_BASELINE_MAX_WAVES = 2
+RVOL_BASELINE_WAVE_DELAY_SEC = 90.0
+
 # Minimum number of historical days that must have data in a given 5-min
 # bucket before we trust the baseline for that bucket. Early in a session,
 # thinly-traded buckets can otherwise produce a near-zero baseline and an
@@ -177,10 +185,14 @@ DEAD_HOLD_SEC = 45 * 60.0  # how long a genuinely-dead eviction holds the symbol
 # distinct from every automatic filter/eviction mechanism above. There's no
 # IBKR-queryable "not tradable" signal (broker-side restrictions, e.g. no
 # borrow) -- see backlog_2026_09_02 item #1 -- so this is a plain manual
-# add, auto-expiring after NON_TRADABLE_IGNORE_SEC so a stale entry doesn't
-# silently suppress a symbol forever.
+# add, expiring at the start of the next trading day (not a rolling 24h --
+# a symbol marked Friday afternoon stays held over the weekend and clears
+# Monday, per session.next_trading_day; no holiday calendar) so a stale
+# entry doesn't silently suppress a symbol forever. Persisted to disk so it
+# survives an app restart mid-session (see momentum_scanner/app.py's
+# _load_non_tradable / _save_non_tradable).
 # --------------------------------------------------------------------------
-NON_TRADABLE_IGNORE_SEC = 24 * 3600.0  # 24h
+NON_TRADABLE_STATE_FILE = "./cache/non_tradable.json"
 
 # --------------------------------------------------------------------------
 # Tier-1 snapshot scorer (observation-only slice of the two-tier redesign).

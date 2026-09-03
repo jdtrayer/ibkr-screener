@@ -5,9 +5,11 @@ filters -> display together and drives the Textual UI.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from ib_async import IB, Stock, Ticker
 from textual.app import App, ComposeResult
@@ -30,7 +32,7 @@ from .filters import (
 )
 from .models import SymbolState
 from .scanner import ScanHit, ScannerManager
-from .session import Session, current_session
+from .session import Session, current_session, next_trading_day
 from .tunables import Tunables
 
 log = logging.getLogger(__name__)
@@ -99,6 +101,7 @@ class ScannerApp(App):
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
         self.float_map = floatref.load()
+        self._load_non_tradable()
         self._reconfigure_for_session(current_session())
         self.scanner_mgr.on_update(self._on_scan_update)
         self._render()
@@ -415,10 +418,12 @@ class ScannerApp(App):
             if (now - evicted_at).total_seconds() >= self.tunables.slot_reentry_cooldown_sec:
                 del self._slot_cooldown[sym]
                 self._logged_no_slot.discard(sym)  # let a fresh block reason log again
-        for sym, until in list(self._ignored_until.items()):
-            if now >= until:
-                del self._ignored_until[sym]
-                log.info("%s non-tradable hold expired (24h elapsed)", sym)
+        expired_non_tradable = [sym for sym, until in self._ignored_until.items() if now >= until]
+        for sym in expired_non_tradable:
+            del self._ignored_until[sym]
+            log.info("%s non-tradable hold expired (next trading day reached)", sym)
+        if expired_non_tradable:
+            self._save_non_tradable()
         for sym, until in list(self._dead_hold.items()):
             if now >= until:
                 del self._dead_hold[sym]
@@ -455,15 +460,48 @@ class ScannerApp(App):
             self._ignore_symbol(message.symbol)
 
     def _ignore_symbol(self, symbol: str) -> None:
-        until = datetime.now(config.TZ) + timedelta(seconds=config.NON_TRADABLE_IGNORE_SEC)
+        now = datetime.now(config.TZ)
+        next_day = next_trading_day(now.date())
+        until = datetime(next_day.year, next_day.month, next_day.day, tzinfo=config.TZ)
         self._ignored_until[symbol] = until
-        log.info("%s marked non-tradable, held out of admission for %.0fh", symbol, config.NON_TRADABLE_IGNORE_SEC / 3600)
+        log.info("%s marked non-tradable, held out of admission until %s (next trading day)", symbol, next_day.isoformat())
+        self._save_non_tradable()
         if symbol in self.states:
             self._remove_symbol(symbol)
 
     def _unignore_symbol(self, symbol: str) -> None:
         if self._ignored_until.pop(symbol, None) is not None:
             log.info("%s removed from non-tradable list", symbol)
+            self._save_non_tradable()
+
+    def _load_non_tradable(self) -> None:
+        """Restore the manual non-tradable list across a restart. Entries
+        whose next-trading-day boundary has already passed while the app was
+        down are dropped rather than re-added -- same as a normal expiry."""
+        try:
+            raw = json.loads(Path(config.NON_TRADABLE_STATE_FILE).read_text())
+        except FileNotFoundError:
+            return
+        except Exception:
+            log.exception("Non-tradable list load failed (non-fatal); starting empty")
+            return
+        now = datetime.now(config.TZ)
+        loaded = {}
+        for sym, until_str in raw.items():
+            until = datetime.fromisoformat(until_str)
+            if until > now:
+                loaded[sym] = until
+        self._ignored_until = loaded
+        if self._ignored_until:
+            log.info("Restored %d non-tradable symbol(s) from disk: %s", len(loaded), ", ".join(sorted(loaded)))
+
+    def _save_non_tradable(self) -> None:
+        try:
+            path = Path(config.NON_TRADABLE_STATE_FILE)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({sym: until.isoformat() for sym, until in self._ignored_until.items()}))
+        except Exception:
+            log.exception("Non-tradable list save failed (non-fatal)")
 
     # -- per-symbol lifecycle ----------------------------------------------
 

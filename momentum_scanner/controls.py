@@ -108,9 +108,10 @@ class SymbolActionsPanel(VerticalScroll):
     """
     Sidebar widget for manually marking a symbol non-tradable (a broker-side
     restriction with no IBKR-queryable signal -- see config.py's
-    NON_TRADABLE_IGNORE_SEC). Purely a view: it reads the typed symbol and
+    NON_TRADABLE_STATE_FILE). Purely a view: it reads the typed symbol and
     posts an Action message, app.py owns the actual ignore-set/timer state
-    and calls refresh_status() back.
+    (persisted to disk, expiring at the next trading day) and calls
+    refresh_status() back.
     """
 
     DEFAULT_CSS = """
@@ -139,7 +140,7 @@ class SymbolActionsPanel(VerticalScroll):
             super().__init__()
 
     def compose(self) -> ComposeResult:
-        yield Static("Non-tradable (24h)", classes="section-header")
+        yield Static("Non-tradable (til next day)", classes="section-header")
         yield Input(placeholder="SYMBOL", id="ignore-symbol-input")
         yield Horizontal(
             Button("Add", id="ignore-add"),
@@ -168,8 +169,15 @@ class SymbolActionsPanel(VerticalScroll):
             self.query_one("#ignore-status", Static).update("")
             return
         lines = [
-            f"{sym} ({max((until - now).total_seconds(), 0) / 3600:.1f}h left)"
+            f"{sym} ({self._fmt_remaining(until - now)} left)"
             for sym, until in sorted(ignored_until.items())
         ]
         self.query_one("#ignore-status", Static).update("\n".join(lines))
+
+    @staticmethod
+    def _fmt_remaining(delta) -> str:
+        hours = max(delta.total_seconds(), 0) / 3600
+        if hours >= 24:
+            return f"{int(hours // 24)}d {hours % 24:.0f}h"
+        return f"{hours:.1f}h"
 

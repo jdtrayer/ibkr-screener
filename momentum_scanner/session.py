@@ -8,7 +8,7 @@ platform tz database rather than by us.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from enum import Enum
 
 from . import config
@@ -64,6 +64,15 @@ def current_session(now: datetime | None = None) -> Session:
     if REGULAR_END <= t < AFTERHOURS_END:
         return Session.AFTERHOURS
     return Session.CLOSED
+
+
+def next_trading_day(d: date) -> date:
+    """The next weekday after `d`, skipping Saturday/Sunday. No holiday
+    calendar -- same convention as current_session()."""
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:  # Saturday=5, Sunday=6
+        nxt += timedelta(days=1)
+    return nxt
 
 
 def session_window(session: Session, on_date: datetime) -> SessionWindow:
