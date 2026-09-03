@@ -191,6 +191,7 @@ class ScannerApp(App):
             self._row_order,
             waiting_count=self._waiting_for_slot_count(),
             cooldown_count=self._cooldown_wait_count(),
+            held_count=self._held_count(),
         )
         self.query_one("#scanner-table", Static).update(table)
         self.query_one("#scorer-table", Static).update(
@@ -205,15 +206,21 @@ class ScannerApp(App):
         """Symbols that have cleared persistence and are genuinely blocked by a
         full pool with nothing bump-eligible -- raising max_live_symbols (or a
         weaker occupant showing up) is what unblocks these. Excludes symbols
-        sitting out a re-entry cooldown; see _cooldown_wait_count for those.
-        Recomputed fresh each render rather than tracked incrementally, so it
-        self-corrects if a candidate drops out of the top-N while queued
-        instead of ever getting a slot."""
+        sitting out a re-entry cooldown (see _cooldown_wait_count) and symbols
+        held out by a dead-hold or the manual non-tradable list (see
+        _held_count) -- neither of those is a capacity problem, so lumping
+        them in here made an empty pool look full (reproduced live 2026-09-03:
+        22/35 slots used, 10 "waiting" -- all 10 were actually dead-held or
+        non-tradable, not capacity-blocked). Recomputed fresh each render
+        rather than tracked incrementally, so it self-corrects if a candidate
+        drops out of the top-N while queued instead of ever getting a slot."""
         return sum(
             1 for sym in self._pending_hits
             if sym not in self.states
             and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
             and sym not in self._slot_cooldown
+            and sym not in self._dead_hold
+            and sym not in self._ignored_until
         )
 
     def _cooldown_wait_count(self) -> int:
@@ -226,6 +233,19 @@ class ScannerApp(App):
             if sym not in self.states
             and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
             and sym in self._slot_cooldown
+        )
+
+    def _held_count(self) -> int:
+        """Symbols that have cleared persistence but are held out by a
+        dead-hold (filters.is_dead_on_bump) or the manual non-tradable list --
+        like cooldown, unrelated to capacity; raising max_live_symbols does
+        NOT admit these."""
+        return sum(
+            1 for sym in self._pending_hits
+            if sym not in self.states
+            and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
+            and sym not in self._slot_cooldown
+            and (sym in self._dead_hold or sym in self._ignored_until)
         )
 
     # -- session lifecycle -------------------------------------------------
@@ -279,6 +299,14 @@ class ScannerApp(App):
             self._logged_no_slot.discard(symbol)
             return
         if symbol in self._ignored_until or symbol in self._dead_hold:
+            if symbol not in self._logged_no_slot:
+                reason = "non-tradable list" if symbol in self._ignored_until else "dead-hold"
+                log.info(
+                    "%s qualified but held out by %s -- NOT capacity-blocked, "
+                    "raising max_live_symbols won't admit it",
+                    symbol, reason,
+                )
+                self._logged_no_slot.add(symbol)
             return
         if hit is None:
             return
@@ -432,6 +460,7 @@ class ScannerApp(App):
         expired_non_tradable = [sym for sym, until in self._ignored_until.items() if now >= until]
         for sym in expired_non_tradable:
             del self._ignored_until[sym]
+            self._logged_no_slot.discard(sym)  # let a fresh block reason log again
             log.info("%s non-tradable hold expired (next trading day reached)", sym)
         if expired_non_tradable:
             self._save_non_tradable()
