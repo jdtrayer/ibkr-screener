@@ -118,9 +118,10 @@ def render(
     `waiting_count` is the number of symbols that have cleared persistence but
     are blocked by a genuinely full pool -- raising max_live_symbols admits
     these. `cooldown_count` is symbols sitting out a re-entry cooldown after
-    being bumped, and `held_count` is symbols held out by a dead-hold or the
-    manual non-tradable list -- neither is a capacity problem, raising
-    max_live_symbols does NOT admit either. Kept as separate numbers so the
+    being bumped, and `held_count` is symbols held out by a dead-hold, the
+    manual non-tradable list, or an excluded instrument type -- none of these
+    is a capacity problem, raising max_live_symbols does NOT admit them.
+    Kept as separate numbers so the
     caption doesn't conflate a capacity problem with a timer/hold -- see
     app.py's _waiting_for_slot_count / _cooldown_wait_count / _held_count.
     """
@@ -211,7 +212,7 @@ def render(
     if cooldown_count:
         status_bits.append(f"{cooldown_count} in re-entry cooldown")
     if held_count:
-        status_bits.append(f"{held_count} held (dead/non-tradable)")
+        status_bits.append(f"{held_count} held (dead/non-tradable/excluded)")
     if not ranked:
         status_bits.insert(0, "No symbols have cleared persistence + RVOL floor yet…")
     table.caption = "   ".join(status_bits)

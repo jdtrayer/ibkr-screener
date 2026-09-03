@@ -84,6 +84,15 @@ class ScannerApp(App):
         self._scorer_pending: set[str] = set()  # admit tasks created but not yet landed in self.states
         self._ignored_until: dict[str, datetime] = {}  # symbol -> when its manual non-tradable hold expires
         self._dead_hold: dict[str, datetime] = {}  # symbol -> when its auto dead-hold expires (see filters.is_dead_on_bump)
+        # Instrument type doesn't change day to day, so this never expires --
+        # unlike every other hold above. Prevents the infinite re-admit/drop
+        # loop confirmed live 2026-09-03: an ETF stayed persistence-qualified
+        # (IB kept re-surfacing it on scan refreshes) but nothing ever held it
+        # out after the stockType check dropped it, so it got re-qualified,
+        # re-checked, and re-dropped every ~1-3s indefinitely -- 7 symbols
+        # cycling this way simultaneously showed up as "7 waiting for a slot"
+        # even though none of them would ever actually get one.
+        self._excluded_stock_types: set[str] = set()
         self._reconnecting = False
 
     def compose(self) -> ComposeResult:
@@ -214,13 +223,15 @@ class ScannerApp(App):
         full pool with nothing bump-eligible -- raising max_live_symbols (or a
         weaker occupant showing up) is what unblocks these. Excludes symbols
         sitting out a re-entry cooldown (see _cooldown_wait_count) and symbols
-        held out by a dead-hold or the manual non-tradable list (see
-        _held_count) -- neither of those is a capacity problem, so lumping
-        them in here made an empty pool look full (reproduced live 2026-09-03:
-        22/35 slots used, 10 "waiting" -- all 10 were actually dead-held or
-        non-tradable, not capacity-blocked). Recomputed fresh each render
-        rather than tracked incrementally, so it self-corrects if a candidate
-        drops out of the top-N while queued instead of ever getting a slot."""
+        held out by a dead-hold, the manual non-tradable list, or an excluded
+        instrument type (see _held_count) -- none of those is a capacity
+        problem, so lumping them in here made an empty pool look full
+        (reproduced live twice: 2026-09-03 with dead-hold/non-tradable, and
+        again the same day with a permanent ETF exclusion that had no
+        hold-out at all -- see _excluded_stock_types). Recomputed fresh each
+        render rather than tracked incrementally, so it self-corrects if a
+        candidate drops out of the top-N while queued instead of ever
+        getting a slot."""
         return sum(
             1 for sym in self._pending_hits
             if sym not in self.states
@@ -228,6 +239,7 @@ class ScannerApp(App):
             and sym not in self._slot_cooldown
             and sym not in self._dead_hold
             and sym not in self._ignored_until
+            and sym not in self._excluded_stock_types
         )
 
     def _cooldown_wait_count(self) -> int:
@@ -244,15 +256,15 @@ class ScannerApp(App):
 
     def _held_count(self) -> int:
         """Symbols that have cleared persistence but are held out by a
-        dead-hold (filters.is_dead_on_bump) or the manual non-tradable list --
-        like cooldown, unrelated to capacity; raising max_live_symbols does
-        NOT admit these."""
+        dead-hold (filters.is_dead_on_bump), the manual non-tradable list, or
+        a permanently excluded instrument type -- like cooldown, unrelated to
+        capacity; raising max_live_symbols does NOT admit these."""
         return sum(
             1 for sym in self._pending_hits
             if sym not in self.states
             and self.persistence.state_for(sym).streak >= self.tunables.persistence_required
             and sym not in self._slot_cooldown
-            and (sym in self._dead_hold or sym in self._ignored_until)
+            and (sym in self._dead_hold or sym in self._ignored_until or sym in self._excluded_stock_types)
         )
 
     # -- session lifecycle -------------------------------------------------
@@ -305,9 +317,14 @@ class ScannerApp(App):
                 self.states[symbol].scan_source = hit.source
             self._logged_no_slot.discard(symbol)
             return
-        if symbol in self._ignored_until or symbol in self._dead_hold:
+        if symbol in self._ignored_until or symbol in self._dead_hold or symbol in self._excluded_stock_types:
             if symbol not in self._logged_no_slot:
-                reason = "non-tradable list" if symbol in self._ignored_until else "dead-hold"
+                if symbol in self._ignored_until:
+                    reason = "non-tradable list"
+                elif symbol in self._dead_hold:
+                    reason = "dead-hold"
+                else:
+                    reason = "excluded instrument type"
                 log.info(
                     "%s qualified but held out by %s -- NOT capacity-blocked, "
                     "raising max_live_symbols won't admit it",
@@ -558,6 +575,7 @@ class ScannerApp(App):
             or len(self.states) >= self.tunables.max_live_symbols
             or hit.symbol in self._ignored_until
             or hit.symbol in self._dead_hold
+            or hit.symbol in self._excluded_stock_types
         ):
             return
         state = SymbolState(symbol=hit.symbol, scan_rank=hit.rank, scan_source=hit.source)
@@ -585,7 +603,12 @@ class ScannerApp(App):
             log.exception("Failed to fetch contract details for %s (proceeding -- not excluded)", hit.symbol)
             stock_type = None
         if stock_type in config.EXCLUDE_STOCK_TYPES:
-            log.info("%s dropped: excluded instrument type (stockType=%s)", hit.symbol, stock_type)
+            log.info(
+                "%s dropped: excluded instrument type (stockType=%s) -- held out permanently, "
+                "won't be re-attempted",
+                hit.symbol, stock_type,
+            )
+            self._excluded_stock_types.add(hit.symbol)
             self._remove_symbol(hit.symbol)
             return
 
