@@ -400,7 +400,8 @@ class ScannerApp(App):
             if reason == self._filter_reasons.get(symbol):
                 continue
             if reason is None:
-                log.info("%s now passing display filters (rvol=%.2fx)", symbol, state.rvol)
+                rvol_txt = f"{state.rvol:.2f}x" if state.rvol is not None else "unavailable"
+                log.info("%s now passing display filters (rvol=%s)", symbol, rvol_txt)
             else:
                 log.info("%s hidden from display: %s", symbol, reason)
             self._filter_reasons[symbol] = reason
@@ -515,8 +516,10 @@ class ScannerApp(App):
 
     async def _load_baseline(self, state: SymbolState) -> None:
         baseline = await rvol.build_baseline(self.ib, state.symbol, self.session)
-        if state.symbol in self.states:
-            state.baseline = baseline
+        if state.symbol not in self.states:
+            return
+        state.baseline = baseline
+        state.baseline_unavailable = baseline is None
 
     async def _load_float(self, state: SymbolState) -> None:
         if state.float_known:

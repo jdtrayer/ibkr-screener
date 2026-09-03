@@ -101,35 +101,45 @@ async def build_baseline(ib: IB, symbol: str, session: Session, use_cache: bool 
 
     contract = Stock(symbol, "SMART", "USD")
     bars = None
-    for attempt in range(1, config.RVOL_FETCH_MAX_ATTEMPTS + 1):
-        try:
-            bars = await _throttled_fetch(
-                ib,
-                contract,
-                endDateTime="",
-                durationStr=f"{config.RVOL_LOOKBACK_DAYS} D",
-                barSizeSetting=config.RVOL_BAR_SIZE,
-                whatToShow="TRADES",
-                useRTH=False,
-                formatDate=2,  # UTC epoch-based datetime objects
-            )
-        except Exception:
-            log.exception("Historical data request failed for %s (attempt %d/%d)",
-                           symbol, attempt, config.RVOL_FETCH_MAX_ATTEMPTS)
-            bars = None
+    for wave in range(1, config.RVOL_BASELINE_MAX_WAVES + 1):
+        for attempt in range(1, config.RVOL_FETCH_MAX_ATTEMPTS + 1):
+            try:
+                bars = await _throttled_fetch(
+                    ib,
+                    contract,
+                    endDateTime="",
+                    durationStr=f"{config.RVOL_LOOKBACK_DAYS} D",
+                    barSizeSetting=config.RVOL_BAR_SIZE,
+                    whatToShow="TRADES",
+                    useRTH=False,
+                    formatDate=2,  # UTC epoch-based datetime objects
+                )
+            except Exception:
+                log.exception("Historical data request failed for %s (wave %d/%d, attempt %d/%d)",
+                               symbol, wave, config.RVOL_BASELINE_MAX_WAVES, attempt, config.RVOL_FETCH_MAX_ATTEMPTS)
+                bars = None
+
+            if bars:
+                break
+            # reqHistoricalDataAsync doesn't raise on timeout -- it logs a warning and
+            # returns an empty BarDataList, so "no bars" needs its own retry path too.
+            if attempt < config.RVOL_FETCH_MAX_ATTEMPTS:
+                log.warning("No historical bars for %s (wave %d/%d, attempt %d/%d), retrying in %.1fs",
+                            symbol, wave, config.RVOL_BASELINE_MAX_WAVES, attempt,
+                            config.RVOL_FETCH_MAX_ATTEMPTS, config.RVOL_FETCH_RETRY_DELAY_SEC)
+                await asyncio.sleep(config.RVOL_FETCH_RETRY_DELAY_SEC)
 
         if bars:
             break
-        # reqHistoricalDataAsync doesn't raise on timeout -- it logs a warning and
-        # returns an empty BarDataList, so "no bars" needs its own retry path too.
-        if attempt < config.RVOL_FETCH_MAX_ATTEMPTS:
-            log.warning("No historical bars for %s (attempt %d/%d), retrying in %.1fs",
-                        symbol, attempt, config.RVOL_FETCH_MAX_ATTEMPTS, config.RVOL_FETCH_RETRY_DELAY_SEC)
-            await asyncio.sleep(config.RVOL_FETCH_RETRY_DELAY_SEC)
+        if wave < config.RVOL_BASELINE_MAX_WAVES:
+            log.warning("Giving up on RVOL baseline wave %d/%d for %s, retrying in %.0fs "
+                        "(likely premarket historical-data congestion rather than this symbol specifically)",
+                        wave, config.RVOL_BASELINE_MAX_WAVES, symbol, config.RVOL_BASELINE_WAVE_DELAY_SEC)
+            await asyncio.sleep(config.RVOL_BASELINE_WAVE_DELAY_SEC)
 
     if not bars:
-        log.warning("Giving up on RVOL baseline for %s after %d attempts",
-                     symbol, config.RVOL_FETCH_MAX_ATTEMPTS)
+        log.warning("Giving up on RVOL baseline for %s after %d wave(s) -- will display without RVOL",
+                     symbol, config.RVOL_BASELINE_MAX_WAVES)
         return None
 
     window_start = window.start

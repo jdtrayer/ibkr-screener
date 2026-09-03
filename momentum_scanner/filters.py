@@ -241,8 +241,13 @@ def display_reason(state: SymbolState, session: Session) -> str | None:
     filter so app.py can log transitions without duplicating display.py's logic.
     """
     if state.rvol is None:
-        return "no rvol (baseline missing or expected volume is 0 for this point in the session)"
-    if state.rvol < config.RVOL_DISPLAY_FLOOR:
+        if not state.baseline_unavailable:
+            return "no rvol (baseline missing or expected volume is 0 for this point in the session)"
+        # Baseline fetch permanently failed (IB historical-data timeouts/errors,
+        # both retry waves exhausted) -- that's a data-availability problem, not
+        # a real "this symbol is weak" signal, so don't hide it over RVOL
+        # forever. The checks below are baseline-independent and still gate it.
+    elif state.rvol < config.RVOL_DISPLAY_FLOOR:
         return f"rvol {state.rvol:.2f}x below display floor {config.RVOL_DISPLAY_FLOOR}x"
     if not check_dollar_volume(state, session):
         dv = state.dollar_volume

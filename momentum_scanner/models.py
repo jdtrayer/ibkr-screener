@@ -109,6 +109,11 @@ class SymbolState:
 
     persistence: PersistenceState = field(default_factory=PersistenceState)
     baseline: RvolBaseline | None = None
+    # True once both baseline-fetch waves in rvol.build_baseline are exhausted
+    # (IB historical-data timeouts/errors, not "no volume expected yet") --
+    # lets display_reason() stop hiding the row over RVOL forever and fall
+    # back to the baseline-independent filters instead.
+    baseline_unavailable: bool = False
     tick: LiveTick = field(default_factory=LiveTick)
     halt: HaltState = field(default_factory=HaltState)
     spike: SpikeState = field(default_factory=SpikeState)
