@@ -328,6 +328,30 @@ SCORER_ADMIT_SWEEPS = 2
 SCORER_ADMIT_MIN_SCORE = 1.0
 
 # --------------------------------------------------------------------------
+# News/catalyst detection (backlog item #12) -- pull-only via
+# reqHistoricalNewsAsync, periodically checking scorer-pool symbols that
+# don't have a headline yet (see momentum_scanner/news.py). A genericTick
+# 292 live-push path was tried and rejected: confirmed live it delivers a
+# broad-market news firehose to every active tick-news subscription rather
+# than symbol-scoped headlines on this account's entitlements, so
+# reqHistoricalNewsAsync (which takes a conId directly) is the only
+# mechanism that's actually symbol-correct. Also confirmed live that its
+# startDateTime bound isn't reliably honored server-side, so news.py
+# enforces the current-trading-day scope client-side instead -- see
+# news.py's module docstring.
+# --------------------------------------------------------------------------
+NEWS_PULL_INTERVAL_SEC = 45.0     # how often to re-check pool symbols with no news yet
+NEWS_FETCH_CONCURRENCY = 5        # mirrors HISTORICAL_FETCH_CONCURRENCY
+NEWS_FETCH_MIN_INTERVAL_SEC = 1.5 # mirrors HISTORICAL_FETCH_MIN_INTERVAL_SEC
+# totalResults passed to reqHistoricalNewsAsync -- since startDateTime isn't
+# honored server-side, this is the only thing bounding how far back a
+# result set can reach before today's own headlines get crowded out by
+# older ones; sized generously since a low-float small-cap (this scanner's
+# actual target) is far less newsy than the AAPL/TSLA/NVDA symbols used to
+# validate this live, which each had ~10 headlines in a single afternoon.
+NEWS_HEADLINES_PER_PULL = 20
+
+# --------------------------------------------------------------------------
 # Refresh cadence
 # --------------------------------------------------------------------------
 DISPLAY_REFRESH_SEC = 2.0   # rich.Live redraw cadence

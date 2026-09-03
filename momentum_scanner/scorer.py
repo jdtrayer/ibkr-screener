@@ -126,6 +126,15 @@ class SnapshotScorer:
     def pool_size(self) -> int:
         return len(self._pool)
 
+    def pool_symbols(self) -> set[str]:
+        return set(self._pool)
+
+    def contract_for(self, symbol: str) -> Stock | None:
+        """The qualified contract for symbol, if this sweeper has already
+        qualified it -- used by news.py's pull sweep to avoid re-qualifying
+        contracts the scorer already has cached."""
+        return self._contracts.get(symbol)
+
     # -- sweep --------------------------------------------------------------
 
     async def sweep(self) -> None:

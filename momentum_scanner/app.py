@@ -18,6 +18,7 @@ from textual.widgets import Footer, Header, Static
 
 from . import config, display, floatref, rvol, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
+from .news import NewsTracker
 from .scorer import SnapshotScorer
 from .filters import (
     PersistenceTracker,
@@ -76,6 +77,7 @@ class ScannerApp(App):
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
         self.scorer = SnapshotScorer(self.ib)
+        self.news = NewsTracker(self.ib)
         self.scorer_admission = ScorerAdmission(self.tunables)
         self._scorer_pending: set[str] = set()  # admit tasks created but not yet landed in self.states
         self._ignored_until: dict[str, datetime] = {}  # symbol -> when its manual non-tradable hold expires
@@ -102,11 +104,13 @@ class ScannerApp(App):
         self.ib.disconnectedEvent += self._on_disconnected
         self.float_map = floatref.load()
         self._load_non_tradable()
+        await self.news.load_providers()
         self._reconfigure_for_session(current_session())
         self.scanner_mgr.on_update(self._on_scan_update)
         self._render()
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
         self.set_interval(config.SCORE_REFRESH_SEC, self._scorer_tick)
+        self.set_interval(config.NEWS_PULL_INTERVAL_SEC, self._news_tick)
 
     def _on_disconnected(self) -> None:
         log.warning("Lost connection to IB -- will retry every %ds until it's back", config.RECONNECT_RETRY_SEC)
@@ -137,6 +141,10 @@ class ScannerApp(App):
     def _scorer_tick(self) -> None:
         # sweep() is re-entry-guarded internally, so a slow sweep can't stack.
         asyncio.create_task(self._scorer_sweep_and_admit())
+
+    def _news_tick(self) -> None:
+        # pull_sweep() is re-entry-guarded internally, so a slow sweep can't stack.
+        asyncio.create_task(self.news.pull_sweep(self.scorer.pool_symbols(), self.scorer.contract_for))
 
     async def _scorer_sweep_and_admit(self) -> None:
         await self.scorer.sweep()
@@ -186,7 +194,10 @@ class ScannerApp(App):
         )
         self.query_one("#scanner-table", Static).update(table)
         self.query_one("#scorer-table", Static).update(
-            display.render_scorer(self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at)
+            display.render_scorer(
+                self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
+                self.news.symbols_with_news(),
+            )
         )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))
 

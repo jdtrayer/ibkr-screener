@@ -226,7 +226,7 @@ def _score_style(score: float) -> str:
     return "white"
 
 
-def render_scorer(rows, pool_size: int, last_sweep_at: datetime | None) -> Table:
+def render_scorer(rows, pool_size: int, last_sweep_at: datetime | None, news_symbols: set[str] = frozenset()) -> Table:
     """
     The Tier-1 snapshot scorer's observation table (see scorer.py). Rendered
     below the main table for side-by-side comparison -- this ranking is OURS
@@ -249,11 +249,12 @@ def render_scorer(rows, pool_size: int, last_sweep_at: datetime | None) -> Table
 
     for r in rows[: config.SCORER_TOP_DISPLAY]:
         style = _score_style(r.score)
-        # More icons land here as they're added (e.g. a news-catalyst glyph --
-        # see backlog_2026_09_02 item #2), same slot as the main table's Flags.
+        # Same slot as the main table's Flags -- see backlog_2026_09_02 item #2.
         flags = []
         if r.fast_lane:
             flags.append("⚡")
+        if r.symbol in news_symbols:
+            flags.append("📰")
         flags_txt = Text(" ".join(flags))
 
         table.add_row(
