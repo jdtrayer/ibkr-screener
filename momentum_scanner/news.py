@@ -31,6 +31,14 @@ live to be naive-but-UTC) rather than trusted to reqHistoricalNewsAsync's
 startDateTime parameter -- confirmed live that IB does not reliably honor
 that bound server-side (a start bound of today's midnight still returned
 headlines from two days prior).
+
+Each newly-recorded headline is optionally classified (see sentiment.py's
+SentimentClassifier, injected rather than imported here so this module
+stays free of the heavy torch/transformers import) -- positive/negative/
+neutral, stored per symbol from the FIRST successfully-recorded headline in
+a given pull (IB returns headlines newest-first, confirmed live, so this is
+the most recent one), not overwritten by older headlines recorded in the
+same batch.
 """
 from __future__ import annotations
 
@@ -46,11 +54,13 @@ log = logging.getLogger(__name__)
 
 
 class NewsTracker:
-    def __init__(self, ib: IB):
+    def __init__(self, ib: IB, sentiment=None):
         self.ib = ib
+        self._sentiment_clf = sentiment  # SentimentClassifier | None -- optional so tests don't need one
         self._provider_codes: str = ""
         self._headlines: dict[str, list[str]] = {}   # symbol -> deduped headline texts, today only
         self._seen: dict[str, set[str]] = {}          # symbol -> normalized headline texts, for O(1) dedup
+        self._sentiment: dict[str, str] = {}           # symbol -> "positive"/"negative"/"neutral", from its most recent headline
         self._date: date = datetime.now(config.TZ).date()
         self._pulling = False
         self._fetch_semaphore = asyncio.Semaphore(config.NEWS_FETCH_CONCURRENCY)
@@ -76,8 +86,19 @@ class NewsTracker:
     def symbols_with_news(self) -> set[str]:
         return set(self._headlines)
 
+    def sentiment_map(self) -> dict[str, str]:
+        """symbol -> 'positive'/'negative'/'neutral' for every symbol with
+        news today -- what display.render_scorer's Flags column reads."""
+        return {sym: self.sentiment(sym) for sym in self._headlines}
+
     def headlines(self, symbol: str) -> list[str]:
         return list(self._headlines.get(symbol, ()))
+
+    def sentiment(self, symbol: str) -> str:
+        """'positive' / 'negative' / 'neutral' -- 'neutral' also covers no
+        news at all, so callers should gate on has_news() first if they need
+        to distinguish "no news" from "neutral news"."""
+        return self._sentiment.get(symbol, "neutral")
 
     # -- record (shared by pull results) ------------------------------------
 
@@ -103,6 +124,7 @@ class NewsTracker:
             log.info("News state cleared for new trading day (%d symbols had news)", len(self._headlines))
             self._headlines.clear()
             self._seen.clear()
+            self._sentiment.clear()
             self._date = today
 
     # -- pull sweep ---------------------------------------------------------
@@ -150,11 +172,19 @@ class NewsTracker:
             except Exception:
                 log.exception("Historical news fetch failed for %s", symbol)
                 continue
+            symbol_classified = False
             for item in items or ():
                 if item.time < start_utc_naive:
                     continue
                 if self.record(symbol, item.headline):
                     found += 1
+                    if self._sentiment_clf is not None and not symbol_classified:
+                        # Headlines come back newest-first (confirmed live), so the
+                        # first one recorded here is the most recent -- that's the
+                        # sentiment shown, not overwritten by older headlines in
+                        # this same batch.
+                        self._sentiment[symbol] = await self._sentiment_clf.classify(item.headline)
+                        symbol_classified = True
         if found:
             log.info("News pull sweep: %d new headline(s) across %d pending symbol(s)", found, len(pending))
 

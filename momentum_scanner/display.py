@@ -230,13 +230,25 @@ def _score_style(score: float) -> str:
     return "white"
 
 
-def render_scorer(rows, pool_size: int, last_sweep_at: datetime | None, news_symbols: set[str] = frozenset()) -> Table:
+NEWS_SENTIMENT_ICONS = {"positive": "📈", "negative": "📉", "neutral": "📰"}
+
+
+def render_scorer(
+    rows, pool_size: int, last_sweep_at: datetime | None, news_sentiment: dict[str, str] | None = None
+) -> Table:
     """
     The Tier-1 snapshot scorer's observation table (see scorer.py). Rendered
     below the main table for side-by-side comparison -- this ranking is OURS
     (computed from snapshot sweeps), deliberately independent of both IB's
     scan ranks and the persistence gate, and does not drive admission yet.
+
+    `news_sentiment` (symbol -> "positive"/"negative"/"neutral", see
+    news.NewsTracker.sentiment_map) drives the Flags column's news icon --
+    📈/📉/📰 respectively. A symbol absent from the dict has no news at all
+    and gets no icon, distinct from a "neutral" classification which still
+    shows 📰.
     """
+    news_sentiment = news_sentiment or {}
     swept = f"swept {last_sweep_at:%H:%M:%S}" if last_sweep_at else "no sweep yet"
     table = Table(
         title=f"Scorer (observation) — pool {pool_size} — {swept}",
@@ -257,8 +269,8 @@ def render_scorer(rows, pool_size: int, last_sweep_at: datetime | None, news_sym
         flags = []
         if r.fast_lane:
             flags.append("⚡")
-        if r.symbol in news_symbols:
-            flags.append("📰")
+        if r.symbol in news_sentiment:
+            flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[r.symbol]])
         flags_txt = Text(" ".join(flags))
 
         table.add_row(

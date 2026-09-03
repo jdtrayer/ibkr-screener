@@ -20,6 +20,7 @@ from . import config, display, floatref, rvol, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .scorer import SnapshotScorer
+from .sentiment import SentimentClassifier
 from .filters import (
     PersistenceTracker,
     ScorerAdmission,
@@ -77,7 +78,8 @@ class ScannerApp(App):
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
         self.scorer = SnapshotScorer(self.ib)
-        self.news = NewsTracker(self.ib)
+        self.sentiment = SentimentClassifier()
+        self.news = NewsTracker(self.ib, sentiment=self.sentiment)
         self.scorer_admission = ScorerAdmission(self.tunables)
         self._scorer_pending: set[str] = set()  # admit tasks created but not yet landed in self.states
         self._ignored_until: dict[str, datetime] = {}  # symbol -> when its manual non-tradable hold expires
@@ -100,6 +102,11 @@ class ScannerApp(App):
         log.info("Connected to IB at %s:%s (clientId=%s)", config.IB_HOST, config.IB_PORT, config.IB_CLIENT_ID)
 
     async def on_mount(self) -> None:
+        # Fired, not awaited -- model load is ~5.6s warm (minutes on the
+        # very first run, downloading weights) and must never delay the
+        # first render or any of the setup below. Sentiment simply becomes
+        # available a few seconds later once this finishes.
+        asyncio.create_task(self.sentiment.load())
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
         self.float_map = floatref.load()
@@ -197,7 +204,7 @@ class ScannerApp(App):
         self.query_one("#scorer-table", Static).update(
             display.render_scorer(
                 self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
-                self.news.symbols_with_news(),
+                self.news.sentiment_map(),
             )
         )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))

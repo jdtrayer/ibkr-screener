@@ -2,3 +2,12 @@ ib_async>=1.0.1
 rich>=13.7.0
 textual>=0.60
 requests>=2.31.0
+
+# Headline sentiment classification (momentum_scanner/sentiment.py) -- CPU-only
+# torch build via --extra-index-url (adds this index alongside PyPI, doesn't
+# replace it, so ib_async/rich/textual/requests above still resolve normally).
+# The default `pip install torch` pulls a much larger CUDA-bundled build that
+# goes entirely unused here -- this workload never needs GPU acceleration.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.14.0
+transformers>=5.0.0

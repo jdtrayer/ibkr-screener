@@ -352,6 +352,23 @@ NEWS_FETCH_MIN_INTERVAL_SEC = 1.5 # mirrors HISTORICAL_FETCH_MIN_INTERVAL_SEC
 NEWS_HEADLINES_PER_PULL = 20
 
 # --------------------------------------------------------------------------
+# Headline sentiment classification (backlog #12 fast-follow) -- local via
+# FinBERT (see momentum_scanner/sentiment.py), not an LLM API: no API key/
+# billing dependency, and headlines are already one line so there's nothing
+# to summarize, only classify. Confirmed live on this machine: 50-70ms/
+# headline (CPU), ~5.6s warm model load (~440MB one-time download, cached
+# under ~/.cache/huggingface).
+# --------------------------------------------------------------------------
+NEWS_SENTIMENT_MODEL = "ProsusAI/finbert"
+# Confirmed live: FinBERT is strong on genuine per-company headlines
+# (0.90+ confidence on clear cases) but a generic market-wide roundup
+# headline ("Stock Market Today: Nasdaq Posts Back-To-Back Gains") was
+# misclassified at only 0.53 confidence -- barely above the 3-way random
+# baseline (0.33). Below this floor, treat the call as neutral rather than
+# paint a wrong color.
+NEWS_SENTIMENT_CONFIDENCE_FLOOR = 0.6
+
+# --------------------------------------------------------------------------
 # Refresh cadence
 # --------------------------------------------------------------------------
 DISPLAY_REFRESH_SEC = 2.0   # rich.Live redraw cadence

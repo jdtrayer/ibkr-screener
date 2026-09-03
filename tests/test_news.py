@@ -116,3 +116,77 @@ def test_pull_sweep_skips_symbols_with_no_qualified_contract():
 
     asyncio.run(tracker.pull_sweep({"UNQUALIFIED"}, lambda symbol: None))
     assert tracker.has_news("UNQUALIFIED") is False
+
+
+# -- sentiment wiring ---------------------------------------------------------
+
+class FakeSentimentClassifier:
+    """classify() returns whatever label is queued for that exact headline
+    text, so tests can assert exactly which headline got classified."""
+
+    def __init__(self, labels: dict[str, str]):
+        self._labels = labels
+        self.calls: list[str] = []
+
+    async def classify(self, headline: str) -> str:
+        self.calls.append(headline)
+        return self._labels.get(headline, "neutral")
+
+
+def test_pull_sweep_classifies_and_stores_sentiment():
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    item = FakeItem(time=now_utc_naive, headline="Apple Rises 5% On Strong Earnings")
+
+    sentiment = FakeSentimentClassifier({"Apple Rises 5% On Strong Earnings": "positive"})
+    tracker = NewsTracker(FakeIBWithNews([item]), sentiment=sentiment)
+    tracker._provider_codes = "FAKE"
+
+    asyncio.run(tracker.pull_sweep({"AAPL"}, lambda symbol: FakeContract(conId=1)))
+
+    assert tracker.sentiment("AAPL") == "positive"
+    assert tracker.sentiment_map() == {"AAPL": "positive"}
+
+
+def test_sentiment_reflects_most_recent_headline_not_oldest():
+    # IB returns headlines newest-first -- the first one successfully
+    # recorded in a batch is the most recent, and must be the one whose
+    # sentiment sticks, not a later (older) headline in the same batch.
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    newest = FakeItem(time=now_utc_naive, headline="Newest headline (good)")
+    oldest = FakeItem(time=now_utc_naive - timedelta(hours=2), headline="Oldest headline (bad)")
+
+    sentiment = FakeSentimentClassifier({
+        "Newest headline (good)": "positive",
+        "Oldest headline (bad)": "negative",
+    })
+    tracker = NewsTracker(FakeIBWithNews([newest, oldest]), sentiment=sentiment)  # newest-first order
+    tracker._provider_codes = "FAKE"
+
+    asyncio.run(tracker.pull_sweep({"AAPL"}, lambda symbol: FakeContract(conId=1)))
+
+    assert tracker.sentiment("AAPL") == "positive"
+    assert sentiment.calls == ["Newest headline (good)"]  # only classified once, not per headline
+
+
+def test_sentiment_defaults_to_neutral_without_a_classifier():
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    item = FakeItem(time=now_utc_naive, headline="Some headline")
+    tracker = NewsTracker(FakeIBWithNews([item]))  # sentiment=None (default)
+    tracker._provider_codes = "FAKE"
+
+    asyncio.run(tracker.pull_sweep({"AAPL"}, lambda symbol: FakeContract(conId=1)))
+
+    assert tracker.has_news("AAPL") is True
+    assert tracker.sentiment("AAPL") == "neutral"
+
+
+def test_reset_if_new_day_clears_sentiment_too():
+    sentiment = FakeSentimentClassifier({"Headline": "positive"})
+    tracker = NewsTracker(FakeIB(), sentiment=sentiment)
+    tracker.record("AAPL", "Headline")
+    tracker._sentiment["AAPL"] = "positive"
+
+    tracker._date = date.today() - timedelta(days=1)
+    tracker.reset_if_new_day()
+
+    assert tracker.sentiment("AAPL") == "neutral"  # back to the no-data default
