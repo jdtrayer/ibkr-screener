@@ -195,6 +195,22 @@ DEAD_HOLD_SEC = 45 * 60.0  # how long a genuinely-dead eviction holds the symbol
 NON_TRADABLE_STATE_FILE = "./cache/non_tradable.json"
 
 # --------------------------------------------------------------------------
+# ETF/fund exclusion (backlog_2026_09_02 item #3) -- unlike the manual
+# non-tradable list above, this IS an IBKR-queryable signal:
+# ContractDetails.stockType, fetched once per admission via
+# reqContractDetailsAsync alongside contract qualification. Confirmed live
+# 2026-09-03 on this account's data entitlements: NVD/SPY/TQQQ all return
+# stockType="ETF" reliably, vs "COMMON" for AAPL -- so this is a real
+# category-level filter, not a per-symbol list like #1. ETNs (exchange-
+# traded notes) are excluded alongside ETFs -- same derivative/fund
+# character, not a single-name equity. A symbol whose stockType lookup
+# fails (API blip) is NOT excluded -- fail open, since this is a
+# secondary check on an already-qualified contract, not core admission
+# logic.
+# --------------------------------------------------------------------------
+EXCLUDE_STOCK_TYPES = frozenset({"ETF", "ETN"})
+
+# --------------------------------------------------------------------------
 # Tier-1 snapshot scorer (observation-only slice of the two-tier redesign).
 # Candidates from the merged scan lists (ALL rows, not just the persistence
 # top-N) are batch-snapshotted every SCORE_REFRESH_SEC and ranked by OUR OWN

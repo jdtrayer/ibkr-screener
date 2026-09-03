@@ -531,6 +531,17 @@ class ScannerApp(App):
         contract = qualified[0]
         state.conid = contract.conId
 
+        try:
+            details_list = await self.ib.reqContractDetailsAsync(contract)
+            stock_type = details_list[0].stockType if details_list else None
+        except Exception:
+            log.exception("Failed to fetch contract details for %s (proceeding -- not excluded)", hit.symbol)
+            stock_type = None
+        if stock_type in config.EXCLUDE_STOCK_TYPES:
+            log.info("%s dropped: excluded instrument type (stockType=%s)", hit.symbol, stock_type)
+            self._remove_symbol(hit.symbol)
+            return
+
         # Halted status (tick 49) is pushed automatically by TWS whenever it applies --
         # it cannot be requested via genericTickList (IB rejects the whole reqMktData
         # call with error 321 if you try), so no generic ticks need to be requested here.
