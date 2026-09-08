@@ -39,6 +39,11 @@ neutral, stored per symbol from the FIRST successfully-recorded headline in
 a given pull (IB returns headlines newest-first, confirmed live, so this is
 the most recent one), not overwritten by older headlines recorded in the
 same batch.
+
+feed() additionally exposes every recorded headline (not just each symbol's
+latest) as a flat, newest-first (when, symbol, headline) list -- backs the
+scrollable news panel at the bottom of the UI's main column (display.py's
+render_news_feed).
 """
 from __future__ import annotations
 
@@ -61,6 +66,7 @@ class NewsTracker:
         self._headlines: dict[str, list[str]] = {}   # symbol -> deduped headline texts, today only
         self._seen: dict[str, set[str]] = {}          # symbol -> normalized headline texts, for O(1) dedup
         self._sentiment: dict[str, str] = {}           # symbol -> "positive"/"negative"/"neutral", from its most recent headline
+        self._feed: list[tuple[datetime, str, str]] = []  # (when, symbol, headline), unsorted -- see feed()
         self._date: date = datetime.now(config.TZ).date()
         self._pulling = False
         self._fetch_semaphore = asyncio.Semaphore(config.NEWS_FETCH_CONCURRENCY)
@@ -94,6 +100,14 @@ class NewsTracker:
     def headlines(self, symbol: str) -> list[str]:
         return list(self._headlines.get(symbol, ()))
 
+    def feed(self, limit: int | None = None) -> list[tuple[datetime, str, str]]:
+        """(when, symbol, headline) across every symbol with news today,
+        newest first -- what the UI's scrollable headline panel reads.
+        Sorted here rather than kept sorted on insert, since headlines
+        arrive symbol-by-symbol during a sweep (not in global time order)."""
+        rows = sorted(self._feed, key=lambda row: row[0], reverse=True)
+        return rows[:limit] if limit is not None else rows
+
     def sentiment(self, symbol: str) -> str:
         """'positive' / 'negative' / 'neutral' -- 'neutral' also covers no
         news at all, so callers should gate on has_news() first if they need
@@ -102,9 +116,12 @@ class NewsTracker:
 
     # -- record (shared by pull results) ------------------------------------
 
-    def record(self, symbol: str, headline: str) -> bool:
+    def record(self, symbol: str, headline: str, when: datetime | None = None) -> bool:
         """Store a headline for symbol if not already seen today. Returns True
-        if it was newly recorded (False if it was a dedup no-op)."""
+        if it was newly recorded (False if it was a dedup no-op). `when`
+        defaults to now for callers (tests, mainly) that don't have an actual
+        publish time -- real pulls pass the headline's own timestamp so the
+        feed panel can show/sort by it."""
         norm = " ".join(headline.split()).casefold()
         if not norm:
             return False
@@ -113,6 +130,7 @@ class NewsTracker:
             return False
         seen.add(norm)
         self._headlines.setdefault(symbol, []).append(headline)
+        self._feed.append((when or datetime.now(config.TZ), symbol, headline))
         log.info("%s news: %s", symbol, headline)
         return True
 
@@ -125,6 +143,7 @@ class NewsTracker:
             self._headlines.clear()
             self._seen.clear()
             self._sentiment.clear()
+            self._feed.clear()
             self._date = today
 
     # -- pull sweep ---------------------------------------------------------
@@ -176,7 +195,7 @@ class NewsTracker:
             for item in items or ():
                 if item.time < start_utc_naive:
                     continue
-                if self.record(symbol, item.headline):
+                if self.record(symbol, item.headline, item.time.replace(tzinfo=timezone.utc)):
                     found += 1
                     if self._sentiment_clf is not None and not symbol_classified:
                         # Headlines come back newest-first (confirmed live), so the

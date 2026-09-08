@@ -98,6 +98,9 @@ def _fmt_scalp_stop(sizing: tuple[int, float, float] | None) -> Text:
     return Text(f"{stop:.2f}", style=SCALP_STOP_STYLE)
 
 
+NEWS_SENTIMENT_ICONS = {"positive": "📈", "negative": "📉", "neutral": "📰"}
+
+
 def render(
     states: list[SymbolState],
     session: Session,
@@ -107,6 +110,7 @@ def render(
     waiting_count: int = 0,
     cooldown_count: int = 0,
     held_count: int = 0,
+    news_sentiment: dict[str, str] | None = None,
 ) -> Table:
     """
     `row_order` (symbols, best-first) fixes the row ORDER; cell values still
@@ -124,7 +128,12 @@ def render(
     Kept as separate numbers so the
     caption doesn't conflate a capacity problem with a timer/hold -- see
     app.py's _waiting_for_slot_count / _cooldown_wait_count / _held_count.
+
+    `news_sentiment` (symbol -> "positive"/"negative"/"neutral", see
+    news.NewsTracker.sentiment_map) drives the Flags column's news icon,
+    same as render_scorer's -- see NEWS_SENTIMENT_ICONS.
     """
+    news_sentiment = news_sentiment or {}
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
     if connected:
         title += "  [bold green](CONNECTED)[/]"
@@ -189,6 +198,8 @@ def render(
             flags.append("[yellow]WIDE[/]")
         if s.float_known and (s.float_shares or 0) > config.FLOAT_CEILING_SHARES:
             flags.append("[yellow]FLOAT[/]")
+        if s.symbol in news_sentiment:
+            flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[s.symbol]])
         flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
 
         sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
@@ -229,9 +240,6 @@ def _score_style(score: float) -> str:
     if score < 0.0:
         return "dim"
     return "white"
-
-
-NEWS_SENTIMENT_ICONS = {"positive": "📈", "negative": "📉", "neutral": "📰"}
 
 
 def render_scorer(
@@ -285,5 +293,29 @@ def render_scorer(
         )
     if not rows:
         table.caption = "Waiting for two sweeps per symbol…"
+        table.caption_justify = "right"
+    return table
+
+
+def render_news_feed(feed: list[tuple[datetime, str, str]]) -> Table:
+    """
+    Every recorded headline today (see news.NewsTracker.feed), newest first
+    -- one row per headline, not one per symbol, so a symbol with several
+    stories shows all of them. Rendered in its own scrollable panel at the
+    bottom of the main column, independent of the scanner/scorer tables
+    above it. No sentiment icon here: sentiment is tracked per-symbol from
+    only its most recent headline (see NEWS_SENTIMENT_ICONS), so attaching
+    it to every row of that symbol's history would misattribute it to
+    older headlines.
+    """
+    table = Table(title="News Feed", expand=True, show_header=True, show_lines=False)
+    table.add_column("Time", style="dim", width=5, no_wrap=True)
+    table.add_column("Sym", style="bold", width=6, no_wrap=True)
+    table.add_column("Headline", ratio=1)
+
+    for when, symbol, headline in feed:
+        table.add_row(Text(f"{when.astimezone(config.TZ):%H:%M}"), Text(symbol), Text(headline))
+    if not feed:
+        table.caption = "No headlines yet today"
         table.caption_justify = "right"
     return table

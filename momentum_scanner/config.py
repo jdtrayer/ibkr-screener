@@ -350,6 +350,7 @@ NEWS_FETCH_MIN_INTERVAL_SEC = 1.5 # mirrors HISTORICAL_FETCH_MIN_INTERVAL_SEC
 # actual target) is far less newsy than the AAPL/TSLA/NVDA symbols used to
 # validate this live, which each had ~10 headlines in a single afternoon.
 NEWS_HEADLINES_PER_PULL = 20
+NEWS_FEED_DISPLAY_ROWS = 100  # cap on the scrollable news feed panel's row count
 
 # --------------------------------------------------------------------------
 # Headline sentiment classification (backlog #12 fast-follow) -- local via

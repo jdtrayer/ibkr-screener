@@ -46,8 +46,18 @@ SORT_REFRESH_EVERY_N_TICKS = int(config.SORT_REFRESH_SEC / config.DISPLAY_REFRES
 
 class ScannerApp(App):
     CSS = """
+    #main-column {
+        width: 1fr;
+        height: 1fr;
+    }
     #scanner-table-scroll {
         width: 1fr;
+        height: 1fr;
+        border: solid $primary;
+    }
+    #news-feed-scroll {
+        width: 1fr;
+        height: 14;
         border: solid $primary;
     }
     #side-panel {
@@ -98,9 +108,12 @@ class ScannerApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
-            with VerticalScroll(id="scanner-table-scroll"):
-                yield Static(id="scanner-table")
-                yield Static(id="scorer-table")
+            with Vertical(id="main-column"):
+                with VerticalScroll(id="scanner-table-scroll"):
+                    yield Static(id="scanner-table")
+                    yield Static(id="scorer-table")
+                with VerticalScroll(id="news-feed-scroll"):
+                    yield Static(id="news-feed-table")
             with Vertical(id="side-panel"):
                 yield TunablesPanel(self.tunables, id="tunables-panel")
                 yield SymbolActionsPanel(id="symbol-actions-panel")
@@ -160,7 +173,25 @@ class ScannerApp(App):
 
     def _news_tick(self) -> None:
         # pull_sweep() is re-entry-guarded internally, so a slow sweep can't stack.
-        asyncio.create_task(self.news.pull_sweep(self.scorer.pool_symbols(), self.scorer.contract_for))
+        # Union of the scorer pool and the main table's live/held symbols --
+        # so the main table's Flags column (backlog #12 fast-follow) gets
+        # news coverage too, not just the scorer table's.
+        pool = self.scorer.pool_symbols() | set(self.states)
+        asyncio.create_task(self.news.pull_sweep(pool, self._contract_for_news))
+
+    def _contract_for_news(self, symbol: str) -> Stock | None:
+        """contract_for callback for news.pull_sweep -- prefers the scorer's
+        already-qualified contract (cheap, no re-qualify), falling back to a
+        bare Stock built from the main table's stored conid for symbols the
+        scorer hasn't (yet, or ever) pooled. Only .conId is used downstream
+        (reqHistoricalNewsAsync), so this doesn't need to be qualified."""
+        contract = self.scorer.contract_for(symbol)
+        if contract is not None:
+            return contract
+        state = self.states.get(symbol)
+        if state is not None and state.conid is not None:
+            return Stock(conId=state.conid)
+        return None
 
     async def _scorer_sweep_and_admit(self) -> None:
         await self.scorer.sweep()
@@ -199,6 +230,7 @@ class ScannerApp(App):
         )
 
     def _render(self) -> None:
+        news_sentiment = self.news.sentiment_map()
         table = display.render(
             list(self.states.values()),
             self.session,
@@ -208,13 +240,17 @@ class ScannerApp(App):
             waiting_count=self._waiting_for_slot_count(),
             cooldown_count=self._cooldown_wait_count(),
             held_count=self._held_count(),
+            news_sentiment=news_sentiment,
         )
         self.query_one("#scanner-table", Static).update(table)
         self.query_one("#scorer-table", Static).update(
             display.render_scorer(
                 self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
-                self.news.sentiment_map(),
+                news_sentiment,
             )
+        )
+        self.query_one("#news-feed-table", Static).update(
+            display.render_news_feed(self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS))
         )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))
 
