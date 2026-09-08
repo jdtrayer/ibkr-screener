@@ -97,6 +97,7 @@ class SnapshotScorer:
         self._pool: dict[str, float] = {}          # symbol -> last seen on any scan list (epoch)
         self._contracts: dict[str, Stock] = {}     # qualified-contract cache
         self._unqualifiable: set[str] = set()      # IB couldn't qualify; don't retry this run
+        self._excluded_types: set[str] = set()     # stockType in config.EXCLUDE_STOCK_TYPES (ETF/ETN); not swept/ranked
         self._history: dict[str, deque[Reading]] = {}
         self._close: dict[str, float] = {}         # prior close per symbol
         self._spread: dict[str, float] = {}        # latest snapshot spread% per symbol
@@ -151,11 +152,11 @@ class SnapshotScorer:
             self._sweeping = False
 
     async def _sweep_inner(self) -> None:
-        symbols = [s for s in self._pool if s not in self._unqualifiable]
-        if not symbols:
+        pool_symbols = [s for s in self._pool if s not in self._unqualifiable]
+        if not pool_symbols:
             return
 
-        new = [s for s in symbols if s not in self._contracts]
+        new = [s for s in pool_symbols if s not in self._contracts]
         if new:
             candidates = [Stock(s, "SMART", "USD") for s in new]
             try:
@@ -169,7 +170,13 @@ class SnapshotScorer:
                 if sym not in got:
                     self._unqualifiable.add(sym)
                     log.info("Scorer: %s unqualifiable, excluded from sweeps this run", sym)
+                    continue
+                await self._check_excluded_type(sym, got[sym])
 
+        # Pool membership (self._pool) is left untouched by the exclusion --
+        # only sweeping/ranking is skipped, so an ETF still counts toward
+        # pool_size and won't get re-qualified+re-checked every sweep.
+        symbols = [s for s in pool_symbols if s not in self._excluded_types]
         contracts = [self._contracts[s] for s in symbols if s in self._contracts]
         now = time.time()
         filled = 0
@@ -187,6 +194,25 @@ class SnapshotScorer:
         self.last_sweep_at = datetime.now(config.TZ)
         log.info("Scorer sweep: %d/%d snapshots recorded (pool %d)", filled, len(contracts), len(self._pool))
         self._save_state()
+
+    async def _check_excluded_type(self, symbol: str, contract: Stock) -> None:
+        """Flags ETF/ETN symbols (config.EXCLUDE_STOCK_TYPES, same check as
+        app.py's _add_symbol) so they never get snapshotted or shown ranked
+        here -- untradeable regardless of score. Reported live: MSTZ (a
+        leveraged inverse ETF) was ranking in this table despite the main
+        table already excluding it, because the pool is deliberately
+        membership-only (see module docstring / the LABT incident) and had
+        no instrument-type check of its own. Fail-open on a lookup error,
+        matching _add_symbol's behavior."""
+        try:
+            details_list = await self.ib.reqContractDetailsAsync(contract)
+            stock_type = details_list[0].stockType if details_list else None
+        except Exception:
+            log.exception("Scorer: contract details fetch failed for %s (proceeding -- not excluded)", symbol)
+            return
+        if stock_type in config.EXCLUDE_STOCK_TYPES:
+            self._excluded_types.add(symbol)
+            log.info("Scorer: %s excluded from sweep/ranking (stockType=%s)", symbol, stock_type)
 
     def _record(self, symbol: str, ticker, ts: float) -> bool:
         last, volume = _clean(ticker.last), _clean(ticker.volume)
