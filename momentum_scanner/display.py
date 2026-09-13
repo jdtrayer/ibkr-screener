@@ -1,10 +1,19 @@
-"""Rich terminal table rendering. RVOL is the primary sort key and color driver."""
+"""
+Terminal UI rendering. RVOL is the primary sort key and color driver.
+
+The main table (sync_table) is a textual.widgets.DataTable, synced in place
+rather than rebuilt -- see its docstring for why. The scorer/news-feed
+tables are still plain rich.Table objects pushed into a Static widget
+(render_scorer/render_news_feed) -- out of scope for the DataTable move,
+see the datatable-rewrite branch's starting point.
+"""
 from __future__ import annotations
 
 from datetime import datetime
 
 from rich.table import Table
 from rich.text import Text
+from textual.widgets import DataTable
 
 from . import config, country, spikes
 from .filters import check_spread, display_reason
@@ -101,23 +110,121 @@ def _fmt_scalp_stop(sizing: tuple[int, float, float] | None) -> Text:
 NEWS_SENTIMENT_ICONS = {"positive": "📈", "negative": "📉", "neutral": "📰"}
 
 
-def render(
+MAIN_TABLE_COLUMNS = [
+    ("Sym", "sym"),
+    ("Flags", "flags"),
+    ("Price", "price"),
+    ("RVOL", "rvol"),
+    ("$Vol", "dvol"),
+    ("Spread%", "spread"),
+    ("Float", "float"),
+    ("Short%", "short"),
+    ("Shares", "shares"),
+    ("Target", "target"),
+    ("Stop", "stop"),
+]
+"""(label, key) pairs for the main table's DataTable -- app.py's on_mount adds
+these once via add_columns(); sync_table's update_cell calls address cells by
+the same keys, so this is the single source of truth for both."""
+
+
+def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str], now: datetime) -> list[Text]:
+    """One SymbolState -> the cell values for MAIN_TABLE_COLUMNS, in order."""
+    style = rvol_style(s.rvol)
+    rvol_txt = f"{s.rvol:.1f}x" if s.rvol is not None else "-"
+    price_txt = f"{s.tick.last:.2f}" if s.tick.last is not None else "-"
+
+    _, spread_pct = check_spread(s)
+    spread_txt = f"{spread_pct:.2f}" if spread_pct is not None else "-"
+    spread_style = "yellow" if (spread_pct is not None and spread_pct > config.MAX_SPREAD_PCT) else ""
+
+    if not s.float_known:
+        float_txt = "?"
+        float_style = "dim"
+    else:
+        float_txt = _fmt_shares(s.float_shares)
+        float_style = "yellow" if (s.float_shares or 0) > config.FLOAT_CEILING_SHARES else ""
+
+    if s.short_interest_known and s.short_pct is not None:
+        short_txt = f"{s.short_pct:.1f}"
+        short_style = ""
+    else:
+        short_txt = "?"
+        short_style = "dim"
+
+    flags = []
+    spike_n = spikes.active_spike_count(s.spike, tunables, now)
+    if spike_n > 0:
+        flags.append(f"[bold black on orange3]SPIKE×{spike_n}[/]")
+    if s.halt.is_halted:
+        flags.append(_fmt_halt_flag(s.halt, now))
+    elif s.halt.recently_resumed(config.HALT_RESUME_RECENT_MIN):
+        flags.append("[bold black on yellow]RESUMED[/]")
+    if spread_pct is not None and spread_pct > config.MAX_SPREAD_PCT:
+        flags.append("[yellow]WIDE[/]")
+    if s.float_known and (s.float_shares or 0) > config.FLOAT_CEILING_SHARES:
+        flags.append("[yellow]FLOAT[/]")
+    if s.symbol in news_sentiment:
+        flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[s.symbol]])
+    country_abbr = country.abbr_for(s.symbol)
+    if country_abbr:
+        flags.append(country_abbr)
+    flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
+
+    sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
+
+    return [
+        Text(s.symbol, style=style),
+        flags_txt,
+        Text(price_txt, style=style),
+        Text(rvol_txt, style=style),
+        Text(_fmt_money(s.dollar_volume), style=style),
+        Text(spread_txt, style=spread_style),
+        Text(float_txt, style=float_style),
+        Text(short_txt, style=short_style),
+        _fmt_scalp_shares(sizing),
+        _fmt_scalp_target(sizing),
+        _fmt_scalp_stop(sizing),
+    ]
+
+
+def sync_table(
+    datatable: DataTable,
     states: list[SymbolState],
     session: Session,
     connected: bool,
     tunables: Tunables,
     row_order: list[str] | None = None,
+    *,
     waiting_count: int = 0,
     cooldown_count: int = 0,
     held_count: int = 0,
     news_sentiment: dict[str, str] | None = None,
-) -> Table:
+    reorder: bool = False,
+) -> None:
     """
-    `row_order` (symbols, best-first) fixes the row ORDER; cell values still
-    reflect live state regardless. Pass None to fall back to a fresh live-RVOL
-    sort every call (e.g. for tests). The caller (app.py) is expected to
-    refresh row_order on a slower cadence than this is called, so rows hold
-    still between resorts instead of jumping around on every redraw.
+    Syncs `datatable` (columns already added via MAIN_TABLE_COLUMNS -- see
+    app.py's on_mount) to current state, in place. Replaces the old
+    Rich-Table `render()`, which returned a brand new Table every call for a
+    Static widget to display -- that widget has no concept of a cursor,
+    hover, or selection, so a full rebuild every call cost nothing extra.
+    DataTable does have all of that, and rebuilding it from scratch every
+    call would reset it on every redraw, defeating the entire point of
+    moving off Static+rich.Table. So instead: existing rows' cell values are
+    updated via update_cell, newly-admitted symbols are added, and
+    symbols that dropped out of view are removed -- all without touching
+    rows that are staying right where they are.
+
+    `reorder=True` additionally repositions every row to match the freshly
+    computed rank order (a full clear+rebuild, which -- like a fresh
+    Table used to implicitly -- resets cursor/scroll/hover). Pass it only on
+    app.py's slower resort cadence; this is the same "rows hold still
+    between resorts" contract `row_order` documented before, just now also
+    covering cursor/scroll/hover state, not only visual row order.
+
+    `row_order` (symbols, best-first) fixes row order when `reorder=True`;
+    cell values always reflect live state regardless. Pass None to fall back
+    to a fresh live-RVOL sort (e.g. for tests).
 
     `waiting_count` is the number of symbols that have cleared persistence but
     are blocked by a genuinely full pool -- raising max_live_symbols admits
@@ -125,9 +232,9 @@ def render(
     being bumped, and `held_count` is symbols held out by a dead-hold, the
     manual non-tradable list, or an excluded instrument type -- none of these
     is a capacity problem, raising max_live_symbols does NOT admit them.
-    Kept as separate numbers so the
-    caption doesn't conflate a capacity problem with a timer/hold -- see
-    app.py's _waiting_for_slot_count / _cooldown_wait_count / _held_count.
+    Kept as separate numbers so the border subtitle doesn't conflate a
+    capacity problem with a timer/hold -- see app.py's
+    _waiting_for_slot_count / _cooldown_wait_count / _held_count.
 
     `news_sentiment` (symbol -> "positive"/"negative"/"neutral", see
     news.NewsTracker.sentiment_map) drives the Flags column's news icon,
@@ -144,24 +251,6 @@ def render(
     no coverage for the symbol, or not fetched yet.
     """
     news_sentiment = news_sentiment or {}
-    title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
-    if connected:
-        title += "  [bold green](CONNECTED)[/]"
-    else:
-        title += "  [bold red](DISCONNECTED)[/]"
-
-    table = Table(title=title, expand=True, show_lines=True)
-    table.add_column("Sym", style="bold")
-    table.add_column("Flags", justify="left")
-    table.add_column("Price", justify="right")
-    table.add_column("RVOL", justify="right")
-    table.add_column("$Vol", justify="right")
-    table.add_column("Spread%", justify="right")
-    table.add_column("Float", justify="right")
-    table.add_column("Short%", justify="right")
-    table.add_column("Shares", justify="right")
-    table.add_column("Target", justify="right")
-    table.add_column("Stop", justify="right")
 
     def _passes(s: SymbolState) -> bool:
         return display_reason(s, session) is None
@@ -181,63 +270,27 @@ def render(
     ranked = (ordered + newcomers)[: config.TOP_DISPLAY_ROWS]
 
     now = datetime.now(config.TZ)
-    for s in ranked:
-        style = rvol_style(s.rvol)
-        rvol_txt = f"{s.rvol:.1f}x" if s.rvol is not None else "-"
-        price_txt = f"{s.tick.last:.2f}" if s.tick.last is not None else "-"
 
-        _, spread_pct = check_spread(s)
-        spread_txt = f"{spread_pct:.2f}" if spread_pct is not None else "-"
-        spread_style = "yellow" if (spread_pct is not None and spread_pct > config.MAX_SPREAD_PCT) else ""
+    if reorder:
+        datatable.clear()
+        for s in ranked:
+            datatable.add_row(*_row_cells(s, tunables, news_sentiment, now), key=s.symbol)
+    else:
+        existing = {row_key.value for row_key in datatable.rows}
+        wanted = {s.symbol for s in ranked}
+        for stale_symbol in existing - wanted:
+            datatable.remove_row(stale_symbol)
+        for s in ranked:
+            cells = _row_cells(s, tunables, news_sentiment, now)
+            if s.symbol in existing:
+                for (_, col_key), value in zip(MAIN_TABLE_COLUMNS, cells):
+                    datatable.update_cell(s.symbol, col_key, value)
+            else:
+                datatable.add_row(*cells, key=s.symbol)
 
-        if not s.float_known:
-            float_txt = "?"
-            float_style = "dim"
-        else:
-            float_txt = _fmt_shares(s.float_shares)
-            float_style = "yellow" if (s.float_shares or 0) > config.FLOAT_CEILING_SHARES else ""
-
-        if s.short_interest_known and s.short_pct is not None:
-            short_txt = f"{s.short_pct:.1f}"
-            short_style = ""
-        else:
-            short_txt = "?"
-            short_style = "dim"
-
-        flags = []
-        spike_n = spikes.active_spike_count(s.spike, tunables, now)
-        if spike_n > 0:
-            flags.append(f"[bold black on orange3]SPIKE×{spike_n}[/]")
-        if s.halt.is_halted:
-            flags.append(_fmt_halt_flag(s.halt, now))
-        elif s.halt.recently_resumed(config.HALT_RESUME_RECENT_MIN):
-            flags.append("[bold black on yellow]RESUMED[/]")
-        if spread_pct is not None and spread_pct > config.MAX_SPREAD_PCT:
-            flags.append("[yellow]WIDE[/]")
-        if s.float_known and (s.float_shares or 0) > config.FLOAT_CEILING_SHARES:
-            flags.append("[yellow]FLOAT[/]")
-        if s.symbol in news_sentiment:
-            flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[s.symbol]])
-        country_abbr = country.abbr_for(s.symbol)
-        if country_abbr:
-            flags.append(country_abbr)
-        flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
-
-        sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
-
-        table.add_row(
-            Text(s.symbol, style=style),
-            flags_txt,
-            Text(price_txt, style=style),
-            Text(rvol_txt, style=style),
-            Text(_fmt_money(s.dollar_volume), style=style),
-            Text(spread_txt, style=spread_style),
-            Text(float_txt, style=float_style),
-            Text(short_txt, style=short_style),
-            _fmt_scalp_shares(sizing),
-            _fmt_scalp_target(sizing),
-            _fmt_scalp_stop(sizing),
-        )
+    title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
+    title += "  [bold green](CONNECTED)[/]" if connected else "  [bold red](DISCONNECTED)[/]"
+    datatable.border_title = title
 
     status_bits = [f"Live slots: {len(states)}/{tunables.max_live_symbols}"]
     if waiting_count:
@@ -248,10 +301,7 @@ def render(
         status_bits.append(f"{held_count} held (dead/non-tradable/excluded)")
     if not ranked:
         status_bits.insert(0, "No symbols have cleared persistence + RVOL floor yet…")
-    table.caption = "   ".join(status_bits)
-    table.caption_justify = "right"
-
-    return table
+    datatable.border_subtitle = "   ".join(status_bits)
 
 
 def _score_style(score: float) -> str:

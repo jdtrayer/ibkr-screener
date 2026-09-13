@@ -14,7 +14,7 @@ from pathlib import Path
 from ib_async import IB, Stock, Ticker
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Static
+from textual.widgets import DataTable, Footer, Header, Static
 
 from . import config, country, display, floatref, rvol, short_interest, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
@@ -50,9 +50,14 @@ class ScannerApp(App):
         width: 1fr;
         height: 1fr;
     }
-    #scanner-table-scroll {
+    #scanner-table {
         width: 1fr;
         height: 1fr;
+        border: solid $primary;
+    }
+    #scorer-table-scroll {
+        width: 1fr;
+        height: 14;
         border: solid $primary;
     }
     #news-feed-scroll {
@@ -109,8 +114,8 @@ class ScannerApp(App):
         yield Header()
         with Horizontal():
             with Vertical(id="main-column"):
-                with VerticalScroll(id="scanner-table-scroll"):
-                    yield Static(id="scanner-table")
+                yield DataTable(id="scanner-table")
+                with VerticalScroll(id="scorer-table-scroll"):
                     yield Static(id="scorer-table")
                 with VerticalScroll(id="news-feed-scroll"):
                     yield Static(id="news-feed-table")
@@ -140,7 +145,13 @@ class ScannerApp(App):
         await self.news.load_providers()
         self._reconfigure_for_session(current_session())
         self.scanner_mgr.on_update(self._on_scan_update)
-        self._render()
+
+        scanner_table = self.query_one("#scanner-table", DataTable)
+        scanner_table.cursor_type = "row"
+        scanner_table.zebra_stripes = True
+        scanner_table.add_columns(*display.MAIN_TABLE_COLUMNS)
+
+        self._render(reorder=True)
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
         self.set_interval(config.SCORE_REFRESH_SEC, self._scorer_tick)
         self.set_interval(config.NEWS_PULL_INTERVAL_SEC, self._news_tick)
@@ -226,14 +237,16 @@ class ScannerApp(App):
         self._evict_unqualified()
         self._log_filter_transitions()
 
+        just_resorted = False
         if self._tick_count % SORT_REFRESH_EVERY_N_TICKS == 0 or not self._row_order:
             self._resort()
+            just_resorted = True
 
-        self._render()
+        self._render(reorder=just_resorted)
 
     def _resort(self) -> None:
         """Recompute row ORDER by live RVOL. Called on a slower cadence than
-        _render() so rows hold still between resorts -- see display.render's
+        _render() so rows hold still between resorts -- see display.sync_table's
         row_order docstring."""
         self._row_order = sorted(
             self.states,
@@ -241,9 +254,10 @@ class ScannerApp(App):
             reverse=True,
         )
 
-    def _render(self) -> None:
+    def _render(self, reorder: bool = False) -> None:
         news_sentiment = self.news.sentiment_map()
-        table = display.render(
+        display.sync_table(
+            self.query_one("#scanner-table", DataTable),
             list(self.states.values()),
             self.session,
             self.ib.isConnected(),
@@ -253,8 +267,8 @@ class ScannerApp(App):
             cooldown_count=self._cooldown_wait_count(),
             held_count=self._held_count(),
             news_sentiment=news_sentiment,
+            reorder=reorder,
         )
-        self.query_one("#scanner-table", Static).update(table)
         self.query_one("#scorer-table", Static).update(
             display.render_scorer(
                 self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
@@ -505,7 +519,7 @@ class ScannerApp(App):
 
     def _log_filter_transitions(self) -> None:
         """Logs, once per state change, why a live-subscribed symbol is or isn't
-        clearing display.render's row filter -- otherwise a symbol can spike
+        clearing display.sync_table's row filter -- otherwise a symbol can spike
         heavily under the hood and stay invisible with no trace in the log."""
         for symbol, state in self.states.items():
             if state.tick.last is None:
