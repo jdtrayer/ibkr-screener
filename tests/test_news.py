@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from momentum_scanner import config
 from momentum_scanner.news import NewsTracker
 
 
@@ -16,8 +17,19 @@ class FakeIB:
         return True
 
 
+@pytest.fixture(autouse=True)
+def isolated_news_state_file(tmp_path, monkeypatch):
+    """NewsTracker reads/writes config.NEWS_STATE_FILE on construction and
+    every pull_sweep -- without this, every test in this module shares (and
+    pollutes) the real ./cache/news_history.json, leaking state between
+    tests within a run AND into a same-day live run of the app. autouse so
+    it covers every NewsTracker built in this file, not just the `tracker`
+    fixture below (several tests construct one inline)."""
+    monkeypatch.setattr(config, "NEWS_STATE_FILE", str(tmp_path / "news_history.json"))
+
+
 @pytest.fixture
-def tracker():
+def tracker(isolated_news_state_file):
     return NewsTracker(FakeIB())
 
 
