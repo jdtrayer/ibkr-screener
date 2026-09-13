@@ -218,6 +218,10 @@ class ScannerApp(App):
             # is re-entry guarded so this can't stack fetches.
             asyncio.create_task(country.refresh_if_stale())
 
+        now = datetime.now(config.TZ)
+        for s in self.states.values():
+            s.record_volume_sample(now)
+
         self._process_pending_hits()
         self._evict_unqualified()
         self._log_filter_transitions()

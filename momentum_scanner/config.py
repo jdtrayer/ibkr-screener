@@ -59,6 +59,19 @@ MIN_DOLLAR_VOLUME = 5_000_000
 # premarket/afterhours session and adjust.
 MIN_DOLLAR_VOLUME_EXTENDED_HOURS = 500_000
 
+# Trailing-window $ volume floor -- MIN_DOLLAR_VOLUME above is session-
+# CUMULATIVE, so a symbol that had a real burst earlier in the session keeps
+# clearing it (and the RVOL floor) forever after, even once it's gone
+# completely quiet -- "a move without volume isn't a move" only holds if you
+# keep checking. This looks only at volume traded in the trailing
+# RECENT_VOLUME_WINDOW_SEC. Starting point (user's own number for the
+# regular-session floor, motivated by SHOE showing ~zero volume for the
+# prior ~15min on 2026-09-10 despite still clearing both cumulative floors)
+# -- validate live and adjust, same as MIN_DOLLAR_VOLUME_EXTENDED_HOURS.
+RECENT_VOLUME_WINDOW_SEC = 900.0  # 15 minutes
+MIN_RECENT_DOLLAR_VOLUME = 100_000.0
+MIN_RECENT_DOLLAR_VOLUME_EXTENDED_HOURS = 25_000.0
+
 # Coarse scanner-SIDE pre-filter (shares, not dollars) to cut noise before
 # we ever pull live data. Keep this well below what you'd expect a real
 # candidate to clear -- it exists to reduce scanner payload size, not to

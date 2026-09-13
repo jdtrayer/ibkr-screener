@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from . import config
 from .session import Session
 
 
@@ -124,6 +125,39 @@ class SymbolState:
     live_subscribed: bool = False
     subscribed_at: datetime | None = None  # when the live mkt-data subscription started
     volume_offset: float | None = None  # tick.volume at the first tick after subscribing
+
+    # (datetime, session_volume) samples, pruned to config.RECENT_VOLUME_WINDOW_SEC --
+    # see record_volume_sample/recent_dollar_volume.
+    volume_history: deque = field(default_factory=deque)
+
+    def record_volume_sample(self, now: datetime) -> None:
+        """Appends a (timestamp, session_volume) sample for the trailing-
+        window $ volume check (recent_dollar_volume) and prunes anything
+        older than the window. Call on a steady cadence (app.py's _tick) --
+        coarse resolution is fine for judging "quiet for 15 min"."""
+        sv = self.session_volume
+        if sv is not None:
+            self.volume_history.append((now, sv))
+        cutoff = now.timestamp() - config.RECENT_VOLUME_WINDOW_SEC
+        while self.volume_history and self.volume_history[0][0].timestamp() < cutoff:
+            self.volume_history.popleft()
+
+    @property
+    def recent_dollar_volume(self) -> float | None:
+        """$ volume traded in the trailing RECENT_VOLUME_WINDOW_SEC, unlike
+        dollar_volume's session-cumulative total -- a symbol that popped
+        early and has since gone quiet still clears the cumulative floor/
+        RVOL forever after, since neither looks backward at just the recent
+        window. None until a full window of samples has accumulated, so a
+        fresh admission isn't held to a 15-min-quiet standard on its first
+        tick."""
+        if self.tick.last is None or len(self.volume_history) < 2:
+            return None
+        oldest_ts, oldest_vol = self.volume_history[0]
+        newest_ts, newest_vol = self.volume_history[-1]
+        if (newest_ts - oldest_ts).total_seconds() < config.RECENT_VOLUME_WINDOW_SEC:
+            return None
+        return self.tick.last * (newest_vol - oldest_vol)
 
     @property
     def session_volume(self) -> float | None:

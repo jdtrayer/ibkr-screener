@@ -10,6 +10,7 @@ from momentum_scanner.filters import (
     PersistenceTracker,
     ScorerAdmission,
     bump_candidate,
+    check_recent_volume,
     is_dead_on_bump,
 )
 from momentum_scanner.models import SymbolState
@@ -21,7 +22,8 @@ from momentum_scanner.tunables import Tunables
 NOW = datetime(2026, 9, 3, 12, 0, 0, tzinfo=config.TZ)
 
 
-def make_state(symbol="TEST", dollar_volume=None, spread_pct=None, subscribed_seconds_ago=999, spiked_seconds_ago=None):
+def make_state(symbol="TEST", dollar_volume=None, spread_pct=None, subscribed_seconds_ago=999,
+                spiked_seconds_ago=None, recent_dollar_volume=None):
     state = SymbolState(symbol=symbol)
     if dollar_volume is not None:
         state.tick.last = 1.0
@@ -32,6 +34,10 @@ def make_state(symbol="TEST", dollar_volume=None, spread_pct=None, subscribed_se
         k = (1 + spread_pct / 200) / (1 - spread_pct / 200)
         state.tick.bid = 100.0
         state.tick.ask = 100.0 * k
+    if recent_dollar_volume is not None:
+        state.tick.last = 1.0  # price=1.0 => recent_dollar_volume == recent share volume
+        state.volume_history.append((NOW - timedelta(seconds=config.RECENT_VOLUME_WINDOW_SEC), 0.0))
+        state.volume_history.append((NOW, recent_dollar_volume))
     state.subscribed_at = NOW - timedelta(seconds=subscribed_seconds_ago)
     if spiked_seconds_ago is not None:
         state.spike.last_spike_at = NOW - timedelta(seconds=spiked_seconds_ago)
@@ -61,6 +67,36 @@ def test_dead_on_bump_false_when_bumped_for_spread_not_volume():
 
 def test_dead_on_bump_true_when_dollar_volume_unknown():
     state = make_state(dollar_volume=None)
+    assert is_dead_on_bump(state, Session.REGULAR, config.DEAD_DV_FRACTION) is True
+
+
+# -- trailing-window $ volume floor (SHOE case, 2026-09-10) ------------------
+
+def test_check_recent_volume_false_when_quiet_despite_healthy_cumulative_dv():
+    # SHOE's actual pattern: big cumulative $ volume from earlier in the
+    # session, but ~$0 traded in the trailing window.
+    state = make_state(dollar_volume=config.MIN_DOLLAR_VOLUME * 10, recent_dollar_volume=500)
+    assert check_recent_volume(state, Session.REGULAR) is False
+
+
+def test_check_recent_volume_true_when_history_not_built_up_yet():
+    # No volume_history samples at all yet -- don't judge a fresh admission.
+    state = make_state(dollar_volume=config.MIN_DOLLAR_VOLUME * 10)
+    assert check_recent_volume(state, Session.REGULAR) is True
+
+
+def test_bump_candidate_picks_symbol_quiet_on_recent_volume_over_a_weak_cumulative_dip():
+    states = {
+        "STALE_MOVER": make_state("STALE_MOVER", dollar_volume=config.MIN_DOLLAR_VOLUME * 10,
+                                   recent_dollar_volume=1_000),
+        "WEAK_DIP": make_state("WEAK_DIP", dollar_volume=config.MIN_DOLLAR_VOLUME * 0.9),
+    }
+    picked = bump_candidate(states, Session.REGULAR, NOW)
+    assert picked is not None and picked.symbol == "STALE_MOVER"
+
+
+def test_is_dead_on_bump_true_for_near_zero_recent_volume():
+    state = make_state(dollar_volume=config.MIN_DOLLAR_VOLUME * 10, recent_dollar_volume=100)
     assert is_dead_on_bump(state, Session.REGULAR, config.DEAD_DV_FRACTION) is True
 
 
