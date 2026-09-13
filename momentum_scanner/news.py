@@ -110,12 +110,16 @@ class NewsTracker:
     def headlines(self, symbol: str) -> list[str]:
         return list(self._headlines.get(symbol, ()))
 
-    def feed(self, limit: int | None = None) -> list[tuple[datetime, str, str]]:
+    def feed(self, limit: int | None = None, symbol: str | None = None) -> list[tuple[datetime, str, str]]:
         """(when, symbol, headline) across every symbol with news today,
         newest first -- what the UI's scrollable headline panel reads.
         Sorted here rather than kept sorted on insert, since headlines
-        arrive symbol-by-symbol during a sweep (not in global time order)."""
-        rows = sorted(self._feed, key=lambda row: row[0], reverse=True)
+        arrive symbol-by-symbol during a sweep (not in global time order).
+        `symbol` restricts to just that symbol's headlines -- selecting a
+        row in the main/scorer table filters the panel this way, see
+        app.py's on_data_table_row_selected."""
+        rows = self._feed if symbol is None else [row for row in self._feed if row[1] == symbol]
+        rows = sorted(rows, key=lambda row: row[0], reverse=True)
         return rows[:limit] if limit is not None else rows
 
     def sentiment(self, symbol: str) -> str:

@@ -202,3 +202,22 @@ def test_reset_if_new_day_clears_sentiment_too():
     tracker.reset_if_new_day()
 
     assert tracker.sentiment("AAPL") == "neutral"  # back to the no-data default
+
+
+def test_feed_symbol_filter():
+    tracker = NewsTracker(FakeIB())
+    tracker.record("AAPL", "Apple headline")
+    tracker.record("TSLA", "Tesla headline")
+    tracker.record("AAPL", "Second Apple headline")
+
+    filtered = tracker.feed(symbol="AAPL")
+
+    assert [headline for _when, _sym, headline in filtered] == ["Second Apple headline", "Apple headline"]
+    assert all(sym == "AAPL" for _when, sym, _headline in filtered)
+
+
+def test_feed_symbol_filter_no_match_returns_empty():
+    tracker = NewsTracker(FakeIB())
+    tracker.record("AAPL", "Apple headline")
+
+    assert tracker.feed(symbol="TSLA") == []

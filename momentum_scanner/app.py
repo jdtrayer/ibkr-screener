@@ -92,6 +92,12 @@ class ScannerApp(App):
         self._filter_reasons: dict[str, str | None] = {}
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
+        # Set by on_data_table_row_selected (click/Enter a row in either the
+        # main or scorer table) -- filters the News Feed panel to just this
+        # symbol. Selecting the same symbol again clears it. Independent of
+        # self.states -- selecting a symbol that's since been evicted still
+        # shows its recorded headlines.
+        self._selected_symbol: str | None = None
         # Unlike the main table, the scorer table has no separate row_order --
         # self.scorer.ranked() is already stable between sweeps on its own, so
         # this just tracks whether last_sweep_at advanced since the last
@@ -288,9 +294,22 @@ class ScannerApp(App):
             reorder=scorer_reorder,
         )
         self.query_one("#news-feed-table", Static).update(
-            display.render_news_feed(self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS))
+            display.render_news_feed(
+                self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS, symbol=self._selected_symbol),
+                symbol_filter=self._selected_symbol,
+            )
         )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Click or Enter a row in the main or scorer table -- filters the
+        News Feed panel to that symbol (selecting the same symbol again
+        clears the filter). Both tables post this same message type, so one
+        handler on the App covers either (it bubbles up regardless of which
+        DataTable posted it)."""
+        symbol = event.row_key.value
+        self._selected_symbol = None if symbol == self._selected_symbol else symbol
+        self._render()
 
     def _waiting_for_slot_count(self) -> int:
         """Symbols that have cleared persistence and are genuinely blocked by a

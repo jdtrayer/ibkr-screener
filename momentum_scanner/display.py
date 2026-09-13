@@ -408,7 +408,7 @@ def sync_scorer_table(
     datatable.border_subtitle = "Waiting for two sweeps per symbol…" if not ranked else None
 
 
-def render_news_feed(feed: list[tuple[datetime, str, str]]) -> Table:
+def render_news_feed(feed: list[tuple[datetime, str, str]], symbol_filter: str | None = None) -> Table:
     """
     Every recorded headline today (see news.NewsTracker.feed), newest first
     -- one row per headline, not one per symbol, so a symbol with several
@@ -418,8 +418,15 @@ def render_news_feed(feed: list[tuple[datetime, str, str]]) -> Table:
     only its most recent headline (see NEWS_SENTIMENT_ICONS), so attaching
     it to every row of that symbol's history would misattribute it to
     older headlines.
+
+    `symbol_filter`, if given, is purely a label -- the caller (app.py) is
+    expected to have already passed a pre-filtered `feed` (via
+    NewsTracker.feed(symbol=...)); this only changes the title/empty-state
+    text so it's clear a filter is active, and how it got cleared (select
+    the same row again -- see app.py's on_data_table_row_selected).
     """
-    table = Table(title="News Feed", expand=True, show_header=True, show_lines=False)
+    title = f"News Feed — {symbol_filter} (select row again to clear)" if symbol_filter else "News Feed"
+    table = Table(title=title, expand=True, show_header=True, show_lines=False)
     table.add_column("Time", style="dim", width=5, no_wrap=True)
     table.add_column("Sym", style="bold", width=6, no_wrap=True)
     table.add_column("Headline", ratio=1)
@@ -427,6 +434,6 @@ def render_news_feed(feed: list[tuple[datetime, str, str]]) -> Table:
     for when, symbol, headline in feed:
         table.add_row(Text(f"{when.astimezone(config.TZ):%H:%M}"), Text(symbol), Text(headline))
     if not feed:
-        table.caption = "No headlines yet today"
+        table.caption = f"No headlines yet today for {symbol_filter}" if symbol_filter else "No headlines yet today"
         table.caption_justify = "right"
     return table
