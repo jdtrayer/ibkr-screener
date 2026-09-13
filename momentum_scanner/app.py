@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, Static
 
-from . import config, display, floatref, rvol, spikes
+from . import config, country, display, floatref, rvol, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .scorer import SnapshotScorer
@@ -129,6 +129,10 @@ class ScannerApp(App):
         # first render or any of the setup below. Sentiment simply becomes
         # available a few seconds later once this finishes.
         asyncio.create_task(self.sentiment.load())
+        # Fired, not awaited -- same reasoning as sentiment.load() above: the
+        # first fetch is a ~2MB HTTP call and country tags simply become
+        # available a few seconds later once this finishes.
+        asyncio.create_task(country.refresh_if_stale())
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
         self.float_map = floatref.load()
@@ -209,6 +213,10 @@ class ScannerApp(App):
             self.float_map = floatref.load()
             for s in self.states.values():
                 self._apply_float(s)
+            # Same cadence as the float reload above -- refresh_if_stale() is
+            # a cheap no-op unless COUNTRY_CACHE_MAX_AGE_DAYS has elapsed, and
+            # is re-entry guarded so this can't stack fetches.
+            asyncio.create_task(country.refresh_if_stale())
 
         self._process_pending_hits()
         self._evict_unqualified()

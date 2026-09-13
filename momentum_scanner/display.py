@@ -6,7 +6,7 @@ from datetime import datetime
 from rich.table import Table
 from rich.text import Text
 
-from . import config, spikes
+from . import config, country, spikes
 from .filters import check_spread, display_reason
 from .models import SymbolState
 from .session import Session
@@ -132,6 +132,11 @@ def render(
     `news_sentiment` (symbol -> "positive"/"negative"/"neutral", see
     news.NewsTracker.sentiment_map) drives the Flags column's news icon,
     same as render_scorer's -- see NEWS_SENTIMENT_ICONS.
+
+    The Flags column also appends a letter country abbreviation (CN, TW, ...)
+    from country.abbr_for() when the symbol's issuer country is known and
+    non-US -- see country.py's module docstring for the data source and its
+    accuracy caveats (it's a heads-up, not ground truth).
     """
     news_sentiment = news_sentiment or {}
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
@@ -200,6 +205,9 @@ def render(
             flags.append("[yellow]FLOAT[/]")
         if s.symbol in news_sentiment:
             flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[s.symbol]])
+        country_abbr = country.abbr_for(s.symbol)
+        if country_abbr:
+            flags.append(country_abbr)
         flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
 
         sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
@@ -280,6 +288,9 @@ def render_scorer(
             flags.append("⚡")
         if r.symbol in news_sentiment:
             flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[r.symbol]])
+        country_abbr = country.abbr_for(r.symbol)
+        if country_abbr:
+            flags.append(country_abbr)
         flags_txt = Text(" ".join(flags))
 
         table.add_row(

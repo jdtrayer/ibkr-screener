@@ -278,6 +278,19 @@ FLOAT_CACHE_FILE = "./cache/float_cache.json"
 FLOAT_CACHE_MAX_AGE_DAYS = 7.0
 
 # --------------------------------------------------------------------------
+# Country reference (country.py) -- issuer country -> flag emoji hint in the
+# Flags column, prototype/experimental. Same underlying gap as float above:
+# IBKR's ContractDetails has no country field on this account (Reuters
+# Fundamentals-gated). Source is Nasdaq's public screener download endpoint,
+# which is NOT authoritative (spot-checked wrong for at least one symbol --
+# see country.py's module docstring) so this is a heads-up, not ground truth.
+# One bulk fetch covers the whole listed universe, cached whole and refreshed
+# on this TTL rather than incrementally per symbol.
+# --------------------------------------------------------------------------
+COUNTRY_CACHE_FILE = "./cache/country_cache.json"
+COUNTRY_CACHE_MAX_AGE_DAYS = 1.0
+
+# --------------------------------------------------------------------------
 # Halt detection
 # --------------------------------------------------------------------------
 # Tick type 49 = "Halted": 0 not halted, 1 general halt, 2 volatility halt.
