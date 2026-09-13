@@ -32,6 +32,14 @@ startDateTime parameter -- confirmed live that IB does not reliably honor
 that bound server-side (a start bound of today's midnight still returned
 headlines from two days prior).
 
+Recorded headlines/sentiment/feed survive restarts within the same trading
+day (config.NEWS_STATE_FILE, date-stamped and discarded on a new day, same
+pattern as scorer.py's SCORER_STATE_FILE) -- this is about the news feed
+panel and sentiment badges not going blank on restart, not pull efficiency;
+a pull is already cheap and self-limiting on its own, and there's no
+cheaper "resume" query to make since startDateTime isn't honored
+server-side regardless.
+
 Each newly-recorded headline is optionally classified (see sentiment.py's
 SentimentClassifier, injected rather than imported here so this module
 stays free of the heavy torch/transformers import) -- positive/negative/
@@ -48,6 +56,7 @@ render_news_feed).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import date, datetime, timezone
 
@@ -72,6 +81,7 @@ class NewsTracker:
         self._fetch_semaphore = asyncio.Semaphore(config.NEWS_FETCH_CONCURRENCY)
         self._fetch_lock = asyncio.Lock()
         self._last_fetch_at = 0.0
+        self._load_state()
 
     # -- setup -----------------------------------------------------------------
 
@@ -206,6 +216,45 @@ class NewsTracker:
                         symbol_classified = True
         if found:
             log.info("News pull sweep: %d new headline(s) across %d pending symbol(s)", found, len(pending))
+        self._save_state()
+
+    # -- state persistence (restart resilience, same trading day only) --------
+
+    def _save_state(self) -> None:
+        try:
+            state = {
+                "date": self._date.isoformat(),
+                "headlines": self._headlines,
+                "sentiment": self._sentiment,
+                "feed": [[when.isoformat(), sym, headline] for when, sym, headline in self._feed],
+            }
+            with open(config.NEWS_STATE_FILE, "w") as fh:
+                json.dump(state, fh)
+        except Exception:
+            log.exception("News state save failed (non-fatal)")
+
+    def _load_state(self) -> None:
+        try:
+            with open(config.NEWS_STATE_FILE) as fh:
+                state = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception:
+            log.exception("News state load failed (non-fatal); starting cold")
+            return
+        if state.get("date") != self._date.isoformat():
+            return  # yesterday's headlines -- reset_if_new_day would clear these anyway
+        self._headlines = {sym: list(hs) for sym, hs in state.get("headlines", {}).items()}
+        self._seen = {
+            sym: {" ".join(h.split()).casefold() for h in hs} for sym, hs in self._headlines.items()
+        }
+        self._sentiment = dict(state.get("sentiment", {}))
+        self._feed = [
+            (datetime.fromisoformat(when), sym, headline)
+            for when, sym, headline in state.get("feed", [])
+        ]
+        if self._headlines:
+            log.info("News resumed same-day headlines for %d symbol(s)", len(self._headlines))
 
     async def _throttled_fetch(self, con_id: int, start: datetime, end: datetime):
         async with self._fetch_semaphore:

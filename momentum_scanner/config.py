@@ -378,6 +378,17 @@ NEWS_FETCH_MIN_INTERVAL_SEC = 1.5 # mirrors HISTORICAL_FETCH_MIN_INTERVAL_SEC
 NEWS_HEADLINES_PER_PULL = 20
 NEWS_FEED_DISPLAY_ROWS = 100  # cap on the scrollable news feed panel's row count
 
+# Sweep state (recorded headlines/sentiment/feed) survives restarts within
+# the same trading day, same pattern/motivation as SCORER_STATE_FILE (the
+# user restarts often mid-session). This is about UX continuity, not pull
+# efficiency -- a pull is already cheap and self-limiting (once a symbol has
+# a headline it's never re-pulled today, and startDateTime isn't honored
+# server-side anyway, so there's no cheaper "resume" query to make) -- what
+# it actually avoids is the news feed panel and sentiment badges going blank
+# on restart until the next sweep cycle re-discovers everything. Date-stamped
+# and discarded on a new trading day, same as scorer_history.json.
+NEWS_STATE_FILE = "./cache/news_history.json"
+
 # --------------------------------------------------------------------------
 # Headline sentiment classification (backlog #12 fast-follow) -- local via
 # FinBERT (see momentum_scanner/sentiment.py), not an LLM API: no API key/
