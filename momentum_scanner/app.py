@@ -55,7 +55,7 @@ class ScannerApp(App):
         height: 1fr;
         border: solid $primary;
     }
-    #scorer-table-scroll {
+    #scorer-table {
         width: 1fr;
         height: 14;
         border: solid $primary;
@@ -92,6 +92,12 @@ class ScannerApp(App):
         self._filter_reasons: dict[str, str | None] = {}
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
+        # Unlike the main table, the scorer table has no separate row_order --
+        # self.scorer.ranked() is already stable between sweeps on its own, so
+        # this just tracks whether last_sweep_at advanced since the last
+        # render, to know when it's safe to reposition scorer table rows
+        # (see display.sync_scorer_table's reorder docstring).
+        self._last_scorer_sweep_rendered: datetime | None = None
         self.scorer = SnapshotScorer(self.ib)
         self.sentiment = SentimentClassifier()
         self.news = NewsTracker(self.ib, sentiment=self.sentiment)
@@ -115,8 +121,7 @@ class ScannerApp(App):
         with Horizontal():
             with Vertical(id="main-column"):
                 yield DataTable(id="scanner-table")
-                with VerticalScroll(id="scorer-table-scroll"):
-                    yield Static(id="scorer-table")
+                yield DataTable(id="scorer-table")
                 with VerticalScroll(id="news-feed-scroll"):
                     yield Static(id="news-feed-table")
             with Vertical(id="side-panel"):
@@ -150,6 +155,11 @@ class ScannerApp(App):
         scanner_table.cursor_type = "row"
         scanner_table.zebra_stripes = True
         scanner_table.add_columns(*display.MAIN_TABLE_COLUMNS)
+
+        scorer_table = self.query_one("#scorer-table", DataTable)
+        scorer_table.cursor_type = "row"
+        scorer_table.zebra_stripes = True
+        scorer_table.add_columns(*display.SCORER_TABLE_COLUMNS)
 
         self._render(reorder=True)
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
@@ -269,11 +279,13 @@ class ScannerApp(App):
             news_sentiment=news_sentiment,
             reorder=reorder,
         )
-        self.query_one("#scorer-table", Static).update(
-            display.render_scorer(
-                self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
-                news_sentiment,
-            )
+        scorer_reorder = self.scorer.last_sweep_at != self._last_scorer_sweep_rendered
+        self._last_scorer_sweep_rendered = self.scorer.last_sweep_at
+        display.sync_scorer_table(
+            self.query_one("#scorer-table", DataTable),
+            self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
+            news_sentiment,
+            reorder=scorer_reorder,
         )
         self.query_one("#news-feed-table", Static).update(
             display.render_news_feed(self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS))

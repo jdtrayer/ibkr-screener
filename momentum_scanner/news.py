@@ -104,7 +104,7 @@ class NewsTracker:
 
     def sentiment_map(self) -> dict[str, str]:
         """symbol -> 'positive'/'negative'/'neutral' for every symbol with
-        news today -- what display.render_scorer's Flags column reads."""
+        news today -- what display.sync_scorer_table's Flags column reads."""
         return {sym: self.sentiment(sym) for sym in self._headlines}
 
     def headlines(self, symbol: str) -> list[str]:

@@ -1,11 +1,11 @@
 """
 Terminal UI rendering. RVOL is the primary sort key and color driver.
 
-The main table (sync_table) is a textual.widgets.DataTable, synced in place
-rather than rebuilt -- see its docstring for why. The scorer/news-feed
-tables are still plain rich.Table objects pushed into a Static widget
-(render_scorer/render_news_feed) -- out of scope for the DataTable move,
-see the datatable-rewrite branch's starting point.
+The main table (sync_table) and scorer table (sync_scorer_table) are both
+textual.widgets.DataTable, synced in place rather than rebuilt -- see
+sync_table's docstring for why. The news-feed panel is still a plain
+rich.Table pushed into a Static widget (render_news_feed) -- out of scope
+for the DataTable move so far, see the datatable-rewrite branch.
 """
 from __future__ import annotations
 
@@ -238,7 +238,7 @@ def sync_table(
 
     `news_sentiment` (symbol -> "positive"/"negative"/"neutral", see
     news.NewsTracker.sentiment_map) drives the Flags column's news icon,
-    same as render_scorer's -- see NEWS_SENTIMENT_ICONS.
+    same as sync_scorer_table's -- see NEWS_SENTIMENT_ICONS.
 
     The Flags column also appends a letter country abbreviation (CN, TW, ...)
     from country.abbr_for() when the symbol's issuer country is known and
@@ -314,14 +314,68 @@ def _score_style(score: float) -> str:
     return "white"
 
 
-def render_scorer(
-    rows, pool_size: int, last_sweep_at: datetime | None, news_sentiment: dict[str, str] | None = None
-) -> Table:
+SCORER_TABLE_COLUMNS = [
+    ("Sym", "sym"),
+    ("Flags", "flags"),
+    ("Score", "score"),
+    ("Move/min", "move"),
+    ("$/min", "dmin"),
+    ("Gap%", "gap"),
+    ("Spread%", "spread"),
+]
+"""(label, key) pairs for the scorer table's DataTable -- same role as
+MAIN_TABLE_COLUMNS."""
+
+
+def _scorer_row_cells(r, news_sentiment: dict[str, str]) -> list[Text]:
+    """One ScoreRow -> the cell values for SCORER_TABLE_COLUMNS, in order."""
+    style = _score_style(r.score)
+    # Same slot as the main table's Flags -- see backlog_2026_09_02 item #2.
+    flags = []
+    if r.fast_lane:
+        flags.append("⚡")
+    if r.symbol in news_sentiment:
+        flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[r.symbol]])
+    country_abbr = country.abbr_for(r.symbol)
+    if country_abbr:
+        flags.append(country_abbr)
+    flags_txt = Text(" ".join(flags))
+
+    return [
+        Text(r.symbol, style=style),
+        flags_txt,
+        Text(f"{r.score:+.2f}", style=style),
+        Text(f"{r.move_pct_per_min:+.2f}%"),
+        Text(_fmt_money(r.dollar_per_min)),
+        Text(f"{r.gap_pct:+.1f}%" if r.gap_pct is not None else "-"),
+        Text(f"{r.spread_pct:.2f}" if r.spread_pct is not None else "-"),
+    ]
+
+
+def sync_scorer_table(
+    datatable: DataTable,
+    rows: list,
+    pool_size: int,
+    last_sweep_at: datetime | None,
+    news_sentiment: dict[str, str] | None = None,
+    *,
+    reorder: bool = False,
+) -> None:
     """
-    The Tier-1 snapshot scorer's observation table (see scorer.py). Rendered
-    below the main table for side-by-side comparison -- this ranking is OURS
-    (computed from snapshot sweeps), deliberately independent of both IB's
-    scan ranks and the persistence gate, and does not drive admission yet.
+    The Tier-1 snapshot scorer's observation table (see scorer.py), synced
+    into `datatable` the same way sync_table syncs the main table -- see its
+    docstring for the update-in-place / reorder-only-on-resort reasoning.
+    Rendered below the main table for side-by-side comparison -- this
+    ranking is OURS (computed from snapshot sweeps), deliberately
+    independent of both IB's scan ranks and the persistence gate, and does
+    not drive admission yet.
+
+    `rows` (ScoreRow, see scorer.py) is expected pre-ranked by the caller
+    (self.scorer.ranked()) -- unlike the main table there's no separate
+    row_order here, since the scorer's own ranked() list is already stable
+    between sweeps on its own. `reorder=True` should be passed only when
+    `last_sweep_at` has actually advanced since the last call (app.py tracks
+    this), same "don't reposition rows outside of a real resort" contract.
 
     `news_sentiment` (symbol -> "positive"/"negative"/"neutral", see
     news.NewsTracker.sentiment_map) drives the Flags column's news icon --
@@ -330,46 +384,28 @@ def render_scorer(
     shows 📰.
     """
     news_sentiment = news_sentiment or {}
+    ranked = rows[: config.SCORER_TOP_DISPLAY]
+
+    if reorder:
+        datatable.clear()
+        for r in ranked:
+            datatable.add_row(*_scorer_row_cells(r, news_sentiment), key=r.symbol)
+    else:
+        existing = {row_key.value for row_key in datatable.rows}
+        wanted = {r.symbol for r in ranked}
+        for stale_symbol in existing - wanted:
+            datatable.remove_row(stale_symbol)
+        for r in ranked:
+            cells = _scorer_row_cells(r, news_sentiment)
+            if r.symbol in existing:
+                for (_, col_key), value in zip(SCORER_TABLE_COLUMNS, cells):
+                    datatable.update_cell(r.symbol, col_key, value)
+            else:
+                datatable.add_row(*cells, key=r.symbol)
+
     swept = f"swept {last_sweep_at:%H:%M:%S}" if last_sweep_at else "no sweep yet"
-    table = Table(
-        title=f"Scorer (observation) — pool {pool_size} — {swept}",
-        expand=True,
-        show_lines=True,
-    )
-    table.add_column("Sym", style="bold")
-    table.add_column("Flags", justify="left")
-    table.add_column("Score", justify="right")
-    table.add_column("Move/min", justify="right")
-    table.add_column("$/min", justify="right")
-    table.add_column("Gap%", justify="right")
-    table.add_column("Spread%", justify="right")
-
-    for r in rows[: config.SCORER_TOP_DISPLAY]:
-        style = _score_style(r.score)
-        # Same slot as the main table's Flags -- see backlog_2026_09_02 item #2.
-        flags = []
-        if r.fast_lane:
-            flags.append("⚡")
-        if r.symbol in news_sentiment:
-            flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[r.symbol]])
-        country_abbr = country.abbr_for(r.symbol)
-        if country_abbr:
-            flags.append(country_abbr)
-        flags_txt = Text(" ".join(flags))
-
-        table.add_row(
-            Text(r.symbol, style=style),
-            flags_txt,
-            Text(f"{r.score:+.2f}", style=style),
-            Text(f"{r.move_pct_per_min:+.2f}%"),
-            Text(_fmt_money(r.dollar_per_min)),
-            Text(f"{r.gap_pct:+.1f}%" if r.gap_pct is not None else "-"),
-            Text(f"{r.spread_pct:.2f}" if r.spread_pct is not None else "-"),
-        )
-    if not rows:
-        table.caption = "Waiting for two sweeps per symbol…"
-        table.caption_justify = "right"
-    return table
+    datatable.border_title = f"Scorer (observation) — pool {pool_size} — {swept}"
+    datatable.border_subtitle = "Waiting for two sweeps per symbol…" if not ranked else None
 
 
 def render_news_feed(feed: list[tuple[datetime, str, str]]) -> Table:
