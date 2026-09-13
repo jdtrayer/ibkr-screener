@@ -6,3 +6,4 @@ cache/
 scanner.log
 premarket_scan_check.log
 .pytest_cache/
+secrets.json

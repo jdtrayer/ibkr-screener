@@ -7,7 +7,28 @@ scanner.py / rvol.py / filters.py, it probably belongs here instead.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# --------------------------------------------------------------------------
+# Secrets -- API keys live in ./secrets.json (gitignored), never hardcoded
+# here or read from the shell environment. Missing file/key both resolve to
+# None (fail open, same as every other optional data source in this app) so
+# a fresh checkout without secrets.json still runs -- just without whatever
+# feature needs that key.
+# --------------------------------------------------------------------------
+def _load_secret(key: str) -> str | None:
+    try:
+        secrets = json.loads(Path("./secrets.json").read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return secrets.get(key) or None
+
+
+EQUIBLES_API_KEY = _load_secret("equibles_api_key")
 
 # --------------------------------------------------------------------------
 # IB connection
