@@ -312,6 +312,19 @@ FLOAT_CACHE_FILE = "./cache/float_cache.json"
 FLOAT_CACHE_MAX_AGE_DAYS = 7.0
 
 # --------------------------------------------------------------------------
+# Short interest (short_interest.py) -- % of float sold short, via Equibles'
+# REST API (api.equibles.com, requires EQUIBLES_API_KEY in secrets.json),
+# a reseller of FINRA's own semi-monthly short interest reports. Chosen
+# over Nasdaq's free per-symbol endpoint, which is Nasdaq-listed only
+# (confirmed live: blank for NYSE names) -- Equibles covers both exchanges.
+# The underlying number only updates twice a month regardless of source
+# (FINRA settlement dates), so this cache TTL is set to roughly that
+# cadence rather than implying it can be fresher than the data actually is.
+# --------------------------------------------------------------------------
+SHORT_INTEREST_CACHE_FILE = "./cache/short_interest_cache.json"
+SHORT_INTEREST_CACHE_MAX_AGE_DAYS = 7.0
+
+# --------------------------------------------------------------------------
 # Country reference (country.py) -- issuer country -> flag emoji hint in the
 # Flags column, prototype/experimental. Same underlying gap as float above:
 # IBKR's ContractDetails has no country field on this account (Reuters

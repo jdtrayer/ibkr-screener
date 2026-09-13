@@ -137,6 +137,11 @@ def render(
     from country.abbr_for() when the symbol's issuer country is known and
     non-US -- see country.py's module docstring for the data source and its
     accuracy caveats (it's a heads-up, not ground truth).
+
+    Short% is s.short_pct (see short_interest.py) -- % of float sold short
+    as of the most recent FINRA settlement date, which only updates twice a
+    month regardless of when this renders; "?" means no API key configured,
+    no coverage for the symbol, or not fetched yet.
     """
     news_sentiment = news_sentiment or {}
     title = f"IBKR Momentum Scanner — session: {session.value.upper()}"
@@ -153,6 +158,7 @@ def render(
     table.add_column("$Vol", justify="right")
     table.add_column("Spread%", justify="right")
     table.add_column("Float", justify="right")
+    table.add_column("Short%", justify="right")
     table.add_column("Shares", justify="right")
     table.add_column("Target", justify="right")
     table.add_column("Stop", justify="right")
@@ -191,6 +197,13 @@ def render(
             float_txt = _fmt_shares(s.float_shares)
             float_style = "yellow" if (s.float_shares or 0) > config.FLOAT_CEILING_SHARES else ""
 
+        if s.short_interest_known and s.short_pct is not None:
+            short_txt = f"{s.short_pct:.1f}"
+            short_style = ""
+        else:
+            short_txt = "?"
+            short_style = "dim"
+
         flags = []
         spike_n = spikes.active_spike_count(s.spike, tunables, now)
         if spike_n > 0:
@@ -220,6 +233,7 @@ def render(
             Text(_fmt_money(s.dollar_volume), style=style),
             Text(spread_txt, style=spread_style),
             Text(float_txt, style=float_style),
+            Text(short_txt, style=short_style),
             _fmt_scalp_shares(sizing),
             _fmt_scalp_target(sizing),
             _fmt_scalp_stop(sizing),

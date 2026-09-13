@@ -122,6 +122,12 @@ class SymbolState:
     float_shares: float | None = None
     float_known: bool = False
 
+    # % of float sold short, from short_interest.py (Equibles/FINRA, biweekly
+    # settlement data) -- short_interest_known distinguishes "no coverage for
+    # this symbol" from "not fetched yet", same reasoning as float_known.
+    short_pct: float | None = None
+    short_interest_known: bool = False
+
     live_subscribed: bool = False
     subscribed_at: datetime | None = None  # when the live mkt-data subscription started
     volume_offset: float | None = None  # tick.volume at the first tick after subscribing

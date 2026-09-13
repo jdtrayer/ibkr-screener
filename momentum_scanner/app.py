@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, Static
 
-from . import config, country, display, floatref, rvol, spikes
+from . import config, country, display, floatref, rvol, short_interest, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .scorer import SnapshotScorer
@@ -680,6 +680,7 @@ class ScannerApp(App):
 
         asyncio.create_task(self._load_baseline(state))
         asyncio.create_task(self._load_float(state))
+        asyncio.create_task(self._load_short_interest(state))
 
     async def _load_baseline(self, state: SymbolState) -> None:
         baseline = await rvol.build_baseline(self.ib, state.symbol, self.session)
@@ -696,6 +697,13 @@ class ScannerApp(App):
         if current is not None and not current.float_known:
             current.float_shares = shares
             current.float_known = shares is not None
+
+    async def _load_short_interest(self, state: SymbolState) -> None:
+        result = await short_interest.get_short_interest(state.symbol)
+        current = self.states.get(state.symbol)
+        if current is not None:
+            current.short_pct = result["pct_float"] if result else None
+            current.short_interest_known = result is not None
 
     def _remove_symbol(self, symbol: str) -> None:
         state = self.states.pop(symbol, None)
