@@ -224,6 +224,50 @@ or the main table. Weights and cadences live in `config.py` (restart to
 change). Sweep history is cached to `cache/scorer_history.json` and survives
 same-day restarts; it's discarded on the first sweep of a new trading day.
 
+## News Feed
+
+A scrollable panel below the scorer table (`news.py`'s `NewsTracker`,
+rendered by `display.sync_news_table`), showing every headline recorded
+today across both tables' symbols — newest first, one row per headline
+(not per symbol, so a symbol with several stories shows all of them).
+
+| Column | Meaning |
+|---|---|
+| **Time** | Headline publish time (local) |
+| **Sym** | Symbol the headline is about |
+| **Sentiment** | 📈 positive / 📉 negative / 📰 neutral — see below |
+| **Headline** | The headline text itself |
+
+Headlines come from `reqHistoricalNewsAsync`, pulled periodically for pool
+symbols that don't have news yet today (`NEWS_PULL_INTERVAL_SEC`). Each
+headline is classified independently by a local FinBERT model
+(`sentiment.py`) — positive/negative/neutral, with a confidence floor
+below which it falls back to neutral rather than trust a low-confidence
+call. This is a per-*headline* classification, not per-symbol: an older
+story for the same symbol can show a different sentiment than its latest
+one. The same classification also drives the news icon in the main/scorer
+tables' Flags column, but that one *is* per-symbol (taken from each
+symbol's most recent headline only).
+
+Selecting a row in the main or scorer table filters this panel to just
+that symbol (selecting the same symbol again clears the filter).
+
+## Non-tradable list
+
+A sidebar widget (`SymbolActionsPanel`, bottom-right) for manually marking
+a symbol non-tradable for the rest of the trading day — for a broker-side
+restriction IBKR has no queryable signal for. Type a symbol and hit Add
+(or Enter); Clear removes everything in the list. Held symbols count
+toward the main table's `N held (dead/non-tradable/excluded)` status, not
+`N waiting for a slot` — this isn't a capacity problem, so raising
+`max_live_symbols` won't un-hold them.
+
+The list itself is a small DataTable (Sym / Time left), scrolling
+internally with its own scrollbar once it has more entries than fit
+rather than growing the panel. Holds expire at the next trading day
+(`config.NON_TRADABLE_STATE_FILE` persists them across a restart within
+the same day).
+
 ## Related fixed thresholds (`config.py`, restart required)
 
 These aren't runtime-tunable but directly affect what you see: `PRICE_MIN`/`PRICE_MAX`

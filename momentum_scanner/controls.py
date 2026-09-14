@@ -139,6 +139,7 @@ class SymbolActionsPanel(VerticalScroll):
     }
     SymbolActionsPanel #ignore-status-table {
         margin-top: 1;
+        height: 6;
     }
     """
 
@@ -164,7 +165,7 @@ class SymbolActionsPanel(VerticalScroll):
         yield DataTable(id="ignore-status-table", cursor_type="none", show_cursor=False)
 
     def on_mount(self) -> None:
-        self.query_one("#ignore-status-table", DataTable).add_columns("Sym", "Time left")
+        self.query_one("#ignore-status-table", DataTable).add_columns(("Sym", "sym"), ("Time left", "time_left"))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self._submit("add")
@@ -183,15 +184,24 @@ class SymbolActionsPanel(VerticalScroll):
         field.value = ""
 
     def refresh_status(self, ignored_until: dict[str, datetime], now: datetime) -> None:
-        # Full clear+rebuild every call rather than sync_table's in-place
-        # update -- this list is short (manual holds are rare) and has no
-        # cursor/scroll state worth preserving (cursor_type="none" above),
-        # so there's nothing an in-place update would buy over just
-        # rebuilding it, same as this did as a plain Static before.
+        # In-place sync (add/remove rows, update the Time left cell) rather
+        # than a full clear+rebuild every call -- #ignore-status-table now
+        # has a fixed height (see DEFAULT_CSS) and scrolls internally once
+        # the list outgrows it, so a held-out symbol scrolled into view
+        # must not get yanked back to the top every render tick just
+        # because the countdown text changed, same reasoning as
+        # sync_news_table.
         table = self.query_one("#ignore-status-table", DataTable)
-        table.clear()
-        for sym, until in sorted(ignored_until.items()):
-            table.add_row(Text(sym, style="bold"), Text(self._fmt_remaining(until - now), style="dim"), key=sym)
+        wanted = sorted(ignored_until)
+        existing = {row_key.value for row_key in table.rows}
+        for stale in existing - set(wanted):
+            table.remove_row(stale)
+        for sym in wanted:
+            remaining = Text(self._fmt_remaining(ignored_until[sym] - now), style="dim")
+            if sym in existing:
+                table.update_cell(sym, "time_left", remaining)
+            else:
+                table.add_row(Text(sym, style="bold"), remaining, key=sym)
 
     @staticmethod
     def _fmt_remaining(delta) -> str:
