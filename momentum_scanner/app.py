@@ -73,7 +73,8 @@ class ScannerApp(App):
         height: 1fr;
     }
     #symbol-actions-panel {
-        height: 14;
+        height: auto;
+        max-height: 20;
     }
     """
 
