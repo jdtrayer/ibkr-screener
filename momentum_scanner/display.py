@@ -250,7 +250,9 @@ def sync_table(
 
     The Country column shows a letter abbreviation (CN, TW, ...) from
     country.abbr_for() when the symbol's issuer country is known and
-    non-US, blank otherwise -- see country.py's module docstring for the
+    non-US, "??" when it's some other country we don't have a code for or
+    the country data isn't available at all, and blank only when the
+    country is confirmed US -- see country.py's module docstring for the
     data source and its accuracy caveats (it's a heads-up, not ground
     truth).
 

@@ -16,7 +16,10 @@ Not authoritative: spot-checked live 2026-09-13, NIO and SE (both Chinese/
 Singapore ADRs) come back "United States" from this endpoint. Treat
 abbr_for() as a quick heads-up, not ground truth -- fine for the target use
 case (a visual nudge to go check), not for anything that gates a decision on
-its own.
+its own. Because of that, abbr_for() distinguishes "confirmed US" (blank)
+from "we don't actually know" ("??", covering an unloaded cache, a symbol
+outside the ~7000-symbol Nasdaq universe, or a country not yet in _ABBR)
+-- but a blank cell still isn't proof of US, just the absence of a flag.
 
 One bulk fetch rather than per-symbol (unlike floatref.get_float's Yahoo
 lookup) -- the whole table is a couple MB and changes rarely (new IPOs), so
@@ -40,10 +43,12 @@ log = logging.getLogger(__name__)
 _SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-# "United States" (and unrecognized/blank countries) intentionally map to no
+# "United States" is the only country that intentionally maps to no
 # abbreviation -- most rows are US, so tagging them too would just be noise;
-# the point is a heads-up for foreign-domiciled names. Not strict ISO 3166
-# throughout -- UK over GB since that's what a trader recognizes faster.
+# the point is a heads-up for foreign-domiciled names. Anything else without
+# an entry here falls back to "??" in abbr_for() rather than silently
+# reading as US. Not strict ISO 3166 throughout -- UK over GB since that's
+# what a trader recognizes faster.
 _ABBR = {
     "China": "CN",
     "Hong Kong": "HK",
@@ -183,9 +188,22 @@ async def refresh_if_stale() -> None:
 
 
 def abbr_for(symbol: str) -> str | None:
-    """Letter abbreviation for symbol's issuer country (e.g. "CN"), or None
-    (unknown, US, or cache not loaded yet -- see module docstring for
-    accuracy caveats)."""
+    """Letter abbreviation for symbol's issuer country (e.g. "CN"); None if
+    the country is known to be "United States" (blank is deliberately
+    treated as the common case, not tagged); "??" if the country is
+    anything else we can't put a short code on -- the whole cache isn't
+    loaded yet, the symbol isn't in the ~7000-symbol Nasdaq universe this
+    is sourced from, or it is in there with some country not yet in
+    _ABBR. The point of "??" is that it's never confused with "confirmed
+    US" the way a blank cell reads -- see module docstring for accuracy
+    caveats (this can still be wrong the other way: NIO/SE, both foreign
+    ADRs, come back "United States" from this source, so a blank cell
+    isn't proof either)."""
     if not _cache:
+        return "??"
+    country = _cache.get(symbol.upper())
+    if country is None:
+        return "??"
+    if country == "United States":
         return None
-    return _ABBR.get(_cache.get(symbol.upper(), ""))
+    return _ABBR.get(country, "??")
