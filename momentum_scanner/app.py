@@ -13,8 +13,8 @@ from pathlib import Path
 
 from ib_async import IB, Stock, Ticker
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.containers import Horizontal, Vertical
+from textual.widgets import DataTable, Footer, Header
 
 from . import config, country, display, floatref, rvol, short_interest, spikes
 from .controls import SymbolActionsPanel, TunablesPanel
@@ -60,7 +60,7 @@ class ScannerApp(App):
         height: 14;
         border: solid $primary;
     }
-    #news-feed-scroll {
+    #news-feed-table {
         width: 1fr;
         height: 14;
         border: solid $primary;
@@ -126,10 +126,16 @@ class ScannerApp(App):
         yield Header()
         with Horizontal():
             with Vertical(id="main-column"):
-                yield DataTable(id="scanner-table")
-                yield DataTable(id="scorer-table")
-                with VerticalScroll(id="news-feed-scroll"):
-                    yield Static(id="news-feed-table")
+                # cursor_foreground_priority="renderable" -- DataTable's default
+                # ("css") lets the cursor row's highlight override every cell's own
+                # text color, which washed out the RVOL/Target/Stop color coding
+                # (green3/red3/etc, see rvol_style and SCALP_TARGET_STYLE/
+                # SCALP_STOP_STYLE) on whichever row currently has the cursor.
+                # This keeps each cell's own color and lets only the background
+                # show the cursor.
+                yield DataTable(id="scanner-table", cursor_foreground_priority="renderable")
+                yield DataTable(id="scorer-table", cursor_foreground_priority="renderable")
+                yield DataTable(id="news-feed-table", cursor_foreground_priority="renderable")
             with Vertical(id="side-panel"):
                 yield TunablesPanel(self.tunables, id="tunables-panel")
                 yield SymbolActionsPanel(id="symbol-actions-panel")
@@ -166,6 +172,16 @@ class ScannerApp(App):
         scorer_table.cursor_type = "row"
         scorer_table.zebra_stripes = True
         scorer_table.add_columns(*display.SCORER_TABLE_COLUMNS)
+
+        news_table = self.query_one("#news-feed-table", DataTable)
+        # Deliberately not cursor_type="row" -- unlike the scanner/scorer
+        # tables, a news row's key isn't a symbol (a symbol can have several
+        # headlines), so it must never post RowSelected into
+        # on_data_table_row_selected, which assumes row_key.value IS a
+        # symbol. Default "cell" cursor still supports arrow-key/PageUp/Down
+        # scrolling through the panel.
+        news_table.zebra_stripes = True
+        news_table.add_columns(*display.NEWS_TABLE_COLUMNS)
 
         self._render(reorder=True)
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
@@ -293,11 +309,10 @@ class ScannerApp(App):
             news_sentiment,
             reorder=scorer_reorder,
         )
-        self.query_one("#news-feed-table", Static).update(
-            display.render_news_feed(
-                self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS, symbol=self._selected_symbol),
-                symbol_filter=self._selected_symbol,
-            )
+        display.sync_news_table(
+            self.query_one("#news-feed-table", DataTable),
+            self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS, symbol=self._selected_symbol),
+            symbol_filter=self._selected_symbol,
         )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))
 

@@ -157,12 +157,18 @@ def test_pull_sweep_classifies_and_stores_sentiment():
 
     assert tracker.sentiment("AAPL") == "positive"
     assert tracker.sentiment_map() == {"AAPL": "positive"}
+    [(_when, _sym, _headline, feed_sentiment)] = tracker.feed()
+    assert feed_sentiment == "positive"
 
 
 def test_sentiment_reflects_most_recent_headline_not_oldest():
     # IB returns headlines newest-first -- the first one successfully
     # recorded in a batch is the most recent, and must be the one whose
-    # sentiment sticks, not a later (older) headline in the same batch.
+    # per-symbol sentiment() sticks, not a later (older) headline in the
+    # same batch. Each headline is still classified individually though
+    # (see feed()'s per-row sentiment, which the news panel's Sentiment
+    # column reads) -- it's only the per-symbol sentiment_map() value that
+    # doesn't get overwritten by an older headline.
     now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
     newest = FakeItem(time=now_utc_naive, headline="Newest headline (good)")
     oldest = FakeItem(time=now_utc_naive - timedelta(hours=2), headline="Oldest headline (bad)")
@@ -177,7 +183,12 @@ def test_sentiment_reflects_most_recent_headline_not_oldest():
     asyncio.run(tracker.pull_sweep({"AAPL"}, lambda symbol: FakeContract(conId=1)))
 
     assert tracker.sentiment("AAPL") == "positive"
-    assert sentiment.calls == ["Newest headline (good)"]  # only classified once, not per headline
+    assert sentiment.calls == ["Newest headline (good)", "Oldest headline (bad)"]  # classified individually
+    feed_by_headline = {headline: s for _when, _sym, headline, s in tracker.feed()}
+    assert feed_by_headline == {
+        "Newest headline (good)": "positive",
+        "Oldest headline (bad)": "negative",
+    }
 
 
 def test_sentiment_defaults_to_neutral_without_a_classifier():
@@ -212,8 +223,8 @@ def test_feed_symbol_filter():
 
     filtered = tracker.feed(symbol="AAPL")
 
-    assert [headline for _when, _sym, headline in filtered] == ["Second Apple headline", "Apple headline"]
-    assert all(sym == "AAPL" for _when, sym, _headline in filtered)
+    assert [headline for _when, _sym, headline, _sentiment in filtered] == ["Second Apple headline", "Apple headline"]
+    assert all(sym == "AAPL" for _when, sym, _headline, _sentiment in filtered)
 
 
 def test_feed_symbol_filter_no_match_returns_empty():

@@ -1,6 +1,6 @@
 """
 Country reference: symbol -> issuer country, for a short letter-abbreviation
-hint in the Flags column (CN, TW, CA, ...). The motivating case is
+hint in its own Country column (CN, TW, CA, ...). The motivating case is
 foreign-domiciled small caps (Chinese ADRs especially) that momentum traders
 want a heads-up on at a glance.
 

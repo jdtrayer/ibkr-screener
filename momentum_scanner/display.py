@@ -1,17 +1,14 @@
 """
 Terminal UI rendering. RVOL is the primary sort key and color driver.
 
-The main table (sync_table) and scorer table (sync_scorer_table) are both
-textual.widgets.DataTable, synced in place rather than rebuilt -- see
-sync_table's docstring for why. The news-feed panel is still a plain
-rich.Table pushed into a Static widget (render_news_feed) -- out of scope
-for the DataTable move so far, see the datatable-rewrite branch.
+The main table (sync_table), scorer table (sync_scorer_table), and news
+panel (sync_news_table) are all textual.widgets.DataTable, synced in place
+rather than rebuilt -- see sync_table's docstring for why.
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from rich.table import Table
 from rich.text import Text
 from textual.widgets import DataTable
 
@@ -109,9 +106,19 @@ def _fmt_scalp_stop(sizing: tuple[int, float, float] | None) -> Text:
 
 NEWS_SENTIMENT_ICONS = {"positive": "📈", "negative": "📉", "neutral": "📰"}
 
+# A distinct hue from every other color in these tables (green=bullish/target,
+# red=stop/halted, yellow=warning, orange=spike) -- cyan reads as "heads-up
+# info", matching country.abbr_for's own docstring ("a heads-up, not ground
+# truth"), and stays legible against both zebra-striped rows and the cursor
+# row's blue highlight background (spot-checked via a screenshot harness --
+# candidates in the blue family, e.g. dodger_blue2/steel_blue1, washed out
+# against that same blue when a row is under the cursor).
+COUNTRY_STYLE = "cyan"
+
 
 MAIN_TABLE_COLUMNS = [
     ("Sym", "sym"),
+    ("Country", "country"),
     ("Flags", "flags"),
     ("Price", "price"),
     ("RVOL", "rvol"),
@@ -166,15 +173,16 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
         flags.append("[yellow]FLOAT[/]")
     if s.symbol in news_sentiment:
         flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[s.symbol]])
-    country_abbr = country.abbr_for(s.symbol)
-    if country_abbr:
-        flags.append(country_abbr)
     flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
+
+    country_abbr = country.abbr_for(s.symbol)
+    country_txt = Text(country_abbr, style=COUNTRY_STYLE) if country_abbr else Text("")
 
     sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
 
     return [
         Text(s.symbol, style=style),
+        country_txt,
         flags_txt,
         Text(price_txt, style=style),
         Text(rvol_txt, style=style),
@@ -240,10 +248,11 @@ def sync_table(
     news.NewsTracker.sentiment_map) drives the Flags column's news icon,
     same as sync_scorer_table's -- see NEWS_SENTIMENT_ICONS.
 
-    The Flags column also appends a letter country abbreviation (CN, TW, ...)
-    from country.abbr_for() when the symbol's issuer country is known and
-    non-US -- see country.py's module docstring for the data source and its
-    accuracy caveats (it's a heads-up, not ground truth).
+    The Country column shows a letter abbreviation (CN, TW, ...) from
+    country.abbr_for() when the symbol's issuer country is known and
+    non-US, blank otherwise -- see country.py's module docstring for the
+    data source and its accuracy caveats (it's a heads-up, not ground
+    truth).
 
     Short% is s.short_pct (see short_interest.py) -- % of float sold short
     as of the most recent FINRA settlement date, which only updates twice a
@@ -316,6 +325,7 @@ def _score_style(score: float) -> str:
 
 SCORER_TABLE_COLUMNS = [
     ("Sym", "sym"),
+    ("Country", "country"),
     ("Flags", "flags"),
     ("Score", "score"),
     ("Move/min", "move"),
@@ -336,13 +346,14 @@ def _scorer_row_cells(r, news_sentiment: dict[str, str]) -> list[Text]:
         flags.append("⚡")
     if r.symbol in news_sentiment:
         flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[r.symbol]])
-    country_abbr = country.abbr_for(r.symbol)
-    if country_abbr:
-        flags.append(country_abbr)
     flags_txt = Text(" ".join(flags))
+
+    country_abbr = country.abbr_for(r.symbol)
+    country_txt = Text(country_abbr, style=COUNTRY_STYLE) if country_abbr else Text("")
 
     return [
         Text(r.symbol, style=style),
+        country_txt,
         flags_txt,
         Text(f"{r.score:+.2f}", style=style),
         Text(f"{r.move_pct_per_min:+.2f}%"),
@@ -408,32 +419,80 @@ def sync_scorer_table(
     datatable.border_subtitle = "Waiting for two sweeps per symbol…" if not ranked else None
 
 
-def render_news_feed(feed: list[tuple[datetime, str, str]], symbol_filter: str | None = None) -> Table:
+NEWS_TABLE_COLUMNS = [
+    ("Time", "time"),
+    ("Sym", "sym"),
+    ("Sentiment", "sentiment"),
+    ("Headline", "headline"),
+]
+"""(label, key) pairs for the news panel's DataTable -- same role as
+MAIN_TABLE_COLUMNS."""
+
+
+def _news_row_key(when: datetime, symbol: str, headline: str) -> str:
+    # Headlines are immutable once recorded (see news.NewsTracker.record),
+    # so a row's key never needs to survive a text change -- it only needs
+    # to be stable for the same headline across calls (to detect "nothing
+    # new" in sync_news_table) and unique among rows shown at once (a
+    # symbol can have several headlines, so symbol alone won't do).
+    return f"{when.timestamp()}|{symbol}|{hash(headline)}"
+
+
+def _news_row_cells(when: datetime, symbol: str, headline: str, sentiment: str) -> list[Text]:
+    return [
+        Text(f"{when.astimezone(config.TZ):%H:%M}", style="dim"),
+        Text(symbol, style="bold"),
+        Text(NEWS_SENTIMENT_ICONS[sentiment]),
+        Text(headline),
+    ]
+
+
+def sync_news_table(
+    datatable: DataTable,
+    feed: list[tuple[datetime, str, str, str]],
+    symbol_filter: str | None = None,
+) -> None:
     """
-    Every recorded headline today (see news.NewsTracker.feed), newest first
-    -- one row per headline, not one per symbol, so a symbol with several
-    stories shows all of them. Rendered in its own scrollable panel at the
-    bottom of the main column, independent of the scanner/scorer tables
-    above it. No sentiment icon here: sentiment is tracked per-symbol from
-    only its most recent headline (see NEWS_SENTIMENT_ICONS), so attaching
-    it to every row of that symbol's history would misattribute it to
-    older headlines.
+    Syncs `datatable` (columns already added via NEWS_TABLE_COLUMNS -- see
+    app.py's on_mount) to `feed` -- news.NewsTracker.feed(...), newest first,
+    already capped and optionally pre-filtered to one symbol by the caller.
+
+    Unlike sync_table/sync_scorer_table, there's no per-row *cell* update
+    here: a recorded headline's text and sentiment never change (see
+    news.NewsTracker.record), so the only thing that ever changes between
+    calls is which rows are visible at all (a new headline prepended, or an
+    old one aging out past the display cap). This is detected by comparing
+    `feed`'s row keys against the table's current rows -- when they match,
+    this is a deliberate no-op rather than a clear+rebuild, since this
+    renders on every tick regardless of whether news actually changed and
+    clearing a DataTable resets its scroll position same as sync_table's
+    reorder does; skipping the rebuild is what lets a mid-scroll read
+    survive ticks with nothing new.
 
     `symbol_filter`, if given, is purely a label -- the caller (app.py) is
     expected to have already passed a pre-filtered `feed` (via
     NewsTracker.feed(symbol=...)); this only changes the title/empty-state
     text so it's clear a filter is active, and how it got cleared (select
-    the same row again -- see app.py's on_data_table_row_selected).
-    """
-    title = f"News Feed — {symbol_filter} (select row again to clear)" if symbol_filter else "News Feed"
-    table = Table(title=title, expand=True, show_header=True, show_lines=False)
-    table.add_column("Time", style="dim", width=5, no_wrap=True)
-    table.add_column("Sym", style="bold", width=6, no_wrap=True)
-    table.add_column("Headline", ratio=1)
+    the same row again in the main/scorer table -- see app.py's
+    on_data_table_row_selected).
 
-    for when, symbol, headline in feed:
-        table.add_row(Text(f"{when.astimezone(config.TZ):%H:%M}"), Text(symbol), Text(headline))
+    The Sentiment column shows NEWS_SENTIMENT_ICONS for that specific
+    headline's own classification (feed()'s 4th tuple element) -- not
+    necessarily the symbol's current sentiment_map() value, since an older
+    headline for the same symbol can have been classified differently.
+    """
+    wanted_keys = [_news_row_key(when, symbol, headline) for when, symbol, headline, _sentiment in feed]
+    existing_keys = [row_key.value for row_key in datatable.rows]
+    if wanted_keys != existing_keys:
+        datatable.clear()
+        for (when, symbol, headline, sentiment), key in zip(feed, wanted_keys):
+            datatable.add_row(*_news_row_cells(when, symbol, headline, sentiment), key=key)
+
+    title = f"News Feed — {symbol_filter} (select row again to clear)" if symbol_filter else "News Feed"
+    datatable.border_title = title
     if not feed:
-        table.caption = f"No headlines yet today for {symbol_filter}" if symbol_filter else "No headlines yet today"
-        table.caption_justify = "right"
-    return table
+        datatable.border_subtitle = (
+            f"No headlines yet today for {symbol_filter}" if symbol_filter else "No headlines yet today"
+        )
+    else:
+        datatable.border_subtitle = None
