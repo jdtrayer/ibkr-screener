@@ -32,22 +32,36 @@ startDateTime parameter -- confirmed live that IB does not reliably honor
 that bound server-side (a start bound of today's midnight still returned
 headlines from two days prior).
 
-Each newly-recorded headline is optionally classified (see sentiment.py's
-SentimentClassifier, injected rather than imported here so this module
-stays free of the heavy torch/transformers import) -- positive/negative/
-neutral, stored per symbol from the FIRST successfully-recorded headline in
-a given pull (IB returns headlines newest-first, confirmed live, so this is
-the most recent one), not overwritten by older headlines recorded in the
-same batch.
+Recorded headlines/sentiment/feed survive restarts within the same trading
+day (config.NEWS_STATE_FILE, date-stamped and discarded on a new day, same
+pattern as scorer.py's SCORER_STATE_FILE) -- this is about the news feed
+panel and sentiment badges not going blank on restart, not pull efficiency;
+a pull is already cheap and self-limiting on its own, and there's no
+cheaper "resume" query to make since startDateTime isn't honored
+server-side regardless.
+
+Each newly-recorded headline is optionally classified individually (see
+sentiment.py's SentimentClassifier, injected rather than imported here so
+this module stays free of the heavy torch/transformers import) --
+positive/negative/neutral, stored alongside that headline in feed() so the
+news panel's Sentiment column reflects each headline's own classification
+rather than the symbol's latest. The per-symbol sentiment_map() (used by the
+main/scorer tables' Flags column) is still taken from the FIRST
+successfully-recorded headline in a given pull (IB returns headlines
+newest-first, confirmed live, so this is the most recent one), not
+overwritten by older headlines recorded in the same batch. Classification
+is ~50-70ms/headline (see sentiment.py) -- trivial even classifying every
+headline rather than just the newest per symbol per pull.
 
 feed() additionally exposes every recorded headline (not just each symbol's
-latest) as a flat, newest-first (when, symbol, headline) list -- backs the
-scrollable news panel at the bottom of the UI's main column (display.py's
-render_news_feed).
+latest) as a flat, newest-first (when, symbol, headline, sentiment) list --
+backs the scrollable news panel at the bottom of the UI's main column
+(display.py's sync_news_table).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import date, datetime, timezone
 
@@ -66,12 +80,13 @@ class NewsTracker:
         self._headlines: dict[str, list[str]] = {}   # symbol -> deduped headline texts, today only
         self._seen: dict[str, set[str]] = {}          # symbol -> normalized headline texts, for O(1) dedup
         self._sentiment: dict[str, str] = {}           # symbol -> "positive"/"negative"/"neutral", from its most recent headline
-        self._feed: list[tuple[datetime, str, str]] = []  # (when, symbol, headline), unsorted -- see feed()
+        self._feed: list[tuple[datetime, str, str, str]] = []  # (when, symbol, headline, sentiment), unsorted -- see feed()
         self._date: date = datetime.now(config.TZ).date()
         self._pulling = False
         self._fetch_semaphore = asyncio.Semaphore(config.NEWS_FETCH_CONCURRENCY)
         self._fetch_lock = asyncio.Lock()
         self._last_fetch_at = 0.0
+        self._load_state()
 
     # -- setup -----------------------------------------------------------------
 
@@ -94,18 +109,24 @@ class NewsTracker:
 
     def sentiment_map(self) -> dict[str, str]:
         """symbol -> 'positive'/'negative'/'neutral' for every symbol with
-        news today -- what display.render_scorer's Flags column reads."""
+        news today -- what display.sync_scorer_table's Flags column reads."""
         return {sym: self.sentiment(sym) for sym in self._headlines}
 
     def headlines(self, symbol: str) -> list[str]:
         return list(self._headlines.get(symbol, ()))
 
-    def feed(self, limit: int | None = None) -> list[tuple[datetime, str, str]]:
-        """(when, symbol, headline) across every symbol with news today,
-        newest first -- what the UI's scrollable headline panel reads.
+    def feed(self, limit: int | None = None, symbol: str | None = None) -> list[tuple[datetime, str, str, str]]:
+        """(when, symbol, headline, sentiment) across every symbol with news
+        today, newest first -- what the UI's scrollable headline panel reads.
+        `sentiment` is that specific headline's own classification (see
+        record()), not necessarily the symbol's current sentiment() value.
         Sorted here rather than kept sorted on insert, since headlines
-        arrive symbol-by-symbol during a sweep (not in global time order)."""
-        rows = sorted(self._feed, key=lambda row: row[0], reverse=True)
+        arrive symbol-by-symbol during a sweep (not in global time order).
+        `symbol` restricts to just that symbol's headlines -- selecting a
+        row in the main/scorer table filters the panel this way, see
+        app.py's on_data_table_row_selected."""
+        rows = self._feed if symbol is None else [row for row in self._feed if row[1] == symbol]
+        rows = sorted(rows, key=lambda row: row[0], reverse=True)
         return rows[:limit] if limit is not None else rows
 
     def sentiment(self, symbol: str) -> str:
@@ -116,13 +137,17 @@ class NewsTracker:
 
     # -- record (shared by pull results) ------------------------------------
 
-    def record(self, symbol: str, headline: str, when: datetime | None = None) -> bool:
+    def record(self, symbol: str, headline: str, when: datetime | None = None, sentiment: str = "neutral") -> bool:
         """Store a headline for symbol if not already seen today. Returns True
         if it was newly recorded (False if it was a dedup no-op). `when`
         defaults to now for callers (tests, mainly) that don't have an actual
         publish time -- real pulls pass the headline's own timestamp so the
-        feed panel can show/sort by it."""
-        norm = " ".join(headline.split()).casefold()
+        feed panel can show/sort by it. `sentiment` is that headline's own
+        classification (default "neutral" for callers, mainly tests, that
+        don't classify) -- stored alongside it in feed(), separate from this
+        symbol's sentiment_map()/sentiment() value which pull_sweep sets from
+        the newest headline only."""
+        norm = self._normalize(headline)
         if not norm:
             return False
         seen = self._seen.setdefault(symbol, set())
@@ -130,9 +155,13 @@ class NewsTracker:
             return False
         seen.add(norm)
         self._headlines.setdefault(symbol, []).append(headline)
-        self._feed.append((when or datetime.now(config.TZ), symbol, headline))
+        self._feed.append((when or datetime.now(config.TZ), symbol, headline, sentiment))
         log.info("%s news: %s", symbol, headline)
         return True
+
+    @staticmethod
+    def _normalize(headline: str) -> str:
+        return " ".join(headline.split()).casefold()
 
     # -- day scope -------------------------------------------------------------
 
@@ -195,17 +224,73 @@ class NewsTracker:
             for item in items or ():
                 if item.time < start_utc_naive:
                     continue
-                if self.record(symbol, item.headline, item.time.replace(tzinfo=timezone.utc)):
+                # Classified before record() (rather than after, then stored) so a
+                # duplicate headline -- already in self._seen from an earlier item
+                # in this same batch -- never pays for a classify call it'll just
+                # discard; record() would reject it anyway, this just skips ahead.
+                norm = self._normalize(item.headline)
+                if not norm or norm in self._seen.get(symbol, set()):
+                    continue
+                sentiment = "neutral"
+                if self._sentiment_clf is not None:
+                    sentiment = await self._sentiment_clf.classify(item.headline)
+                if self.record(symbol, item.headline, item.time.replace(tzinfo=timezone.utc), sentiment):
                     found += 1
-                    if self._sentiment_clf is not None and not symbol_classified:
+                    if not symbol_classified:
                         # Headlines come back newest-first (confirmed live), so the
                         # first one recorded here is the most recent -- that's the
-                        # sentiment shown, not overwritten by older headlines in
-                        # this same batch.
-                        self._sentiment[symbol] = await self._sentiment_clf.classify(item.headline)
+                        # per-symbol sentiment shown in the main/scorer tables'
+                        # Flags column, not overwritten by older headlines in this
+                        # same batch. The news panel's own Sentiment column instead
+                        # shows each headline's own classification -- see feed().
+                        self._sentiment[symbol] = sentiment
                         symbol_classified = True
         if found:
             log.info("News pull sweep: %d new headline(s) across %d pending symbol(s)", found, len(pending))
+        self._save_state()
+
+    # -- state persistence (restart resilience, same trading day only) --------
+
+    def _save_state(self) -> None:
+        try:
+            state = {
+                "date": self._date.isoformat(),
+                "headlines": self._headlines,
+                "sentiment": self._sentiment,
+                "feed": [
+                    [when.isoformat(), sym, headline, sentiment]
+                    for when, sym, headline, sentiment in self._feed
+                ],
+            }
+            with open(config.NEWS_STATE_FILE, "w") as fh:
+                json.dump(state, fh)
+        except Exception:
+            log.exception("News state save failed (non-fatal)")
+
+    def _load_state(self) -> None:
+        try:
+            with open(config.NEWS_STATE_FILE) as fh:
+                state = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception:
+            log.exception("News state load failed (non-fatal); starting cold")
+            return
+        if state.get("date") != self._date.isoformat():
+            return  # yesterday's headlines -- reset_if_new_day would clear these anyway
+        self._headlines = {sym: list(hs) for sym, hs in state.get("headlines", {}).items()}
+        self._seen = {
+            sym: {" ".join(h.split()).casefold() for h in hs} for sym, hs in self._headlines.items()
+        }
+        self._sentiment = dict(state.get("sentiment", {}))
+        # Old state files (pre per-headline sentiment) stored 3-element rows --
+        # default those to "neutral" rather than crashing on restart mid-day.
+        self._feed = [
+            (datetime.fromisoformat(row[0]), row[1], row[2], row[3] if len(row) > 3 else "neutral")
+            for row in state.get("feed", [])
+        ]
+        if self._headlines:
+            log.info("News resumed same-day headlines for %d symbol(s)", len(self._headlines))
 
     async def _throttled_fetch(self, con_id: int, start: datetime, end: datetime):
         async with self._fetch_semaphore:

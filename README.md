@@ -6,22 +6,26 @@ the runtime-adjustable tunables in the sidebar panel.
 
 ## Table columns
 
-Columns appear in this order on screen: Sym, Flags, Price, RVOL, $Vol, Spread%, Float, Shares, Target, Stop.
+Columns appear in this order on screen: Sym, Country, Price, Trend, Spike, RVOL, $Vol, Spread%, Float, Short%, Shares, Target, Stop, Flags.
 Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows easier to track.
 
 | Column | Meaning | Calculation |
 |---|---|---|
 | **Sym** | Ticker symbol | Colored by RVOL tier (see below) |
-| **Flags** | See [Flags](#flags) below | |
+| **Country** | Issuer country hint | See [Country](#country) below |
 | **Price** | Last trade price | Live `last` tick |
+| **Trend** | Zoomed-out price direction — see [Trend](#trend) below | ↑ up / → sideways / ↓ down / `-` not enough data yet |
+| **Spike** | Fast intraday price move — see [Spike detection](#spike-detection-algorithm-spikespy) below | `SPIKE×N` (N = events in the trailing lookback) or `-` |
 | **RVOL** | Relative volume vs. this time-of-day's historical norm | `session volume so far / expected cumulative volume at this many minutes into the session`, where "expected" is interpolated from an empirical 20-trading-day curve of average cumulative volume by 5-minute bucket, built per symbol per session type (`rvol.py`). A bucket is only trusted if ≥5 of the 20 days had data for it (`RVOL_MIN_SAMPLE_DAYS`); untrusted buckets contribute 0, which can make RVOL `None` early in a session for thinly-traded names. This is *not* a naive "volume ÷ elapsed time" ratio — it accounts for volume being front-loaded near the open. |
 | **$Vol** | Dollar volume traded this session | `Price × session volume` |
 | | | `session volume` here is `SymbolState.session_volume` (`models.py`): IBKR's raw volume tick never resets at session boundaries (it's one running total from premarket through the close through afterhours), so this is deliberately volume *since we started watching this symbol this session* (a snapshot is taken on its first live tick and subtracted from every reading after). Without this, a stock that did big volume hours ago in an earlier session leg reads as still-hot RVOL/$Vol long after it's gone quiet — e.g. a stock that spikes premarket and then trades nothing would otherwise still show a huge $Vol and RVOL well into the regular session, purely off the stale premarket total. One consequence: a symbol admitted a few minutes into a session (not exactly at its start) will slightly *undercount* for those first few minutes, since volume traded before we were watching it is invisible to us — the opposite direction of error, and much smaller. |
 | **Spread%** | Bid-ask spread as a % of the midpoint | `(ask − bid) / mid × 100` |
 | **Float** | Shares outstanding available to trade | Looked up from `float_reference.csv`, a file you maintain yourself — an entry there always wins. For anything not in it, `floatref.get_float()` fetches from Yahoo Finance directly (IBKR has no float data on a standard account -- confirmed via `Error 10358` against both `reqFundamentalData` and generic tick 258, which need a Reuters Fundamentals subscription this account doesn't have) and caches the result to `cache/float_cache.json` for `FLOAT_CACHE_MAX_AGE_DAYS` (7 days). `?` means neither source has a value yet (a fresh symbol's first Yahoo lookup takes a moment) or Yahoo genuinely has no float data for it. |
+| **Short%** | % of float sold short | `short_interest.py` (Equibles/FINRA, biweekly settlement data). `?` means no API key configured, no coverage for the symbol, or not fetched yet |
 | **Shares** | Rough "does this deserve a closer look" sizing — see [Scalp sizing](#scalp-sizing) below | `scalp_position_usd / price` |
 | **Target** | Scalp target price | See [Scalp sizing](#scalp-sizing) below |
 | **Stop** | Scalp stop price | See [Scalp sizing](#scalp-sizing) below |
+| **Flags** | See [Flags](#flags) below | |
 
 ### RVOL color tiers (`config.RVOL_TIERS`)
 
@@ -34,6 +38,37 @@ Each row is separated by a horizontal rule (`show_lines=True`) to make wide rows
 | ≥ 0.0x | white |
 | unknown | dim white |
 
+### Trend
+
+A slower, zoomed-out companion to `SPIKE×N`'s fast 20s detector (`trend.py`):
+compares the oldest vs newest price over a rolling `trend_window_sec` (default
+3 minutes) and shows ↑ if it's up more than `trend_flat_pct`, ↓ if down more
+than that, → if within the band either way ("sideways"), or `-` until there's
+at least half a window of history to speak to. Purely descriptive — it does
+**not** gate or suppress `SPIKE×N`: a fast pop and a falling multi-minute
+trend aren't mutually exclusive (a brief bounce inside a selloff still spikes
+off its own local low), and a genuine reversal looks identical to that bounce
+at the moment it starts, so a gate strict enough to hide the noise case would
+also hide real reversals. It does feed row *order* — see [What has to be true
+for a row to show](#what-has-to-be-true-for-a-row-to-show-at-all).
+
+### Country
+
+A letter abbreviation (`CN`, `TW`, `CA`, ...) hinting at the symbol's issuer
+country (`country.py`), sourced from Nasdaq's public screener endpoint since
+IBKR's own contract data has no country field on this account. Three
+distinct states, not two:
+
+| Shown | Meaning |
+|---|---|
+| *(blank)* | Country is confirmed "United States" |
+| `CN`, `TW`, ... | Known non-US country with a mapped abbreviation |
+| `??` | Not confirmed US — country data isn't loaded yet, the symbol isn't in the ~7000-symbol Nasdaq universe this is sourced from, or it's a country not yet mapped to an abbreviation |
+
+Not authoritative — spot-checked live, NIO and SE (both foreign ADRs) come
+back "United States" from this source, so a blank cell is a heads-up to go
+check, not proof of US domicile.
+
 ### What has to be true for a row to show at all
 
 Two gates apply, in order:
@@ -45,18 +80,21 @@ Two gates apply, in order:
    - Spread% ≤ `MAX_SPREAD_PCT` (1.5%) **or** `SPREAD_HARD_REJECT` is off (it's on by default — over-threshold spread is hidden entirely, not just flagged; wide spread is a direct cost against a scalp's target and stop, so it's treated the same as failing the $Vol floor)
    - Float ≤ `FLOAT_CEILING_SHARES` (20,000,000) **or unknown** **or** `FLOAT_HARD_REJECT` is off (it is, by default — oversized float just gets the `FLOAT` flag instead of being hidden)
 
-Rows that pass are capped to the top `TOP_DISPLAY_ROWS` (20). Row *order* is by RVOL
-descending, but it's only recomputed every `SORT_REFRESH_SEC` (8s, `config.py`) instead
-of on every redraw — cell values (price, RVOL, flags, scalp numbers) still update live
-every 2s, but rows hold their position between resorts instead of jumping around on
-minor RVOL noise. A symbol that newly qualifies between resorts still appears
-immediately, just not necessarily in its final sorted position until the next resort.
+Rows that pass are capped to the top `TOP_DISPLAY_ROWS` (20). Row *order* is
+`display.priority_key`: Trend direction first (up > sideways/unknown > down —
+see [Trend](#trend)), then active `SPIKE×N` count, then RVOL as the final
+tiebreaker (RVOL is already a floor to hold a slot at all, so it differentiates
+least once a symbol is admitted). It's only recomputed every `SORT_REFRESH_SEC`
+(8s, `config.py`) instead of on every redraw — cell values (price, RVOL,
+flags, scalp numbers) still update live every 2s, but rows hold their position
+between resorts instead of jumping around on minor noise. A symbol that newly
+qualifies between resorts still appears immediately, just not necessarily in
+its final sorted position until the next resort.
 
 ### Flags
 
 | Flag | Meaning |
 |---|---|
-| `SPIKE×N` | N spike events in the trailing lookback window — see [Spike detection](#spike-detection) |
 | `HALTED` | Symbol is currently halted (IBKR tick 49 = 1 general halt or 2 volatility halt). Volatility (LULD) halts show elapsed plus an estimated time remaining against the standard 5-minute clock, then the ~10-minute extension (`HALTED 3:12 ~1:48 left`, tiers in `HALT_EXPECTED_DURATIONS_MIN`); general halts and halts that outlive both tiers show elapsed only, since there's no standard clock to count against. Estimates are `~` because reopen times vary, and a symbol subscribed mid-halt starts its clock at first observation |
 | `RESUMED` | Halt resumed within the last `HALT_RESUME_RECENT_MIN` (15) minutes — flags the post-halt catalyst window |
 | `WIDE` | Spread% is over `MAX_SPREAD_PCT` (1.5%) — with `SPREAD_HARD_REJECT` on by default, a row showing this flag is about to drop off the table (and becomes bump-eligible for a live slot — see [Live-slot occupancy](#live-slot-occupancy)) |
@@ -97,8 +135,8 @@ low-priced stock with an aggressive R:R/target combination).
 ## Tunables
 
 Adjustable live from the sidebar's `+`/`-` buttons (`tunables.py`, `controls.py`) —
-no restart needed. Three groups, each backed by one shared `Tunables` instance
-that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
+no restart needed. Each group is backed by one shared `Tunables` instance
+that `PersistenceTracker`, the spike/trend logic, and scalp sizing read directly.
 
 ### Persistence
 
@@ -114,7 +152,7 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 |---|---|---|---|---|---|
 | Spike thresh | `spike_threshold_pct` | 3.0% | 0.5–20% | 0.5% | Minimum price move within the detection window to count as a spike |
 | Spike window | `spike_window_sec` | 20s | 5–120s | 5s | The detection window itself, *and* the cooldown before the same symbol can trigger another spike |
-| Spike lookback | `spike_lookback_sec` | 10m | 1–60m | 1m | Trailing window over which spike events are counted for the `SPIKE×N` flag |
+| Spike lookback | `spike_lookback_sec` | 10m | 1–60m | 1m | Trailing window over which spike events are counted for the `SPIKE×N` column |
 | Spike quiet | `spike_quiet_sec` | 5m | 1–30m | 1m | How long with no new spike **and** no new session high before a symbol that has spiked is evicted from live tracking |
 
 #### Spike detection algorithm (`spikes.py`)
@@ -123,6 +161,15 @@ that `PersistenceTracker`, the spike logic, and scalp sizing read directly.
 - `move_pct = (price − min(price in window)) / min(price in window) × 100`. If `move_pct ≥ spike_threshold_pct` **and** at least `spike_window_sec` has passed since the last recorded spike (cooldown), a new spike event is recorded.
 - `SPIKE×N` counts events still within the trailing `spike_lookback_sec`.
 - A symbol becomes eligible for eviction once it has spiked at least once **and** both of the following hold for `spike_quiet_sec`: no new spike, and no new session high. This is independent of the persistence streak — a symbol can be evicted purely for going quiet after spiking.
+
+### Trend
+
+| Label | Field | Default | Range | Step | Meaning |
+|---|---|---|---|---|---|
+| Trend window | `trend_window_sec` | 3.0m | 30s–15m | 30s | Lookback window for the ↑/→/↓ arrow |
+| Trend flat | `trend_flat_pct` | 1.00% | 0.25–10% | 0.25% | Move within ±this % over the window counts as sideways (→) rather than up/down |
+
+See [Trend](#trend) above for the algorithm.
 
 ### Live-slot occupancy
 
@@ -205,6 +252,50 @@ This table is **observation only** — it does not affect admission, eviction,
 or the main table. Weights and cadences live in `config.py` (restart to
 change). Sweep history is cached to `cache/scorer_history.json` and survives
 same-day restarts; it's discarded on the first sweep of a new trading day.
+
+## News Feed
+
+A scrollable panel below the scorer table (`news.py`'s `NewsTracker`,
+rendered by `display.sync_news_table`), showing every headline recorded
+today across both tables' symbols — newest first, one row per headline
+(not per symbol, so a symbol with several stories shows all of them).
+
+| Column | Meaning |
+|---|---|
+| **Time** | Headline publish time (local) |
+| **Sym** | Symbol the headline is about |
+| **Sentiment** | 📈 positive / 📉 negative / 📰 neutral — see below |
+| **Headline** | The headline text itself |
+
+Headlines come from `reqHistoricalNewsAsync`, pulled periodically for pool
+symbols that don't have news yet today (`NEWS_PULL_INTERVAL_SEC`). Each
+headline is classified independently by a local FinBERT model
+(`sentiment.py`) — positive/negative/neutral, with a confidence floor
+below which it falls back to neutral rather than trust a low-confidence
+call. This is a per-*headline* classification, not per-symbol: an older
+story for the same symbol can show a different sentiment than its latest
+one. The same classification also drives the news icon in the main/scorer
+tables' Flags column, but that one *is* per-symbol (taken from each
+symbol's most recent headline only).
+
+Selecting a row in the main or scorer table filters this panel to just
+that symbol (selecting the same symbol again clears the filter).
+
+## Non-tradable list
+
+A sidebar widget (`SymbolActionsPanel`, bottom-right) for manually marking
+a symbol non-tradable for the rest of the trading day — for a broker-side
+restriction IBKR has no queryable signal for. Type a symbol and hit Add
+(or Enter); Clear removes everything in the list. Held symbols count
+toward the main table's `N held (dead/non-tradable/excluded)` status, not
+`N waiting for a slot` — this isn't a capacity problem, so raising
+`max_live_symbols` won't un-hold them.
+
+The list itself is a small DataTable (Sym / Time left), scrolling
+internally with its own scrollbar once it has more entries than fit
+rather than growing the panel. Holds expire at the next trading day
+(`config.NON_TRADABLE_STATE_FILE` persists them across a restart within
+the same day).
 
 ## Related fixed thresholds (`config.py`, restart required)
 

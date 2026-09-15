@@ -7,7 +7,28 @@ scanner.py / rvol.py / filters.py, it probably belongs here instead.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# --------------------------------------------------------------------------
+# Secrets -- API keys live in ./secrets.json (gitignored), never hardcoded
+# here or read from the shell environment. Missing file/key both resolve to
+# None (fail open, same as every other optional data source in this app) so
+# a fresh checkout without secrets.json still runs -- just without whatever
+# feature needs that key.
+# --------------------------------------------------------------------------
+def _load_secret(key: str) -> str | None:
+    try:
+        secrets = json.loads(Path("./secrets.json").read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return secrets.get(key) or None
+
+
+EQUIBLES_API_KEY = _load_secret("equibles_api_key")
 
 # --------------------------------------------------------------------------
 # IB connection
@@ -58,6 +79,19 @@ MIN_DOLLAR_VOLUME = 5_000_000
 # "regular-session liquid." Starting point -- validate against a real
 # premarket/afterhours session and adjust.
 MIN_DOLLAR_VOLUME_EXTENDED_HOURS = 500_000
+
+# Trailing-window $ volume floor -- MIN_DOLLAR_VOLUME above is session-
+# CUMULATIVE, so a symbol that had a real burst earlier in the session keeps
+# clearing it (and the RVOL floor) forever after, even once it's gone
+# completely quiet -- "a move without volume isn't a move" only holds if you
+# keep checking. This looks only at volume traded in the trailing
+# RECENT_VOLUME_WINDOW_SEC. Starting point (user's own number for the
+# regular-session floor, motivated by SHOE showing ~zero volume for the
+# prior ~15min on 2026-09-10 despite still clearing both cumulative floors)
+# -- validate live and adjust, same as MIN_DOLLAR_VOLUME_EXTENDED_HOURS.
+RECENT_VOLUME_WINDOW_SEC = 900.0  # 15 minutes
+MIN_RECENT_DOLLAR_VOLUME = 100_000.0
+MIN_RECENT_DOLLAR_VOLUME_EXTENDED_HOURS = 25_000.0
 
 # Coarse scanner-SIDE pre-filter (shares, not dollars) to cut noise before
 # we ever pull live data. Keep this well below what you'd expect a real
@@ -139,6 +173,17 @@ SPIKE_THRESHOLD_PCT = 3.0     # price move within the detection window that coun
 SPIKE_WINDOW_SEC = 20.0       # detection window; also used as the spike-refire cooldown
 SPIKE_LOOKBACK_SEC = 600.0    # trailing window for the SPIKE×N event count
 SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long -> clear + evict
+
+# --------------------------------------------------------------------------
+# Trend direction -- seed values for the runtime-mutable Tunables object.
+# A slower, zoomed-out companion to spike detection above: compares oldest
+# vs newest price over a multi-minute window to show up/down/sideways
+# context next to SPIKE×N, without gating or suppressing that flag (a fast
+# spike and a longer-term downtrend aren't mutually exclusive -- see
+# trend.py).
+# --------------------------------------------------------------------------
+TREND_WINDOW_SEC = 180.0      # lookback window for the up/down/sideways arrow
+TREND_FLAT_PCT = 1.0          # move within +-this % over the window counts as sideways
 
 # --------------------------------------------------------------------------
 # Scalp sizing -- seed values for the runtime-mutable Tunables object. A
@@ -278,6 +323,32 @@ FLOAT_CACHE_FILE = "./cache/float_cache.json"
 FLOAT_CACHE_MAX_AGE_DAYS = 7.0
 
 # --------------------------------------------------------------------------
+# Short interest (short_interest.py) -- % of float sold short, via Equibles'
+# REST API (api.equibles.com, requires EQUIBLES_API_KEY in secrets.json),
+# a reseller of FINRA's own semi-monthly short interest reports. Chosen
+# over Nasdaq's free per-symbol endpoint, which is Nasdaq-listed only
+# (confirmed live: blank for NYSE names) -- Equibles covers both exchanges.
+# The underlying number only updates twice a month regardless of source
+# (FINRA settlement dates), so this cache TTL is set to roughly that
+# cadence rather than implying it can be fresher than the data actually is.
+# --------------------------------------------------------------------------
+SHORT_INTEREST_CACHE_FILE = "./cache/short_interest_cache.json"
+SHORT_INTEREST_CACHE_MAX_AGE_DAYS = 7.0
+
+# --------------------------------------------------------------------------
+# Country reference (country.py) -- issuer country -> flag emoji hint in the
+# Flags column, prototype/experimental. Same underlying gap as float above:
+# IBKR's ContractDetails has no country field on this account (Reuters
+# Fundamentals-gated). Source is Nasdaq's public screener download endpoint,
+# which is NOT authoritative (spot-checked wrong for at least one symbol --
+# see country.py's module docstring) so this is a heads-up, not ground truth.
+# One bulk fetch covers the whole listed universe, cached whole and refreshed
+# on this TTL rather than incrementally per symbol.
+# --------------------------------------------------------------------------
+COUNTRY_CACHE_FILE = "./cache/country_cache.json"
+COUNTRY_CACHE_MAX_AGE_DAYS = 1.0
+
+# --------------------------------------------------------------------------
 # Halt detection
 # --------------------------------------------------------------------------
 # Tick type 49 = "Halted": 0 not halted, 1 general halt, 2 volatility halt.
@@ -351,6 +422,17 @@ NEWS_FETCH_MIN_INTERVAL_SEC = 1.5 # mirrors HISTORICAL_FETCH_MIN_INTERVAL_SEC
 # validate this live, which each had ~10 headlines in a single afternoon.
 NEWS_HEADLINES_PER_PULL = 20
 NEWS_FEED_DISPLAY_ROWS = 100  # cap on the scrollable news feed panel's row count
+
+# Sweep state (recorded headlines/sentiment/feed) survives restarts within
+# the same trading day, same pattern/motivation as SCORER_STATE_FILE (the
+# user restarts often mid-session). This is about UX continuity, not pull
+# efficiency -- a pull is already cheap and self-limiting (once a symbol has
+# a headline it's never re-pulled today, and startDateTime isn't honored
+# server-side anyway, so there's no cheaper "resume" query to make) -- what
+# it actually avoids is the news feed panel and sentiment badges going blank
+# on restart until the next sweep cycle re-discovers everything. Date-stamped
+# and discarded on a new trading day, same as scorer_history.json.
+NEWS_STATE_FILE = "./cache/news_history.json"
 
 # --------------------------------------------------------------------------
 # Headline sentiment classification (backlog #12 fast-follow) -- local via

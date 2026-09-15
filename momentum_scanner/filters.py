@@ -123,6 +123,26 @@ def check_dollar_volume(state: SymbolState, session: Session) -> bool:
     return dv is not None and dv >= min_dollar_volume_for(session)
 
 
+def min_recent_dollar_volume_for(session: Session) -> float:
+    """The trailing-window $ floor a symbol must clear -- see config.py's
+    RECENT_VOLUME_WINDOW_SEC/MIN_RECENT_DOLLAR_VOLUME."""
+    return (
+        config.MIN_RECENT_DOLLAR_VOLUME
+        if session == Session.REGULAR
+        else config.MIN_RECENT_DOLLAR_VOLUME_EXTENDED_HOURS
+    )
+
+
+def check_recent_volume(state: SymbolState, session: Session) -> bool:
+    """True if `state` clears the trailing-window $ volume floor, or hasn't
+    accumulated a full window of history yet to judge (see
+    SymbolState.recent_dollar_volume)."""
+    rdv = state.recent_dollar_volume
+    if rdv is None:
+        return True
+    return rdv >= min_recent_dollar_volume_for(session)
+
+
 def check_spread(state: SymbolState) -> tuple[bool, float | None]:
     """Returns (passes, spread_pct). `passes` is False only if SPREAD_HARD_REJECT and over threshold."""
     spread_pct = state.tick.spread_pct
@@ -179,16 +199,41 @@ def _spread_weakness(state: SymbolState) -> float:
     return spread_pct / config.MAX_SPREAD_PCT
 
 
+def _recent_volume_weakness(state: SymbolState, session: Session) -> float:
+    """0 if clearing the trailing-window $ floor or history is still
+    building; otherwise how many floor-multiples below it. Mirrors
+    _dv_weakness but against the trailing window instead of the session
+    cumulative, so a symbol that popped early and has since gone quiet can
+    still be bumped even while its cumulative $ volume/RVOL still look
+    fine."""
+    rdv = state.recent_dollar_volume
+    if rdv is None:
+        return 0.0
+    floor = min_recent_dollar_volume_for(session)
+    if rdv >= floor:
+        return 0.0
+    return floor / max(rdv, 1.0)
+
+
 def is_dead_on_bump(state: SymbolState, session: Session, fraction: float) -> bool:
-    """True if `state` is being bumped primarily for dollar-volume weakness
-    (not spread) AND its dollar volume is negligible -- at or below
-    `fraction` of the session's floor -- rather than merely a dip below it.
-    Distinguishes a symbol that's genuinely never traded while it held the
-    slot (see config.py's DEAD_DV_FRACTION/DEAD_HOLD_SEC -- confirmed live
-    2026-09-02 with TYA cycling admit/bump/re-admit 10+ times, always at
-    ~$0 dollar volume) from one that just cooled off from real activity."""
-    if _dv_weakness(state, session) < _spread_weakness(state):
+    """True if `state` is being bumped primarily for volume weakness --
+    either the session-cumulative $ floor or the trailing-window $ floor,
+    not spread -- AND that volume is negligible -- at or below `fraction` of
+    the relevant floor -- rather than merely a dip below it. Distinguishes a
+    symbol that's genuinely never traded (or has gone fully quiet) while it
+    held the slot (see config.py's DEAD_DV_FRACTION/DEAD_HOLD_SEC --
+    confirmed live 2026-09-02 with TYA cycling admit/bump/re-admit 10+
+    times, always at ~$0 dollar volume) from one that just cooled off from
+    real activity."""
+    dv_w = _dv_weakness(state, session)
+    recent_w = _recent_volume_weakness(state, session)
+    if max(dv_w, recent_w) < _spread_weakness(state):
         return False  # bumped mainly for spread, not dead volume
+    if recent_w >= dv_w:
+        rdv = state.recent_dollar_volume
+        if rdv is None:
+            return False  # not enough history yet to call it dead on this axis
+        return rdv <= min_recent_dollar_volume_for(session) * fraction
     dv = state.dollar_volume
     if dv is None:
         return True
@@ -198,8 +243,19 @@ def is_dead_on_bump(state: SymbolState, session: Session, fraction: float) -> bo
 
 def bump_reason(state: SymbolState, session: Session) -> str:
     """Human-readable reason `state` was chosen as the bump candidate --
-    whichever of the two weakness signals is larger for it."""
-    if _dv_weakness(state, session) >= _spread_weakness(state):
+    whichever of the three weakness signals is largest for it."""
+    dv_w = _dv_weakness(state, session)
+    recent_w = _recent_volume_weakness(state, session)
+    spread_w = _spread_weakness(state)
+    if recent_w > 0 and recent_w >= dv_w and recent_w >= spread_w:
+        rdv = state.recent_dollar_volume
+        rdv_txt = f"{rdv:,.0f}" if rdv is not None else "unknown"
+        window_min = config.RECENT_VOLUME_WINDOW_SEC / 60
+        return (
+            f"only ${rdv_txt} traded in the last {window_min:.0f}min "
+            f"(floor {min_recent_dollar_volume_for(session):,.0f})"
+        )
+    if dv_w >= spread_w:
         dv = state.dollar_volume
         dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
         return f"dollar volume {dv_txt} below floor {min_dollar_volume_for(session):,}"
@@ -219,8 +275,8 @@ def bump_candidate(
     display_reason) but otherwise left alone.
 
     Weakness on each axis is normalized to "how many threshold-multiples past
-    the line" so the two signals compare on equal footing rather than one
-    axis silently always winning; the single worst offender across both is
+    the line" so the signals compare on equal footing rather than one axis
+    silently always winning; the single worst offender across all three is
     returned. None if every occupant is entitled to its slot.
     """
     now = now or datetime.now(TZ)
@@ -228,7 +284,7 @@ def bump_candidate(
     for s in states.values():
         if not slot_warmed_up(s, now) or spike_held(s, now):
             continue
-        score = max(_dv_weakness(s, session), _spread_weakness(s))
+        score = max(_dv_weakness(s, session), _spread_weakness(s), _recent_volume_weakness(s, session))
         if score > best_score:
             best, best_score = s, score
     return best
@@ -236,7 +292,7 @@ def bump_candidate(
 
 def display_reason(state: SymbolState, session: Session) -> str | None:
     """
-    None if `state` would clear display.render's row filter; otherwise a short
+    None if `state` would clear display.sync_table's row filter; otherwise a short
     human-readable reason it's being hidden. Single source of truth for that
     filter so app.py can log transitions without duplicating display.py's logic.
     """
@@ -253,6 +309,13 @@ def display_reason(state: SymbolState, session: Session) -> str | None:
         dv = state.dollar_volume
         dv_txt = f"{dv:,.0f}" if dv is not None else "unknown"
         return f"dollar volume {dv_txt} below floor {min_dollar_volume_for(session):,}"
+    if not check_recent_volume(state, session):
+        rdv = state.recent_dollar_volume
+        window_min = config.RECENT_VOLUME_WINDOW_SEC / 60
+        return (
+            f"only ${rdv:,.0f} traded in the last {window_min:.0f}min "
+            f"(floor {min_recent_dollar_volume_for(session):,.0f})"
+        )
     spread_ok, spread_pct = check_spread(state)
     if not spread_ok:
         return f"spread {spread_pct:.2f}% over hard-reject threshold {config.MAX_SPREAD_PCT}%"

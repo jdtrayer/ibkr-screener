@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from momentum_scanner import config
 from momentum_scanner.news import NewsTracker
 
 
@@ -16,8 +17,19 @@ class FakeIB:
         return True
 
 
+@pytest.fixture(autouse=True)
+def isolated_news_state_file(tmp_path, monkeypatch):
+    """NewsTracker reads/writes config.NEWS_STATE_FILE on construction and
+    every pull_sweep -- without this, every test in this module shares (and
+    pollutes) the real ./cache/news_history.json, leaking state between
+    tests within a run AND into a same-day live run of the app. autouse so
+    it covers every NewsTracker built in this file, not just the `tracker`
+    fixture below (several tests construct one inline)."""
+    monkeypatch.setattr(config, "NEWS_STATE_FILE", str(tmp_path / "news_history.json"))
+
+
 @pytest.fixture
-def tracker():
+def tracker(isolated_news_state_file):
     return NewsTracker(FakeIB())
 
 
@@ -145,12 +157,18 @@ def test_pull_sweep_classifies_and_stores_sentiment():
 
     assert tracker.sentiment("AAPL") == "positive"
     assert tracker.sentiment_map() == {"AAPL": "positive"}
+    [(_when, _sym, _headline, feed_sentiment)] = tracker.feed()
+    assert feed_sentiment == "positive"
 
 
 def test_sentiment_reflects_most_recent_headline_not_oldest():
     # IB returns headlines newest-first -- the first one successfully
     # recorded in a batch is the most recent, and must be the one whose
-    # sentiment sticks, not a later (older) headline in the same batch.
+    # per-symbol sentiment() sticks, not a later (older) headline in the
+    # same batch. Each headline is still classified individually though
+    # (see feed()'s per-row sentiment, which the news panel's Sentiment
+    # column reads) -- it's only the per-symbol sentiment_map() value that
+    # doesn't get overwritten by an older headline.
     now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
     newest = FakeItem(time=now_utc_naive, headline="Newest headline (good)")
     oldest = FakeItem(time=now_utc_naive - timedelta(hours=2), headline="Oldest headline (bad)")
@@ -165,7 +183,12 @@ def test_sentiment_reflects_most_recent_headline_not_oldest():
     asyncio.run(tracker.pull_sweep({"AAPL"}, lambda symbol: FakeContract(conId=1)))
 
     assert tracker.sentiment("AAPL") == "positive"
-    assert sentiment.calls == ["Newest headline (good)"]  # only classified once, not per headline
+    assert sentiment.calls == ["Newest headline (good)", "Oldest headline (bad)"]  # classified individually
+    feed_by_headline = {headline: s for _when, _sym, headline, s in tracker.feed()}
+    assert feed_by_headline == {
+        "Newest headline (good)": "positive",
+        "Oldest headline (bad)": "negative",
+    }
 
 
 def test_sentiment_defaults_to_neutral_without_a_classifier():
@@ -190,3 +213,22 @@ def test_reset_if_new_day_clears_sentiment_too():
     tracker.reset_if_new_day()
 
     assert tracker.sentiment("AAPL") == "neutral"  # back to the no-data default
+
+
+def test_feed_symbol_filter():
+    tracker = NewsTracker(FakeIB())
+    tracker.record("AAPL", "Apple headline")
+    tracker.record("TSLA", "Tesla headline")
+    tracker.record("AAPL", "Second Apple headline")
+
+    filtered = tracker.feed(symbol="AAPL")
+
+    assert [headline for _when, _sym, headline, _sentiment in filtered] == ["Second Apple headline", "Apple headline"]
+    assert all(sym == "AAPL" for _when, sym, _headline, _sentiment in filtered)
+
+
+def test_feed_symbol_filter_no_match_returns_empty():
+    tracker = NewsTracker(FakeIB())
+    tracker.record("AAPL", "Apple headline")
+
+    assert tracker.feed(symbol="TSLA") == []

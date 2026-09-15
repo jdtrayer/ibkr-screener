@@ -13,10 +13,10 @@ from pathlib import Path
 
 from ib_async import IB, Stock, Ticker
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Static
+from textual.containers import Horizontal, Vertical
+from textual.widgets import DataTable, Footer, Header
 
-from . import config, display, floatref, rvol, spikes
+from . import config, country, display, floatref, rvol, short_interest, spikes, trend
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .scorer import SnapshotScorer
@@ -50,12 +50,17 @@ class ScannerApp(App):
         width: 1fr;
         height: 1fr;
     }
-    #scanner-table-scroll {
+    #scanner-table {
         width: 1fr;
         height: 1fr;
         border: solid $primary;
     }
-    #news-feed-scroll {
+    #scorer-table {
+        width: 1fr;
+        height: 14;
+        border: solid $primary;
+    }
+    #news-feed-table {
         width: 1fr;
         height: 14;
         border: solid $primary;
@@ -68,7 +73,8 @@ class ScannerApp(App):
         height: 1fr;
     }
     #symbol-actions-panel {
-        height: 14;
+        height: auto;
+        max-height: 20;
     }
     """
 
@@ -87,6 +93,18 @@ class ScannerApp(App):
         self._filter_reasons: dict[str, str | None] = {}
         self._slot_cooldown: dict[str, datetime] = {}  # symbol -> when it was bumped from a slot
         self._row_order: list[str] = []
+        # Set by on_data_table_row_selected (click/Enter a row in either the
+        # main or scorer table) -- filters the News Feed panel to just this
+        # symbol. Selecting the same symbol again clears it. Independent of
+        # self.states -- selecting a symbol that's since been evicted still
+        # shows its recorded headlines.
+        self._selected_symbol: str | None = None
+        # Unlike the main table, the scorer table has no separate row_order --
+        # self.scorer.ranked() is already stable between sweeps on its own, so
+        # this just tracks whether last_sweep_at advanced since the last
+        # render, to know when it's safe to reposition scorer table rows
+        # (see display.sync_scorer_table's reorder docstring).
+        self._last_scorer_sweep_rendered: datetime | None = None
         self.scorer = SnapshotScorer(self.ib)
         self.sentiment = SentimentClassifier()
         self.news = NewsTracker(self.ib, sentiment=self.sentiment)
@@ -109,11 +127,16 @@ class ScannerApp(App):
         yield Header()
         with Horizontal():
             with Vertical(id="main-column"):
-                with VerticalScroll(id="scanner-table-scroll"):
-                    yield Static(id="scanner-table")
-                    yield Static(id="scorer-table")
-                with VerticalScroll(id="news-feed-scroll"):
-                    yield Static(id="news-feed-table")
+                # cursor_foreground_priority="renderable" -- DataTable's default
+                # ("css") lets the cursor row's highlight override every cell's own
+                # text color, which washed out the RVOL/Target/Stop color coding
+                # (green3/red3/etc, see rvol_style and SCALP_TARGET_STYLE/
+                # SCALP_STOP_STYLE) on whichever row currently has the cursor.
+                # This keeps each cell's own color and lets only the background
+                # show the cursor.
+                yield DataTable(id="scanner-table", cursor_foreground_priority="renderable")
+                yield DataTable(id="scorer-table", cursor_foreground_priority="renderable")
+                yield DataTable(id="news-feed-table", cursor_foreground_priority="renderable")
             with Vertical(id="side-panel"):
                 yield TunablesPanel(self.tunables, id="tunables-panel")
                 yield SymbolActionsPanel(id="symbol-actions-panel")
@@ -129,6 +152,10 @@ class ScannerApp(App):
         # first render or any of the setup below. Sentiment simply becomes
         # available a few seconds later once this finishes.
         asyncio.create_task(self.sentiment.load())
+        # Fired, not awaited -- same reasoning as sentiment.load() above: the
+        # first fetch is a ~2MB HTTP call and country tags simply become
+        # available a few seconds later once this finishes.
+        asyncio.create_task(country.refresh_if_stale())
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
         self.float_map = floatref.load()
@@ -136,7 +163,28 @@ class ScannerApp(App):
         await self.news.load_providers()
         self._reconfigure_for_session(current_session())
         self.scanner_mgr.on_update(self._on_scan_update)
-        self._render()
+
+        scanner_table = self.query_one("#scanner-table", DataTable)
+        scanner_table.cursor_type = "row"
+        scanner_table.zebra_stripes = True
+        scanner_table.add_columns(*display.MAIN_TABLE_COLUMNS)
+
+        scorer_table = self.query_one("#scorer-table", DataTable)
+        scorer_table.cursor_type = "row"
+        scorer_table.zebra_stripes = True
+        scorer_table.add_columns(*display.SCORER_TABLE_COLUMNS)
+
+        news_table = self.query_one("#news-feed-table", DataTable)
+        # Deliberately not cursor_type="row" -- unlike the scanner/scorer
+        # tables, a news row's key isn't a symbol (a symbol can have several
+        # headlines), so it must never post RowSelected into
+        # on_data_table_row_selected, which assumes row_key.value IS a
+        # symbol. Default "cell" cursor still supports arrow-key/PageUp/Down
+        # scrolling through the panel.
+        news_table.zebra_stripes = True
+        news_table.add_columns(*display.NEWS_TABLE_COLUMNS)
+
+        self._render(reorder=True)
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
         self.set_interval(config.SCORE_REFRESH_SEC, self._scorer_tick)
         self.set_interval(config.NEWS_PULL_INTERVAL_SEC, self._news_tick)
@@ -209,29 +257,42 @@ class ScannerApp(App):
             self.float_map = floatref.load()
             for s in self.states.values():
                 self._apply_float(s)
+            # Same cadence as the float reload above -- refresh_if_stale() is
+            # a cheap no-op unless COUNTRY_CACHE_MAX_AGE_DAYS has elapsed, and
+            # is re-entry guarded so this can't stack fetches.
+            asyncio.create_task(country.refresh_if_stale())
+
+        now = datetime.now(config.TZ)
+        for s in self.states.values():
+            s.record_volume_sample(now)
 
         self._process_pending_hits()
         self._evict_unqualified()
         self._log_filter_transitions()
 
+        just_resorted = False
         if self._tick_count % SORT_REFRESH_EVERY_N_TICKS == 0 or not self._row_order:
             self._resort()
+            just_resorted = True
 
-        self._render()
+        self._render(reorder=just_resorted)
 
     def _resort(self) -> None:
-        """Recompute row ORDER by live RVOL. Called on a slower cadence than
-        _render() so rows hold still between resorts -- see display.render's
-        row_order docstring."""
+        """Recompute row ORDER by display.priority_key (trend, then active
+        spike count, then RVOL as tiebreaker). Called on a slower cadence
+        than _render() so rows hold still between resorts -- see
+        display.sync_table's row_order docstring."""
+        now = datetime.now(config.TZ)
         self._row_order = sorted(
             self.states,
-            key=lambda sym: (self.states[sym].rvol if self.states[sym].rvol is not None else -1),
+            key=lambda sym: display.priority_key(self.states[sym], self.tunables, now),
             reverse=True,
         )
 
-    def _render(self) -> None:
+    def _render(self, reorder: bool = False) -> None:
         news_sentiment = self.news.sentiment_map()
-        table = display.render(
+        display.sync_table(
+            self.query_one("#scanner-table", DataTable),
             list(self.states.values()),
             self.session,
             self.ib.isConnected(),
@@ -241,18 +302,32 @@ class ScannerApp(App):
             cooldown_count=self._cooldown_wait_count(),
             held_count=self._held_count(),
             news_sentiment=news_sentiment,
+            reorder=reorder,
         )
-        self.query_one("#scanner-table", Static).update(table)
-        self.query_one("#scorer-table", Static).update(
-            display.render_scorer(
-                self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
-                news_sentiment,
-            )
+        scorer_reorder = self.scorer.last_sweep_at != self._last_scorer_sweep_rendered
+        self._last_scorer_sweep_rendered = self.scorer.last_sweep_at
+        display.sync_scorer_table(
+            self.query_one("#scorer-table", DataTable),
+            self.scorer.ranked(), self.scorer.pool_size, self.scorer.last_sweep_at,
+            news_sentiment,
+            reorder=scorer_reorder,
         )
-        self.query_one("#news-feed-table", Static).update(
-            display.render_news_feed(self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS))
+        display.sync_news_table(
+            self.query_one("#news-feed-table", DataTable),
+            self.news.feed(limit=config.NEWS_FEED_DISPLAY_ROWS, symbol=self._selected_symbol),
+            symbol_filter=self._selected_symbol,
         )
         self.query_one(SymbolActionsPanel).refresh_status(self._ignored_until, datetime.now(config.TZ))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Click or Enter a row in the main or scorer table -- filters the
+        News Feed panel to that symbol (selecting the same symbol again
+        clears the filter). Both tables post this same message type, so one
+        handler on the App covers either (it bubbles up regardless of which
+        DataTable posted it)."""
+        symbol = event.row_key.value
+        self._selected_symbol = None if symbol == self._selected_symbol else symbol
+        self._render()
 
     def _waiting_for_slot_count(self) -> int:
         """Symbols that have cleared persistence and are genuinely blocked by a
@@ -493,7 +568,7 @@ class ScannerApp(App):
 
     def _log_filter_transitions(self) -> None:
         """Logs, once per state change, why a live-subscribed symbol is or isn't
-        clearing display.render's row filter -- otherwise a symbol can spike
+        clearing display.sync_table's row filter -- otherwise a symbol can spike
         heavily under the hood and stay invisible with no trace in the log."""
         for symbol, state in self.states.items():
             if state.tick.last is None:
@@ -668,6 +743,7 @@ class ScannerApp(App):
 
         asyncio.create_task(self._load_baseline(state))
         asyncio.create_task(self._load_float(state))
+        asyncio.create_task(self._load_short_interest(state))
 
     async def _load_baseline(self, state: SymbolState) -> None:
         baseline = await rvol.build_baseline(self.ib, state.symbol, self.session)
@@ -685,6 +761,13 @@ class ScannerApp(App):
             current.float_shares = shares
             current.float_known = shares is not None
 
+    async def _load_short_interest(self, state: SymbolState) -> None:
+        result = await short_interest.get_short_interest(state.symbol)
+        current = self.states.get(state.symbol)
+        if current is not None:
+            current.short_pct = result["pct_float"] if result else None
+            current.short_interest_known = result is not None
+
     def _remove_symbol(self, symbol: str) -> None:
         state = self.states.pop(symbol, None)
         self._logged_no_slot.discard(symbol)
@@ -701,7 +784,9 @@ class ScannerApp(App):
     def _apply_tick(self, state: SymbolState, t: Ticker) -> None:
         if t.last is not None and not _isnan(t.last):
             state.tick.last = t.last
-            spikes.update_spike_state(state.spike, t.last, datetime.now(config.TZ), self.tunables)
+            now = datetime.now(config.TZ)
+            spikes.update_spike_state(state.spike, t.last, now, self.tunables)
+            trend.update_trend_state(state.trend, t.last, now, self.tunables)
         if t.bid is not None and not _isnan(t.bid):
             state.tick.bid = t.bid
         if t.ask is not None and not _isnan(t.ask):
