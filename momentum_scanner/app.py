@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header
 
-from . import config, country, display, floatref, rvol, short_interest, spikes, trend
+from . import atr, config, country, display, floatref, rvol, short_interest, spikes, trend
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .scorer import SnapshotScorer
@@ -744,6 +744,31 @@ class ScannerApp(App):
         asyncio.create_task(self._load_baseline(state))
         asyncio.create_task(self._load_float(state))
         asyncio.create_task(self._load_short_interest(state))
+        asyncio.create_task(self._start_atr(state, contract))
+
+    async def _start_atr(self, state: SymbolState, contract) -> None:
+        try:
+            bars = await atr.start_atr_subscription(self.ib, contract)
+        except Exception:
+            log.exception("Failed to start ATR bar subscription for %s", state.symbol)
+            return
+        current = self.states.get(state.symbol)
+        if current is not state:
+            # Evicted/removed while the throttled fetch was in flight -- this
+            # subscription was never registered on state, so _remove_symbol
+            # couldn't have cancelled it; do it here instead of leaking it.
+            try:
+                self.ib.cancelHistoricalData(bars)
+            except Exception:
+                log.exception("Error cancelling orphaned ATR subscription for %s", state.symbol)
+            return
+        atr.seed_atr_state(state.atr, bars)
+        state._atr_bars = bars  # keep a reference for cleanup, same convention as state._ticker
+
+        def on_bar_update(_bars, has_new_bar, _state=state):
+            atr.update_atr_state(_state.atr, _bars, has_new_bar)
+
+        bars.updateEvent += on_bar_update
 
     async def _load_baseline(self, state: SymbolState) -> None:
         baseline = await rvol.build_baseline(self.ib, state.symbol, self.session)
@@ -780,6 +805,12 @@ class ScannerApp(App):
                 self.ib.cancelMktData(ticker.contract)
             except Exception:
                 log.exception("Error cancelling market data for %s", symbol)
+        atr_bars = getattr(state, "_atr_bars", None)
+        if atr_bars is not None:
+            try:
+                self.ib.cancelHistoricalData(atr_bars)
+            except Exception:
+                log.exception("Error cancelling ATR subscription for %s", symbol)
 
     def _apply_tick(self, state: SymbolState, t: Ticker) -> None:
         if t.last is not None and not _isnan(t.last):

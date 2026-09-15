@@ -26,9 +26,13 @@ class Tunables:
     spike_quiet_sec: float = config.SPIKE_QUIET_SEC
     trend_window_sec: float = config.TREND_WINDOW_SEC
     trend_flat_pct: float = config.TREND_FLAT_PCT
-    scalp_position_usd: float = config.SCALP_POSITION_USD
-    scalp_target_usd: float = config.SCALP_TARGET_USD
-    scalp_rr_ratio: float = config.SCALP_RR_RATIO
+    risk_usd: float = config.RISK_USD
+    atr_multiplier: float = config.ATR_MULTIPLIER
+    min_spreads: int = config.MIN_SPREADS
+    r_multiple: float = config.R_MULTIPLE
+    max_position_usd: float = config.MAX_POSITION_USD
+    min_shares: int = config.MIN_SHARES
+    pass_through_per_share: float = config.PASS_THROUGH_PER_SHARE
     slot_reentry_cooldown_sec: float = config.SLOT_REENTRY_COOLDOWN_SEC
     max_live_symbols: int = config.MAX_LIVE_SYMBOLS
     scorer_reserved_slots: int = config.SCORER_RESERVED_SLOTS
@@ -57,9 +61,13 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("spike_quiet_sec", "Spike quiet", 60, 60, 1800, False, lambda v: f"{v / 60:.0f}m"),
     TunableSpec("trend_window_sec", "Trend window", 30, 30, 900, False, lambda v: f"{v / 60:.1f}m"),
     TunableSpec("trend_flat_pct", "Trend flat", 0.25, 0.25, 10, False, lambda v: f"{v:.2f}%"),
-    TunableSpec("scalp_position_usd", "Scalp size $", 50, 50, 5000, False, lambda v: f"${v:.0f}"),
-    TunableSpec("scalp_target_usd", "Scalp target $", 5, 5, 200, False, lambda v: f"${v:.0f}"),
-    TunableSpec("scalp_rr_ratio", "Scalp R:R", 0.5, 1.0, 5.0, False, lambda v: f"{v:.1f}:1"),
+    TunableSpec("risk_usd", "Risk $", 5, 5, 500, False, lambda v: f"${v:.0f}"),
+    TunableSpec("atr_multiplier", "ATR x", 0.1, 0.1, 5.0, False, lambda v: f"{v:.1f}x"),
+    TunableSpec("min_spreads", "Min Spreads", 1, 1, 30, True, str),
+    TunableSpec("r_multiple", "R Multiple", 0.25, 0.5, 5.0, False, lambda v: f"{v:.2f}"),
+    TunableSpec("max_position_usd", "Max Position $", 50, 100, 10000, False, lambda v: f"${v:.0f}"),
+    TunableSpec("min_shares", "Min Shares", 5, 1, 200, True, str),
+    TunableSpec("pass_through_per_share", "Pass-thru $/sh", 0.0001, 0.0, 0.01, False, lambda v: f"${v:.4f}"),
     TunableSpec("slot_reentry_cooldown_sec", "Slot cooldown", 60, 0, 1800, False, lambda v: f"{v:.0f}s"),
     TunableSpec("max_live_symbols", "Live slots", 5, 5, 100, True, str),
     TunableSpec("scorer_reserved_slots", "Scorer slots", 1, 0, 10, True, str),

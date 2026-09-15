@@ -51,44 +51,6 @@ def active_spike_count(spike: SpikeState, tunables: Tunables, now: datetime) -> 
     return len(spike.events)
 
 
-def scalp_sizing(price: float, tunables: Tunables) -> tuple[int, float, float] | None:
-    """
-    Rough, at-a-glance scalp sizing, worked forward purely from the current
-    price and three tunables -- no dependency on recent price history/technical
-    levels at all. Earlier versions derived the stop from a recent low, which
-    produced unrealistically tight (sometimes undefined) stops whenever the
-    stock hadn't pulled back much, which is common during a strong move and
-    isn't actually informative about a sane stop distance anyway.
-
-    shares       = scalp_position_usd worth of shares at the current price
-    reward/share = scalp_target_usd / shares  (profit if target is hit, using the full position)
-    target_price = price + reward/share
-    risk/share   = reward/share / scalp_rr_ratio
-    stop_price   = price - risk/share
-
-    This is meant to tell a quick story ("worth pulling up the chart/L2/T&S"
-    vs. "wait") -- not a risk-managed trade plan: the target isn't guaranteed
-    reachable and the stop isn't tied to any real support level, it's just
-    algebra that makes the numbers consistent with your position size, profit
-    target, and chosen reward:risk.
-
-    Returns (shares, target_price, stop_price), or None if price is invalid,
-    the implied share count is zero, or the implied stop would be <= 0.
-    """
-    if price <= 0:
-        return None
-    shares = int(tunables.scalp_position_usd / price)
-    if shares <= 0:
-        return None
-    reward_per_share = tunables.scalp_target_usd / shares
-    risk_per_share = reward_per_share / tunables.scalp_rr_ratio
-    stop_price = price - risk_per_share
-    if stop_price <= 0:
-        return None
-    target_price = price + reward_per_share
-    return shares, target_price, stop_price
-
-
 def ready_to_evict(spike: SpikeState, tunables: Tunables, now: datetime) -> bool:
     if spike.last_spike_at is None:
         return False  # never spiked -- this eviction path doesn't apply

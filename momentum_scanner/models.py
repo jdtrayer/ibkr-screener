@@ -85,6 +85,20 @@ class TrendState:
 
 
 @dataclass
+class AtrState:
+    """Tracks the rolling true-range history behind one symbol's intraday
+    ATR, fed by atr.py from a keepUpToDate reqHistoricalData 1-min-bar
+    subscription (see atr.py's seed_atr_state/update_atr_state) -- only
+    fully CLOSED bars are ever folded in here, never the still-forming live
+    bar. Consumed by sizing.py's compute_sizing() as the ATR leg of the
+    stop-distance formula."""
+
+    true_ranges: deque = field(default_factory=deque)  # float, capped to config.ATR_LOOKBACK_BARS, oldest first
+    prev_close: float | None = None
+    last_bar_time: object = None  # datetime of the last closed bar folded in -- dedupe guard
+
+
+@dataclass
 class LiveTick:
     last: float | None = None
     bid: float | None = None
@@ -104,6 +118,15 @@ class LiveTick:
         if mid is None or mid <= 0 or self.bid is None or self.ask is None:
             return None
         return (self.ask - self.bid) / mid * 100.0
+
+    @property
+    def spread_abs(self) -> float | None:
+        """Raw dollar spread (ask - bid), used by sizing.py's spread floor
+        and round-trip cost terms -- spread_pct above stays the display/
+        filter metric, this is the same underlying quote in dollars."""
+        if self.bid is None or self.ask is None:
+            return None
+        return self.ask - self.bid
 
 
 @dataclass
@@ -126,6 +149,7 @@ class SymbolState:
     halt: HaltState = field(default_factory=HaltState)
     spike: SpikeState = field(default_factory=SpikeState)
     trend: TrendState = field(default_factory=TrendState)
+    atr: AtrState = field(default_factory=AtrState)
 
     float_shares: float | None = None
     float_known: bool = False

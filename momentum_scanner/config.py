@@ -186,17 +186,60 @@ TREND_WINDOW_SEC = 180.0      # lookback window for the up/down/sideways arrow
 TREND_FLAT_PCT = 1.0          # move within +-this % over the window counts as sideways
 
 # --------------------------------------------------------------------------
-# Scalp sizing -- seed values for the runtime-mutable Tunables object. A
-# rough, at-a-glance "does this deserve a closer look" heuristic, not a
-# risk-managed trade plan. Worked forward purely from the current price, with
-# no dependency on recent price history/technical levels: buy this many
-# dollars of shares at the current price, solve for the target price that
-# nets SCALP_TARGET_USD profit using that position, then set the stop at
-# SCALP_RR_RATIO reward:risk from there. See spikes.scalp_sizing().
+# Position sizing -- seed values for the runtime-mutable Tunables object.
+# Stop distance is derived from the symbol's own recent volatility and
+# spread FIRST, then the position is sized off that -- the reverse of the
+# old fixed-$-position scalp sizing this replaced, which fixed the position
+# size and let stop distance fall out as a byproduct (dangerously tight on
+# wide-spread/volatile names: a 2-cent spread could get a stop under a
+# single spread wide, getting taken out by bid-ask bounce alone). See
+# sizing.py's module docstring for the full formula.
 # --------------------------------------------------------------------------
-SCALP_POSITION_USD = 300.0
-SCALP_TARGET_USD = 20.0
-SCALP_RR_RATIO = 2.0
+RISK_USD = 10.0
+ATR_MULTIPLIER = 1.0
+# Live-validated 2026-09-15: at MIN_SPREADS=4, round-trip spread cost is a
+# structural 2/min_spreads = 50% of risk_usd whenever the spread floor binds
+# (the common case, since ATR only overrides it on genuinely high-vol
+# names) -- 8 puts that floor at 25%, which is at least a tradeable
+# proposition rather than guaranteed-red on every spread-floor-bound row.
+MIN_SPREADS = 8
+R_MULTIPLE = 2.0
+MAX_POSITION_USD = 800.0  # backstop/buying-power cap only -- NOT a sizing input
+MIN_SHARES = 10
+# Configurable estimate for exchange/regulatory pass-through fees (not
+# modeled individually) -- see COMMISSION_* below for the modeled IBKR
+# broker commission itself.
+PASS_THROUGH_PER_SHARE = 0.0002
+
+# --------------------------------------------------------------------------
+# IBKR commission -- Pro TIERED pricing specifically (US stocks, per order
+# leg). Would be silently wrong under IBKR Pro FIXED or any other account
+# tier. Plain constants, not tunables: this is the broker's fee schedule,
+# not a risk knob a user would reasonably want to adjust mid-session.
+# --------------------------------------------------------------------------
+COMMISSION_PER_SHARE = 0.0035
+COMMISSION_MIN_PER_ORDER = 0.35
+COMMISSION_MAX_PCT_OF_TRADE = 0.01
+
+# --------------------------------------------------------------------------
+# Intraday ATR (sizing.py's stop-distance formula) -- real 1-min OHLC bars
+# via a keepUpToDate reqHistoricalData subscription per live symbol (see
+# atr.py), not a polling loop: one call opens the subscription and IB
+# streams bar updates into the same BarDataList from then on, no further
+# calls needed. N=5 bars (~5min lookback) is a short intraday window by
+# design (scalp timeframe, not swing) -- fixed, not a tunable, since
+# changing the window meaningfully changes what's being measured, unlike
+# ATR_MULTIPLIER above.
+# --------------------------------------------------------------------------
+ATR_LOOKBACK_BARS = 5
+ATR_BAR_SIZE = "1 min"
+# Mirrors HISTORICAL_FETCH_CONCURRENCY/HISTORICAL_FETCH_MIN_INTERVAL_SEC --
+# guards the *initial* fetch of a new ATR subscription against IB's
+# historical-data pacing limit if several symbols get admitted within a
+# couple seconds of each other. Steady-state bar updates stream in via the
+# open subscription's own event and never touch this throttle again.
+ATR_FETCH_CONCURRENCY = 5
+ATR_FETCH_MIN_INTERVAL_SEC = 1.5
 
 # --------------------------------------------------------------------------
 # Live-slot occupancy -- letting the capped live-symbol pool (MAX_LIVE_SYMBOLS)

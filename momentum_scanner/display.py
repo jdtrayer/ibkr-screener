@@ -15,9 +15,11 @@ from rich.text import Text
 from textual.widgets import DataTable
 
 from . import config, country, spikes, trend
+from .atr import atr_value
 from .filters import check_spread, display_reason
 from .models import SymbolState
 from .session import Session
+from .sizing import SizingResult, compute_sizing
 from .tunables import Tunables
 
 
@@ -77,33 +79,77 @@ def _fmt_halt_flag(halt, now: datetime) -> str:
     return f"[bold white on red3]HALTED {_mmss(elapsed)}[/]"
 
 
-SCALP_TARGET_STYLE = "green3"  # muted, not pure green -- readable on a dark background
-SCALP_STOP_STYLE = "red3"      # muted, not pure red -- readable on a dark background
+SIZING_TARGET_STYLE = "green3"  # muted, not pure green -- readable on a dark background
+SIZING_STOP_STYLE = "red3"      # muted, not pure red -- readable on a dark background
+NON_TRADEABLE_STYLE = "dim red3"
+
+# A row that computed a SizingResult but failed the tradeability check (too
+# few shares, or too large a position -- see sizing.compute_sizing) stays
+# visible in the table (it's still a real scanner hit worth watching) rather
+# than being hidden via filters.display_reason: the Shares cell shows a
+# short "NT" marker (the full reason would blow out the column width) and
+# the rest of the sizing-derived cells (Target/Stop/S-spr/Comm/EffR) dash
+# out rather than show numbers that don't mean anything. The reason itself
+# is appended to the Flags cell instead, where prose-length text already
+# belongs. Every other cell (RVOL, spread%, ...) is untouched.
 
 
-def _fmt_scalp_shares(sizing: tuple[int, float, float] | None) -> Text:
-    # No color cue: shares is deterministic from price alone
-    # (scalp_position_usd / price), so it no longer reflects the move's
-    # quality -- a share-count-based style would just encode price, not
-    # signal anything about the setup. See spikes.scalp_sizing docstring.
+def _sizing_blocked(sizing: SizingResult | None) -> bool:
+    return sizing is None or sizing.non_tradeable_reason is not None
+
+
+def _fmt_sizing_shares(sizing: SizingResult | None) -> Text:
     if sizing is None:
         return Text("-", style="dim")
-    shares, _target, _stop = sizing
-    return Text(_fmt_shares(shares))
+    if sizing.non_tradeable_reason:
+        return Text("NT", style=NON_TRADEABLE_STYLE)
+    return Text(_fmt_shares(sizing.shares))
 
 
-def _fmt_scalp_target(sizing: tuple[int, float, float] | None) -> Text:
-    if sizing is None:
+def _fmt_sizing_target(sizing: SizingResult | None) -> Text:
+    if _sizing_blocked(sizing):
         return Text("-", style="dim")
-    _shares, target, _stop = sizing
-    return Text(f"{target:.2f}", style=SCALP_TARGET_STYLE)
+    return Text(f"{sizing.target_price:.2f}", style=SIZING_TARGET_STYLE)
 
 
-def _fmt_scalp_stop(sizing: tuple[int, float, float] | None) -> Text:
-    if sizing is None:
+def _fmt_sizing_stop(sizing: SizingResult | None) -> Text:
+    if _sizing_blocked(sizing):
         return Text("-", style="dim")
-    _shares, _target, stop = sizing
-    return Text(f"{stop:.2f}", style=SCALP_STOP_STYLE)
+    return Text(f"{sizing.stop_price:.2f}", style=SIZING_STOP_STYLE)
+
+
+def stop_in_spreads_style(value: float | None) -> str:
+    if value is None:
+        return "dim"
+    if value < 4:
+        return "red3"
+    if value < 6:
+        return "yellow"
+    return ""
+
+
+def _fmt_stop_in_spreads(sizing: SizingResult | None) -> Text:
+    if _sizing_blocked(sizing) or sizing.stop_in_spreads is None:
+        return Text("-", style="dim")
+    v = sizing.stop_in_spreads
+    return Text(f"{v:.1f}", style=stop_in_spreads_style(v))
+
+
+def _fmt_commission(sizing: SizingResult | None) -> Text:
+    if _sizing_blocked(sizing):
+        return Text("-", style="dim")
+    return Text(f"${sizing.commission_rt:.2f}")
+
+
+def _fmt_effective_r(sizing: SizingResult | None, tunables: Tunables) -> Text:
+    if _sizing_blocked(sizing):
+        return Text("-", style="dim")
+    nominal = f"{tunables.r_multiple:.1f}"
+    if sizing.effective_r is None:
+        return Text(f"{nominal}/-", style="dim")
+    eff = sizing.effective_r
+    style = "dim" if eff <= 0 else ""
+    return Text(f"{nominal}/{eff:.1f}R", style=style)
 
 
 def _fmt_spike(spike_n: int) -> Text:
@@ -174,6 +220,9 @@ MAIN_TABLE_COLUMNS = [
     ("Shares", "shares"),
     ("Target", "target"),
     ("Stop", "stop"),
+    ("S/spr", "s_spr"),
+    ("Comm", "comm"),
+    ("EffR", "eff_r"),
     ("Flags", "flags"),
 ]
 """(label, key) pairs for the main table's DataTable -- app.py's on_mount adds
@@ -207,6 +256,11 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
 
     spike_n = spikes.active_spike_count(s.spike, tunables, now)
 
+    sizing = (
+        compute_sizing(s.tick.last, s.tick, atr_value(s.atr), tunables)
+        if s.tick.last is not None else None
+    )
+
     flags = []
     if s.halt.is_halted:
         flags.append(_fmt_halt_flag(s.halt, now))
@@ -216,6 +270,8 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
         flags.append("[yellow]WIDE[/]")
     if s.float_known and (s.float_shares or 0) > config.FLOAT_CEILING_SHARES:
         flags.append("[yellow]FLOAT[/]")
+    if sizing is not None and sizing.non_tradeable_reason:
+        flags.append(f"[dim red3]NT: {sizing.non_tradeable_reason}[/]")
     if s.symbol in news_sentiment:
         flags.append(NEWS_SENTIMENT_ICONS[news_sentiment[s.symbol]])
     flags_txt = Text.from_markup(" ".join(flags)) if flags else Text("")
@@ -223,7 +279,6 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
     country_abbr = country.abbr_for(s.symbol)
     country_txt = Text(country_abbr, style=COUNTRY_STYLE) if country_abbr else Text("")
 
-    sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
     trend_txt = _fmt_trend(trend.trend_direction(s.trend, tunables))
     spike_txt = _fmt_spike(spike_n)
 
@@ -238,9 +293,12 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
         Text(spread_txt, style=spread_style),
         Text(float_txt, style=float_style),
         Text(short_txt, style=short_style),
-        _fmt_scalp_shares(sizing),
-        _fmt_scalp_target(sizing),
-        _fmt_scalp_stop(sizing),
+        _fmt_sizing_shares(sizing),
+        _fmt_sizing_target(sizing),
+        _fmt_sizing_stop(sizing),
+        _fmt_stop_in_spreads(sizing),
+        _fmt_commission(sizing),
+        _fmt_effective_r(sizing, tunables),
         flags_txt,
     ]
 
