@@ -292,7 +292,7 @@ def bump_candidate(
 
 def display_reason(state: SymbolState, session: Session) -> str | None:
     """
-    None if `state` would clear display.render's row filter; otherwise a short
+    None if `state` would clear display.sync_table's row filter; otherwise a short
     human-readable reason it's being hidden. Single source of truth for that
     filter so app.py can log transitions without duplicating display.py's logic.
     """
