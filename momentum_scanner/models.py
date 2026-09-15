@@ -78,6 +78,13 @@ class SpikeState:
 
 
 @dataclass
+class TrendState:
+    """Tracks the slower, zoomed-out price direction for the Trend column. See trend.py for the logic."""
+
+    price_history: deque = field(default_factory=deque)  # (datetime, price), pruned to trend_window_sec
+
+
+@dataclass
 class LiveTick:
     last: float | None = None
     bid: float | None = None
@@ -118,6 +125,7 @@ class SymbolState:
     tick: LiveTick = field(default_factory=LiveTick)
     halt: HaltState = field(default_factory=HaltState)
     spike: SpikeState = field(default_factory=SpikeState)
+    trend: TrendState = field(default_factory=TrendState)
 
     float_shares: float | None = None
     float_known: bool = False

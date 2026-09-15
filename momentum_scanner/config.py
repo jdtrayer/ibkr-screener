@@ -175,6 +175,17 @@ SPIKE_LOOKBACK_SEC = 600.0    # trailing window for the SPIKE×N event count
 SPIKE_QUIET_SEC = 300.0       # no new spike + no new session-high for this long -> clear + evict
 
 # --------------------------------------------------------------------------
+# Trend direction -- seed values for the runtime-mutable Tunables object.
+# A slower, zoomed-out companion to spike detection above: compares oldest
+# vs newest price over a multi-minute window to show up/down/sideways
+# context next to SPIKE×N, without gating or suppressing that flag (a fast
+# spike and a longer-term downtrend aren't mutually exclusive -- see
+# trend.py).
+# --------------------------------------------------------------------------
+TREND_WINDOW_SEC = 180.0      # lookback window for the up/down/sideways arrow
+TREND_FLAT_PCT = 1.0          # move within +-this % over the window counts as sideways
+
+# --------------------------------------------------------------------------
 # Scalp sizing -- seed values for the runtime-mutable Tunables object. A
 # rough, at-a-glance "does this deserve a closer look" heuristic, not a
 # risk-managed trade plan. Worked forward purely from the current price, with

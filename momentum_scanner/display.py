@@ -1,5 +1,7 @@
 """
-Terminal UI rendering. RVOL is the primary sort key and color driver.
+Terminal UI rendering. Row order is priority_key (trend, then active spike
+count, then RVOL as tiebreaker); RVOL remains the color driver via
+rvol_style.
 
 The main table (sync_table), scorer table (sync_scorer_table), and news
 panel (sync_news_table) are all textual.widgets.DataTable, synced in place
@@ -12,7 +14,7 @@ from datetime import datetime
 from rich.text import Text
 from textual.widgets import DataTable
 
-from . import config, country, spikes
+from . import config, country, spikes, trend
 from .filters import check_spread, display_reason
 from .models import SymbolState
 from .session import Session
@@ -104,6 +106,48 @@ def _fmt_scalp_stop(sizing: tuple[int, float, float] | None) -> Text:
     return Text(f"{stop:.2f}", style=SCALP_STOP_STYLE)
 
 
+def _fmt_spike(spike_n: int) -> Text:
+    if spike_n > 0:
+        return Text.from_markup(f"[bold black on orange3]SPIKE×{spike_n}[/]")
+    return Text("-", style="dim")
+
+
+def _fmt_trend(direction: str | None) -> Text:
+    # Purely descriptive context alongside SPIKE×N -- not a gate on it (see
+    # trend.py's docstring: a fast 20s pop and a falling multi-minute trend
+    # aren't mutually exclusive, and a real reversal looks identical to a
+    # dead-cat bounce at the moment it starts, so suppressing SPIKE×N on
+    # trend direction would hide genuine reversals along with the noise).
+    if direction == "up":
+        return Text("↑", style="green3")
+    if direction == "down":
+        return Text("↓", style="red3")
+    if direction == "flat":
+        return Text("→", style="dim")
+    return Text("-", style="dim")
+
+
+_TREND_PRIORITY = {"up": 2, "flat": 1, None: 1, "down": 0}
+
+
+def priority_key(s: SymbolState, tunables: Tunables, now: datetime) -> tuple[int, int, float]:
+    """
+    Row priority for the main table's sort order: trend direction first (an
+    up or sideways symbol with active spikes is more interesting to look at
+    than a spike inside a downtrend), then active spike count, then RVOL as
+    the final tiebreaker -- RVOL is already a floor to hold a live slot at
+    all (see filters.py), so once a symbol is admitted it differentiates
+    rows least. Unknown trend (not enough history yet, e.g. a newcomer)
+    ranks with flat/sideways rather than being punished or rewarded for
+    missing data. Purely a display-order choice -- doesn't gate or suppress
+    SPIKE×N itself, same reasoning as trend.py's docstring.
+    """
+    trend_rank = _TREND_PRIORITY[trend.trend_direction(s.trend, tunables)]
+    spike_n = spikes.active_spike_count(s.spike, tunables, now)
+    rvol = s.rvol if s.rvol is not None else -1.0
+    return (trend_rank, spike_n, rvol)
+
+
 NEWS_SENTIMENT_ICONS = {"positive": "📈", "negative": "📉", "neutral": "📰"}
 
 # A distinct hue from every other color in these tables (green=bullish/target,
@@ -119,8 +163,9 @@ COUNTRY_STYLE = "cyan"
 MAIN_TABLE_COLUMNS = [
     ("Sym", "sym"),
     ("Country", "country"),
-    ("Flags", "flags"),
     ("Price", "price"),
+    ("Trend", "trend"),
+    ("Spike", "spike"),
     ("RVOL", "rvol"),
     ("$Vol", "dvol"),
     ("Spread%", "spread"),
@@ -129,6 +174,7 @@ MAIN_TABLE_COLUMNS = [
     ("Shares", "shares"),
     ("Target", "target"),
     ("Stop", "stop"),
+    ("Flags", "flags"),
 ]
 """(label, key) pairs for the main table's DataTable -- app.py's on_mount adds
 these once via add_columns(); sync_table's update_cell calls address cells by
@@ -159,10 +205,9 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
         short_txt = "?"
         short_style = "dim"
 
-    flags = []
     spike_n = spikes.active_spike_count(s.spike, tunables, now)
-    if spike_n > 0:
-        flags.append(f"[bold black on orange3]SPIKE×{spike_n}[/]")
+
+    flags = []
     if s.halt.is_halted:
         flags.append(_fmt_halt_flag(s.halt, now))
     elif s.halt.recently_resumed(config.HALT_RESUME_RECENT_MIN):
@@ -179,12 +224,15 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
     country_txt = Text(country_abbr, style=COUNTRY_STYLE) if country_abbr else Text("")
 
     sizing = spikes.scalp_sizing(s.tick.last, tunables) if s.tick.last is not None else None
+    trend_txt = _fmt_trend(trend.trend_direction(s.trend, tunables))
+    spike_txt = _fmt_spike(spike_n)
 
     return [
         Text(s.symbol, style=style),
         country_txt,
-        flags_txt,
         Text(price_txt, style=style),
+        trend_txt,
+        spike_txt,
         Text(rvol_txt, style=style),
         Text(_fmt_money(s.dollar_volume), style=style),
         Text(spread_txt, style=spread_style),
@@ -193,6 +241,7 @@ def _row_cells(s: SymbolState, tunables: Tunables, news_sentiment: dict[str, str
         _fmt_scalp_shares(sizing),
         _fmt_scalp_target(sizing),
         _fmt_scalp_stop(sizing),
+        flags_txt,
     ]
 
 
@@ -232,7 +281,7 @@ def sync_table(
 
     `row_order` (symbols, best-first) fixes row order when `reorder=True`;
     cell values always reflect live state regardless. Pass None to fall back
-    to a fresh live-RVOL sort (e.g. for tests).
+    to a fresh live sort by priority_key (e.g. for tests).
 
     `waiting_count` is the number of symbols that have cleared persistence but
     are blocked by a genuinely full pool -- raising max_live_symbols admits
@@ -262,12 +311,10 @@ def sync_table(
     no coverage for the symbol, or not fetched yet.
     """
     news_sentiment = news_sentiment or {}
+    now = datetime.now(config.TZ)
 
     def _passes(s: SymbolState) -> bool:
         return display_reason(s, session) is None
-
-    def _rvol_key(s: SymbolState) -> float:
-        return s.rvol if s.rvol is not None else -1
 
     passing_by_symbol = {s.symbol: s for s in states if _passes(s)}
     if row_order:
@@ -275,12 +322,10 @@ def sync_table(
     else:
         ordered = []
     # Anything not covered by row_order yet (newly qualified since the last
-    # resort) is appended by live RVOL so it's visible immediately rather than
-    # waiting for the next periodic resort.
-    newcomers = sorted(passing_by_symbol.values(), key=_rvol_key, reverse=True)
+    # resort) is appended by priority_key so it's visible immediately rather
+    # than waiting for the next periodic resort.
+    newcomers = sorted(passing_by_symbol.values(), key=lambda s: priority_key(s, tunables, now), reverse=True)
     ranked = (ordered + newcomers)[: config.TOP_DISPLAY_ROWS]
-
-    now = datetime.now(config.TZ)
 
     if reorder:
         datatable.clear()

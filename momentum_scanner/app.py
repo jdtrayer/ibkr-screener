@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header
 
-from . import config, country, display, floatref, rvol, short_interest, spikes
+from . import config, country, display, floatref, rvol, short_interest, spikes, trend
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .scorer import SnapshotScorer
@@ -278,12 +278,14 @@ class ScannerApp(App):
         self._render(reorder=just_resorted)
 
     def _resort(self) -> None:
-        """Recompute row ORDER by live RVOL. Called on a slower cadence than
-        _render() so rows hold still between resorts -- see display.sync_table's
-        row_order docstring."""
+        """Recompute row ORDER by display.priority_key (trend, then active
+        spike count, then RVOL as tiebreaker). Called on a slower cadence
+        than _render() so rows hold still between resorts -- see
+        display.sync_table's row_order docstring."""
+        now = datetime.now(config.TZ)
         self._row_order = sorted(
             self.states,
-            key=lambda sym: (self.states[sym].rvol if self.states[sym].rvol is not None else -1),
+            key=lambda sym: display.priority_key(self.states[sym], self.tunables, now),
             reverse=True,
         )
 
@@ -782,7 +784,9 @@ class ScannerApp(App):
     def _apply_tick(self, state: SymbolState, t: Ticker) -> None:
         if t.last is not None and not _isnan(t.last):
             state.tick.last = t.last
-            spikes.update_spike_state(state.spike, t.last, datetime.now(config.TZ), self.tunables)
+            now = datetime.now(config.TZ)
+            spikes.update_spike_state(state.spike, t.last, now, self.tunables)
+            trend.update_trend_state(state.trend, t.last, now, self.tunables)
         if t.bid is not None and not _isnan(t.bid):
             state.tick.bid = t.bid
         if t.ask is not None and not _isnan(t.ask):

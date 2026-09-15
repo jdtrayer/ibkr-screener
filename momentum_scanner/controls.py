@@ -19,6 +19,7 @@ from textual.widgets import Button, DataTable, Input, Static
 from .tunables import TUNABLE_SPECS, Tunables, bump
 
 _PERSISTENCE_ATTRS = {"persistence_required", "persistence_top_n", "persistence_reset_sec"}
+_TREND_ATTRS = {"trend_window_sec", "trend_flat_pct"}
 _SCALP_ATTRS = {"scalp_position_usd", "scalp_target_usd", "scalp_rr_ratio"}
 _SLOT_ATTRS = {
     "slot_reentry_cooldown_sec", "max_live_symbols",
@@ -69,7 +70,17 @@ class TunablesPanel(VerticalScroll):
             yield self._row(spec)
         yield Static("Spike", classes="section-header")
         for spec in TUNABLE_SPECS:
-            if spec.attr in _PERSISTENCE_ATTRS or spec.attr in _SCALP_ATTRS or spec.attr in _SLOT_ATTRS:
+            if (
+                spec.attr in _PERSISTENCE_ATTRS
+                or spec.attr in _TREND_ATTRS
+                or spec.attr in _SCALP_ATTRS
+                or spec.attr in _SLOT_ATTRS
+            ):
+                continue
+            yield self._row(spec)
+        yield Static("Trend", classes="section-header")
+        for spec in TUNABLE_SPECS:
+            if spec.attr not in _TREND_ATTRS:
                 continue
             yield self._row(spec)
         yield Static("Scalp", classes="section-header")
