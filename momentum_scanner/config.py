@@ -517,12 +517,16 @@ SORT_REFRESH_SEC = 8.0
 # from. One source of truth; the pad shows exactly the numbers the row did.
 # --------------------------------------------------------------------------
 
-# Master switch for actually transmitting orders. While False, the fire key
-# runs every validation check and logs the exact bracket it WOULD have sent
-# without touching the order API at all -- that's the arm/display/validation
-# path, testable live against a real session with zero order risk. Flip this
-# only after that path has been watched through a real weekday session.
-ORDER_PAD_SUBMIT_ENABLED = False
+# Master switch for actually transmitting orders is
+# tunables.Tunables.order_pad_dry_run, toggled live from a button at the
+# bottom of the TunablesPanel sidebar (default: dry run ON). While on, the
+# fire key runs every validation check and logs the exact bracket it WOULD
+# have sent without touching the order API at all -- that's the
+# arm/display/validation path, testable live against a real session with
+# zero order risk. There is no placeOrder call yet regardless of this
+# switch (see app.py's _on_pad_fire), so flipping it off currently only
+# previews the "not wired up" path -- wire up submission only after the
+# dry-run path has been watched through a real weekday session.
 
 # How far the live price may drift from the ARMED price before firing is
 # refused, as a fraction of the armed stop distance. The pad deliberately

@@ -38,6 +38,10 @@ class Tunables:
     scorer_reserved_slots: int = config.SCORER_RESERVED_SLOTS
     scorer_admit_min_score: float = config.SCORER_ADMIT_MIN_SCORE
     dead_hold_sec: float = config.DEAD_HOLD_SEC
+    # Not a TunableSpec/bump() field -- boolean, toggled by its own button in
+    # TunablesPanel rather than +/-. Defaults on: a fresh session should
+    # never fire live without someone deliberately switching it off.
+    order_pad_dry_run: bool = True
 
 
 @dataclass(frozen=True)

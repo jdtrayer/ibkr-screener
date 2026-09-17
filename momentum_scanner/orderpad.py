@@ -1,7 +1,7 @@
 """
 Order pad logic: the frozen sizing snapshot taken at arm time, the fire-time
 validation gate, and the bracket description that gets submitted (or, while
-config.ORDER_PAD_SUBMIT_ENABLED is False, merely logged).
+tunables.order_pad_dry_run is True, merely logged).
 
 Deliberately free of Tk and of IB -- padwindow.py owns the window, app.py
 owns the wiring and the eventual order submission, and everything in here is
@@ -182,7 +182,7 @@ def validate_fire(
 class BracketPlan:
     """Exactly what would be sent to IB for one armed snapshot.
 
-    Exists so the dry run (ORDER_PAD_SUBMIT_ENABLED False) logs the real
+    Exists so the dry run (tunables.order_pad_dry_run True) logs the real
     thing rather than an approximation of it: the same object that phase 2's
     submission path will consume is the one being printed, so what you read
     in scanner.log during testing is what will actually go out.

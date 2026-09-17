@@ -736,9 +736,9 @@ class ScannerApp(App):
             return
         self._pad_pump_task = asyncio.create_task(self.pad.pump())
         log.info(
-            "Order pad ready -- %s arms the selected row, %s fires, submission %s",
+            "Order pad ready -- %s arms the selected row, %s fires, dry run %s",
             config.ORDER_PAD_ARM_KEY, config.ORDER_PAD_FIRE_KEY,
-            "ENABLED" if config.ORDER_PAD_SUBMIT_ENABLED else "DISABLED (dry run)",
+            "ON" if self.tunables.order_pad_dry_run else "OFF",
         )
 
     def _pad_quote_age(self) -> float | None:
@@ -841,18 +841,18 @@ class ScannerApp(App):
             return
 
         plan = orderpad.bracket_plan(snapshot)
-        if not config.ORDER_PAD_SUBMIT_ENABLED:
+        if self.tunables.order_pad_dry_run:
             # The full arm -> validate path has run and passed; this is the
             # only thing being skipped. Logging the real BracketPlan (not a
             # paraphrase of it) means what's read back in scanner.log during
             # testing is exactly what the live path will send.
-            log.info("Order pad DRY RUN (submission disabled) -- would submit: %s", plan.describe())
+            log.info("Order pad DRY RUN (dry run on) -- would submit: %s", plan.describe())
             self.pad.show_result(f"DRY RUN: {plan.quantity}sh @ {plan.entry_limit:.2f}")
             return
 
         log.error(
             "Order pad fire reached the submission path, which is not wired up yet "
-            "(ORDER_PAD_SUBMIT_ENABLED is True but no placeOrder exists) -- nothing sent"
+            "(dry run switched off but no placeOrder exists) -- nothing sent"
         )
         self.pad.show_block("submission not wired up yet")
 

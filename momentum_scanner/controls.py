@@ -59,6 +59,10 @@ class TunablesPanel(VerticalScroll):
         min-width: 3;
         width: 3;
     }
+    TunablesPanel #toggle-dry-run {
+        min-width: 5;
+        width: 5;
+    }
     """
 
     def __init__(self, tunables: Tunables, **kwargs):
@@ -96,6 +100,8 @@ class TunablesPanel(VerticalScroll):
             if spec.attr not in _SLOT_ATTRS:
                 continue
             yield self._row(spec)
+        yield Static("Order Pad", classes="section-header")
+        yield self._dry_run_row()
 
     def _row(self, spec) -> Horizontal:
         # compact=True -- same built-in borderless/single-line Button style
@@ -110,8 +116,27 @@ class TunablesPanel(VerticalScroll):
             Button("+", id=f"inc-{spec.attr}", compact=True),
         )
 
+    def _dry_run_row(self) -> Horizontal:
+        return Horizontal(
+            Static("Dry run", classes="tunable-label"),
+            Button(
+                self._dry_run_label(),
+                id="toggle-dry-run",
+                compact=True,
+                variant="success" if self.tunables.order_pad_dry_run else "error",
+            ),
+        )
+
+    def _dry_run_label(self) -> str:
+        return "ON" if self.tunables.order_pad_dry_run else "OFF"
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
+        if button_id == "toggle-dry-run":
+            self.tunables.order_pad_dry_run = not self.tunables.order_pad_dry_run
+            event.button.label = self._dry_run_label()
+            event.button.variant = "success" if self.tunables.order_pad_dry_run else "error"
+            return
         if "-" not in button_id:
             return
         direction_key, attr = button_id.split("-", 1)

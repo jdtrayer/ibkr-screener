@@ -204,8 +204,8 @@ def test_disarm_releases_the_pin():
 
 
 def test_fire_dry_runs_while_submission_is_disabled():
-    assert not config.ORDER_PAD_SUBMIT_ENABLED, "phase 1: submission must stay off"
     app = make_app([make_state("CVDK", last=4.12)])
+    assert app.tunables.order_pad_dry_run, "phase 1: dry run must default on"
     app._arm("CVDK")
     app._on_pad_fire()
     assert app.pad.results and app.pad.results[0].startswith("DRY RUN:")
