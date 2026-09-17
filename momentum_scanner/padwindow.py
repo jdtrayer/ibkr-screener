@@ -43,6 +43,7 @@ _DIM = "#808080"
 _ARMED_BG = "#2e7d32"
 _BLOCKED_BG = "#b71c1c"
 _DISARMED_BG = "#3a3a3a"
+_FIRED_BG = "#1565c0"
 
 # Rich style names (display.py's) -> Tk colors, so the pad inherits the
 # table's existing S/spr and target/stop color thresholds rather than
@@ -82,6 +83,7 @@ class OrderPadWindow:
         self.snapshot: ArmedSnapshot | None = None
         self._block_reason: str | None = None
         self._status_override: str | None = None
+        self._fired = False
         self._last_geometry: str | None = None
         self._geometry_saved_at = 0.0
         self._closed = False
@@ -176,6 +178,7 @@ class OrderPadWindow:
         self.snapshot = snapshot
         self._block_reason = None
         self._status_override = None
+        self._fired = False
         if self._closed:
             return
         try:
@@ -198,6 +201,7 @@ class OrderPadWindow:
         self.snapshot = None
         self._block_reason = None
         self._status_override = reason
+        self._fired = False
         self._render()
 
     def show_block(self, reason: str) -> None:
@@ -206,9 +210,13 @@ class OrderPadWindow:
         self._render()
 
     def show_result(self, message: str) -> None:
-        """Outcome of a fire that passed validation (or of its dry run)."""
+        """Outcome of a fire that passed validation (or of its dry run).
+        Moves the status from ARMED to FIRED -- a fired snapshot stays on
+        screen (so the sizing that was sent is still visible) but won't fire
+        again; F2 re-arms for another entry."""
         self._block_reason = None
         self._status_override = message
+        self._fired = True
         self._render()
 
     def close(self) -> None:
@@ -247,7 +255,7 @@ class OrderPadWindow:
     # -- internals ---------------------------------------------------------
 
     def _fire(self) -> None:
-        if self.snapshot is None:
+        if self.snapshot is None or self._fired:
             return
         self._on_fire()
 
@@ -292,9 +300,15 @@ class OrderPadWindow:
         age = self._quote_age_provider()
         age_txt = f"{age:.1f}s" if age is not None else "--"
         blocked = self._block_reason is not None
+        if blocked:
+            label, bg = "BLOCKED", _BLOCKED_BG
+        elif self._fired:
+            label, bg = "FIRED", _FIRED_BG
+        else:
+            label, bg = "ARMED", _ARMED_BG
         self._status.configure(
-            text=f"{'BLOCKED' if blocked else 'ARMED'}  {snap.symbol}".ljust(20) + age_txt,
-            bg=_BLOCKED_BG if blocked else _ARMED_BG,
+            text=f"{label}  {snap.symbol}".ljust(20) + age_txt,
+            bg=bg,
             fg="#ffffff",
         )
 
