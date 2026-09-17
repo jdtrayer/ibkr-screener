@@ -92,6 +92,8 @@ def make_app(states=(), persistence_streak=999) -> ScannerApp:
     app._logged_no_slot = set()
     app._filter_reasons = {}
     app.pad = FakePad()
+    app._pad_order_ids = {}
+    app.ib = None  # only the submission-path tests (test_orderpad_submission.py) touch this
     return app
 
 

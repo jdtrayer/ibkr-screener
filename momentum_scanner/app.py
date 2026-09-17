@@ -8,10 +8,11 @@ import asyncio
 import json
 import logging
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from ib_async import IB, Stock, Ticker
+from ib_async import IB, LimitOrder, Stock, StopOrder, Ticker, Trade
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header
@@ -43,6 +44,24 @@ log = logging.getLogger(__name__)
 SESSION_CHECK_EVERY_N_TICKS = int(30 / config.DISPLAY_REFRESH_SEC) or 1
 FLOAT_REFRESH_EVERY_N_TICKS = int(60 / config.DISPLAY_REFRESH_SEC) or 1
 SORT_REFRESH_EVERY_N_TICKS = int(config.SORT_REFRESH_SEC / config.DISPLAY_REFRESH_SEC) or 1
+
+
+@dataclass
+class _PadBracket:
+    """Tracks one order-pad fire from parent submission through to a fully
+    protected fill.
+
+    The stop/target legs are submitted only once the parent reports a fill,
+    sized to shares actually held rather than the requested quantity (see
+    orderpad.BracketPlan's docstring) -- so stop_trade/target_trade start
+    None and get created, then resized in place (same orderId, larger
+    totalQuantity) as more of the parent fills.
+    """
+
+    plan: orderpad.BracketPlan
+    contract: Stock
+    stop_trade: Trade | None = None
+    target_trade: Trade | None = None
 
 
 class ScannerApp(App):
@@ -138,6 +157,13 @@ class ScannerApp(App):
         self._pinned: set[str] = set()
         self.pad: OrderPadWindow | None = None
         self._pad_pump_task: asyncio.Task | None = None
+        # Every orderId belonging to a live pad-submitted bracket (parent,
+        # then its stop/target once created) maps back to the same
+        # _PadBracket, so fill/cancel/error events on any leg can find their
+        # way back to the plan and the pad. Entries outlive the pad being
+        # disarmed/re-armed -- a fired position stays protected regardless
+        # of what's currently on screen.
+        self._pad_order_ids: dict[int, _PadBracket] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -174,6 +200,7 @@ class ScannerApp(App):
         asyncio.create_task(country.refresh_if_stale())
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
+        self.ib.errorEvent += self._on_ib_order_error
         self.float_map = floatref.load()
         self._load_non_tradable()
         await self.news.load_providers()
@@ -850,11 +877,107 @@ class ScannerApp(App):
             self.pad.show_result(f"DRY RUN: {plan.quantity}sh @ {plan.entry_limit:.2f}")
             return
 
-        log.error(
-            "Order pad fire reached the submission path, which is not wired up yet "
-            "(dry run switched off but no placeOrder exists) -- nothing sent"
+        if config.IB_PORT not in config.ORDER_PAD_PAPER_PORTS:
+            # Independent of the dry-run toggle -- see config.ORDER_PAD_PAPER_PORTS.
+            log.error(
+                "Order pad fire blocked: IB_PORT %s is not a recognized paper-trading "
+                "port %s -- refusing to submit a real order",
+                config.IB_PORT, sorted(config.ORDER_PAD_PAPER_PORTS),
+            )
+            self.pad.show_block("blocked: not on a paper account (see IB_PORT)")
+            return
+
+        if state.conid is None:
+            log.error("Order pad fire blocked: %s has no qualified contract yet", snapshot.symbol)
+            self.pad.show_block("no qualified contract yet")
+            return
+
+        self._submit_pad_bracket(plan, state)
+
+    def _submit_pad_bracket(self, plan: orderpad.BracketPlan, state: SymbolState) -> None:
+        """Send the parent (entry) leg standalone -- not IB's own linked
+        bracket -- because the stop/target legs are sized from the actual
+        fill, not the requested quantity (see orderpad.BracketPlan). They get
+        created in _on_pad_parent_fill once the first fill reports in."""
+        contract = Stock(conId=state.conid)
+        parent = LimitOrder(
+            "BUY", plan.quantity, plan.entry_limit,
+            tif="DAY", outsideRth=True, orderRef=plan.oca_group,
         )
-        self.pad.show_block("submission not wired up yet")
+        trade = self.ib.placeOrder(contract, parent)
+        bracket = _PadBracket(plan=plan, contract=contract)
+        self._pad_order_ids[trade.order.orderId] = bracket
+        trade.fillEvent += self._on_pad_parent_fill
+        trade.cancelledEvent += self._on_pad_parent_cancelled
+        log.info(
+            "Order pad SUBMITTED %s (orderId %d): %s",
+            plan.symbol, trade.order.orderId, plan.describe(),
+        )
+        if self.pad:
+            self.pad.show_result(f"SENT {plan.quantity}sh @ {plan.entry_limit:.2f}")
+
+    def _on_pad_parent_fill(self, trade: Trade, _fill) -> None:
+        """A parent fill (partial or full) arrived -- (re)create the stop and
+        target legs sized to shares actually held so far. Reuses the existing
+        stop/target orderIds on a later fill so this is a resize (placeOrder
+        with a non-zero orderId modifies in place), not a second pair of
+        orders stacking on top of the first."""
+        bracket = self._pad_order_ids.get(trade.order.orderId)
+        if bracket is None:
+            return
+        filled = int(trade.filled())
+        if filled <= 0:
+            return
+
+        stop = StopOrder("SELL", filled, bracket.plan.stop_price, tif="DAY", outsideRth=True)
+        target = LimitOrder("SELL", filled, bracket.plan.target_price, tif="DAY", outsideRth=True)
+        stop.ocaGroup = target.ocaGroup = bracket.plan.oca_group
+        stop.ocaType = target.ocaType = 1  # cancel the other leg outright once either fills
+        if bracket.stop_trade is not None:
+            stop.orderId = bracket.stop_trade.order.orderId
+        if bracket.target_trade is not None:
+            target.orderId = bracket.target_trade.order.orderId
+
+        bracket.stop_trade = self.ib.placeOrder(bracket.contract, stop)
+        bracket.target_trade = self.ib.placeOrder(bracket.contract, target)
+        self._pad_order_ids[bracket.stop_trade.order.orderId] = bracket
+        self._pad_order_ids[bracket.target_trade.order.orderId] = bracket
+
+        log.info(
+            "Order pad %s filled %d/%d -- protective stop %.2f / target %.2f now cover %d sh",
+            bracket.plan.symbol, filled, bracket.plan.quantity,
+            bracket.plan.stop_price, bracket.plan.target_price, filled,
+        )
+        if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+            self.pad.show_result(f"FILLED {filled}/{bracket.plan.quantity} -- stop/target live")
+
+    def _on_pad_parent_cancelled(self, trade: Trade) -> None:
+        bracket = self._pad_order_ids.get(trade.order.orderId)
+        if bracket is None:
+            return
+        filled = int(trade.filled())
+        log.info(
+            "Order pad parent order for %s cancelled (%d/%d filled before cancel)",
+            bracket.plan.symbol, filled, bracket.plan.quantity,
+        )
+        if filled == 0:
+            del self._pad_order_ids[trade.order.orderId]
+            if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+                self.pad.show_result("order cancelled, nothing filled")
+
+    def _on_ib_order_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        """Surface an IB-side reject/warning for a pad-submitted order onto
+        the pad itself -- scanner.log alone isn't glanceable over TWS, which
+        is the entire reason the pad exists."""
+        bracket = self._pad_order_ids.get(reqId)
+        if bracket is None:
+            return
+        log.error(
+            "Order pad %s order %d error %d: %s",
+            bracket.plan.symbol, reqId, errorCode, errorString,
+        )
+        if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+            self.pad.show_result(f"IB {errorCode}: {errorString}")
 
     # -- per-symbol lifecycle ----------------------------------------------
 

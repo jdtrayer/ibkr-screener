@@ -183,15 +183,16 @@ class BracketPlan:
     """Exactly what would be sent to IB for one armed snapshot.
 
     Exists so the dry run (tunables.order_pad_dry_run True) logs the real
-    thing rather than an approximation of it: the same object that phase 2's
-    submission path will consume is the one being printed, so what you read
-    in scanner.log during testing is what will actually go out.
+    thing rather than an approximation of it: the same object app.py's
+    _submit_pad_bracket() actually submits from is the one being printed, so
+    what you read in scanner.log during testing is what will actually go out.
 
     The children are quantity-less on purpose. Their size is not knowable
     here -- it has to come from the parent's reported fill quantity, because
     a partial fill sized from the INTENDED quantity leaves stop/target orders
     larger than the position, which IBKR then treats as an unprotected short
-    sale. See app.py's submission path.
+    sale. See app.py's _on_pad_parent_fill, which creates them sized to
+    shares actually held once the parent starts filling.
     """
 
     symbol: str

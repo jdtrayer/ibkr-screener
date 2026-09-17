@@ -37,6 +37,12 @@ IB_HOST = "127.0.0.1"
 IB_PORT = 7497          # 7497 = TWS paper, 7496 = TWS live, 4002 = Gateway paper, 4001 = Gateway live
 IB_CLIENT_ID = 17
 
+# Order pad safety interlock, independent of tunables.order_pad_dry_run: a
+# real submission is refused outright unless IB_PORT is a paper-trading
+# port, so switching dry run off can never reach a live account by mistake
+# (or by config.py drifting) -- see app.py's _on_pad_fire.
+ORDER_PAD_PAPER_PORTS = frozenset({7497, 4002})
+
 # How long to wait between reconnect attempts after TWS/Gateway drops the
 # socket (e.g. a TWS restart) -- ib_async does not auto-reconnect on its own.
 RECONNECT_RETRY_SEC = 5
@@ -523,10 +529,10 @@ SORT_REFRESH_SEC = 8.0
 # fire key runs every validation check and logs the exact bracket it WOULD
 # have sent without touching the order API at all -- that's the
 # arm/display/validation path, testable live against a real session with
-# zero order risk. There is no placeOrder call yet regardless of this
-# switch (see app.py's _on_pad_fire), so flipping it off currently only
-# previews the "not wired up" path -- wire up submission only after the
-# dry-run path has been watched through a real weekday session.
+# zero order risk. Flipping it off submits for real (see app.py's
+# _on_pad_fire / _submit_pad_bracket) -- gated a second, independent way by
+# ORDER_PAD_PAPER_PORTS below, so a live account can't be reached by
+# mistake even with dry run off.
 
 # How far the live price may drift from the ARMED price before firing is
 # refused, as a fraction of the armed stop distance. The pad deliberately
