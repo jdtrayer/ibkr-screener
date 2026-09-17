@@ -329,7 +329,18 @@ class OrderPadWindow:
             log.exception("Order pad geometry load failed (non-fatal); using the default")
             return config.ORDER_PAD_DEFAULT_GEOMETRY
         geometry = raw.get("geometry")
-        return geometry if isinstance(geometry, str) and geometry else config.ORDER_PAD_DEFAULT_GEOMETRY
+        if not isinstance(geometry, str) or not geometry:
+            return config.ORDER_PAD_DEFAULT_GEOMETRY
+        # A window saved while withdrawn (never mapped) reports a degenerate
+        # 1x1 size -- guard against replaying that back as the real geometry.
+        size = geometry.split("+", 1)[0]
+        try:
+            width, height = (int(part) for part in size.split("x", 1))
+        except ValueError:
+            return config.ORDER_PAD_DEFAULT_GEOMETRY
+        if width < 100 or height < 80:
+            return config.ORDER_PAD_DEFAULT_GEOMETRY
+        return geometry
 
     def _save_geometry(self, force: bool = False) -> None:
         """Persist the window's position/size when it changes.
@@ -339,6 +350,12 @@ class OrderPadWindow:
         TWS -- rate-limited so dragging the window isn't a write per frame.
         """
         try:
+            # Skip while hidden: before the window is ever mapped (or while
+            # withdrawn), Tk hasn't run geometry propagation from the packed
+            # widgets and reports a bogus 1x1, which would otherwise get
+            # written to disk and replayed as the geometry on the next arm.
+            if not self._root.winfo_viewable():
+                return
             geometry = self._root.geometry()
         except tk.TclError:
             return
