@@ -48,6 +48,22 @@ class SizingResult:
     non_tradeable_reason: str | None
 
 
+def tick_size(price: float) -> float:
+    """Minimum price variation under Reg NMS Rule 612: $0.0001 for a stock
+    quoted below $1.00, $0.01 at or above. IB enforces the exact rule
+    server-side, including right at the boundary as a name crosses it --
+    this is close enough to construct a compliant order, not a full
+    replacement for that validation, which still surfaces via
+    app.py's _on_ib_order_error on the rare reject."""
+    return 0.0001 if price < 1.0 else 0.01
+
+
+def round_to_tick(price: float) -> float:
+    tick = tick_size(price)
+    decimals = 4 if tick == 0.0001 else 2
+    return round(round(price / tick) * tick, decimals)
+
+
 def _commission_per_order(shares: int, price: float, pass_through_per_share: float) -> float:
     """
     IBKR Pro TIERED commission for one order leg (US stocks): a per-share

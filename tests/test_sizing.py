@@ -6,7 +6,7 @@ docstring for the spec."""
 import pytest
 
 from momentum_scanner.models import LiveTick
-from momentum_scanner.sizing import compute_sizing
+from momentum_scanner.sizing import compute_sizing, round_to_tick, tick_size
 from momentum_scanner.tunables import Tunables
 
 
@@ -171,3 +171,30 @@ def test_effective_r_none_when_non_tradeable_at_zero_shares():
     tick = LiveTick(last=1.0, bid=None, ask=None)
     r = compute_sizing(1.0, tick, atr_value=None, tunables=Tunables())
     assert r.effective_r is None
+
+
+# -- tick_size / round_to_tick -------------------------------------------------
+# Reg NMS Rule 612: $0.0001 below $1.00, $0.01 at or above. Real money is
+# rounded to these, so the order pad's stop/trigger construction (see
+# orderpad.recompute_bracket_exit) depends on getting the boundary right.
+
+
+def test_tick_size_is_a_penny_at_and_above_a_dollar():
+    assert tick_size(1.00) == 0.01
+    assert tick_size(4.12) == 0.01
+    assert tick_size(500.0) == 0.01
+
+
+def test_tick_size_is_a_hundredth_of_a_cent_below_a_dollar():
+    assert tick_size(0.9999) == 0.0001
+    assert tick_size(0.85) == 0.0001
+
+
+def test_round_to_tick_rounds_penny_stocks_to_two_decimals():
+    assert round_to_tick(3.8049) == pytest.approx(3.80)
+    assert round_to_tick(3.8051) == pytest.approx(3.81)
+
+
+def test_round_to_tick_rounds_sub_dollar_names_to_four_decimals():
+    assert round_to_tick(0.85006) == pytest.approx(0.8501)
+    assert round_to_tick(0.85002) == pytest.approx(0.8500)

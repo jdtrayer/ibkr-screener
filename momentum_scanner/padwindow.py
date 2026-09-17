@@ -332,6 +332,11 @@ class OrderPadWindow:
         self._price.configure(text=f"{snap.price:.2f}")
         self._shares.configure(text=f"{snap.shares}sh")
         self._risk.configure(text=f"risk ${snap.risk_usd:,.0f}")
+        # snap.stop_price is the real, risk-math stop -- the same number
+        # that becomes the STOP LIMIT once fired (see
+        # orderpad.recompute_bracket_exit). No trigger concept pre-fire;
+        # once the position fills, app.py's own status line (post-fill
+        # FILLED/EXIT messages) shows the trigger too, labeled separately.
         self._stop.configure(text=f"stop {snap.stop_price:.2f}")
         self._target.configure(text=f"tgt  {snap.target_price:.2f}")
 

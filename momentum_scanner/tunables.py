@@ -33,6 +33,7 @@ class Tunables:
     max_position_usd: float = config.MAX_POSITION_USD
     min_shares: int = config.MIN_SHARES
     pass_through_per_share: float = config.PASS_THROUGH_PER_SHARE
+    stop_trigger_lead_pct: float = config.STOP_TRIGGER_LEAD_PCT
     slot_reentry_cooldown_sec: float = config.SLOT_REENTRY_COOLDOWN_SEC
     max_live_symbols: int = config.MAX_LIVE_SYMBOLS
     scorer_reserved_slots: int = config.SCORER_RESERVED_SLOTS
@@ -72,6 +73,7 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("max_position_usd", "Max Position $", 50, 100, 10000, False, lambda v: f"${v:.0f}"),
     TunableSpec("min_shares", "Min Shares", 5, 1, 200, True, str),
     TunableSpec("pass_through_per_share", "Pass-thru $/sh", 0.0001, 0.0, 0.01, False, lambda v: f"${v:.4f}"),
+    TunableSpec("stop_trigger_lead_pct", "Stop trig lead", 0.05, 0.0, 2.0, False, lambda v: f"{v:.2f}x"),
     TunableSpec("slot_reentry_cooldown_sec", "Slot cooldown", 60, 0, 1800, False, lambda v: f"{v:.0f}s"),
     TunableSpec("max_live_symbols", "Live slots", 5, 5, 100, True, str),
     TunableSpec("scorer_reserved_slots", "Scorer slots", 1, 0, 10, True, str),

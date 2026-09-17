@@ -30,7 +30,7 @@ from datetime import datetime
 from . import config
 from .atr import atr_value
 from .models import SymbolState
-from .sizing import compute_sizing
+from .sizing import compute_sizing, round_to_tick, tick_size
 from .tunables import Tunables
 
 
@@ -59,6 +59,7 @@ class ArmedSnapshot:
     commission_rt: float
     effective_r: float | None
     nominal_r: float
+    stop_trigger_lead_pct: float
     non_tradeable_reason: str | None
 
     @property
@@ -118,6 +119,7 @@ def build_snapshot(state: SymbolState, tunables: Tunables, now: datetime) -> Arm
         commission_rt=sizing.commission_rt,
         effective_r=sizing.effective_r,
         nominal_r=tunables.r_multiple,
+        stop_trigger_lead_pct=tunables.stop_trigger_lead_pct,
         non_tradeable_reason=sizing.non_tradeable_reason,
     )
 
@@ -193,13 +195,69 @@ def validate_fire(
 
 
 @dataclass(frozen=True)
-class BracketPlan:
-    """Exactly what would be sent to IB for one armed snapshot.
+class BracketExitPrices:
+    """The stop-limit/stop-trigger/target prices actually sent to IB for one
+    fill price. See recompute_bracket_exit -- the LIMIT is the real stop,
+    the TRIGGER sits above it."""
 
-    Exists so the dry run (tunables.order_pad_dry_run True) logs the real
-    thing rather than an approximation of it: the same object app.py's
-    _submit_pad_bracket() actually submits from is the one being printed, so
-    what you read in scanner.log during testing is what will actually go out.
+    stop_limit_price: float
+    stop_trigger_price: float
+    target_price: float
+
+
+def recompute_bracket_exit(fill_price: float, snapshot: ArmedSnapshot) -> BracketExitPrices:
+    """The stop/target children, anchored to `fill_price` rather than the
+    (possibly slipped) armed price -- same reasoning the children are
+    already sized from the parent's actual fill quantity rather than the
+    requested one (see BracketPlan). Called again on every parent fill
+    event, including a resize, using the order's running average fill
+    price, so the exit keeps tracking the true cost basis through partial
+    fills at different prices.
+
+    stop_limit_price is the real stop: fill_price - stop_distance. This is
+    what all risk math (including sizing.compute_sizing's shares) is
+    computed from -- nothing here references the trigger.
+
+    stop_trigger_price sits stop_trigger_lead_pct (frozen into the snapshot
+    at arm time) of stop_distance ABOVE the limit, so the stop order wakes
+    and is already working in the market before price actually reaches the
+    intended stop, rather than being submitted only once price is already
+    there. Fixed 2026-09-17: the previous construction used the computed
+    stop as the TRIGGER and set the limit a flat $0.02 below it -- backwards,
+    and flat rather than proportional to the name's own volatility -- which
+    meant every stop fill realized worse than risk_usd priced in (see
+    config.STOP_TRIGGER_LEAD_PCT's docstring for the live evidence).
+
+    Both are rounded to the applicable tick (sizing.round_to_tick); if that
+    rounding collapses the trigger onto the same tick as the limit, the
+    trigger is widened by one tick so the two can never compare equal (IB
+    requires the trigger to sit outside the limit for a SELL STP LMT).
+    """
+    stop_distance = snapshot.stop_distance
+    stop_limit_price = round_to_tick(fill_price - stop_distance)
+    trigger_lead = stop_distance * snapshot.stop_trigger_lead_pct
+    stop_trigger_price = round_to_tick(stop_limit_price + trigger_lead)
+    if stop_trigger_price <= stop_limit_price:
+        stop_trigger_price = round_to_tick(stop_limit_price + tick_size(stop_limit_price))
+    target_price = round_to_tick(fill_price + stop_distance * snapshot.nominal_r)
+    return BracketExitPrices(
+        stop_limit_price=stop_limit_price,
+        stop_trigger_price=stop_trigger_price,
+        target_price=target_price,
+    )
+
+
+@dataclass(frozen=True)
+class BracketPlan:
+    """The PLANNED bracket for one armed snapshot -- what would be sent to
+    IB if the parent filled at exactly the armed price, with no slippage.
+
+    Exists so the dry run (tunables.order_pad_dry_run True) logs something
+    concrete rather than nothing: what you read in scanner.log during
+    testing is what would go out if the fill matches the arm. A real fire's
+    ACTUAL stop/target are recomputed from the real fill price -- see
+    app.py's _on_pad_parent_fill / orderpad.recompute_bracket_exit -- and
+    can differ from these planned figures whenever the entry slips.
 
     The children are quantity-less on purpose. Their size is not knowable
     here -- it has to come from the parent's reported fill quantity, because
@@ -213,17 +271,17 @@ class BracketPlan:
     quantity: int
     entry_limit: float
     stop_price: float
+    stop_trigger_price: float
     target_price: float
     oca_group: str
 
     def describe(self) -> str:
-        # STP LMT, not plain STP -- see config.ORDER_PAD_STOP_SLIPPAGE.
-        stop_limit = round(self.stop_price - config.ORDER_PAD_STOP_SLIPPAGE, 2)
         return (
             f"BUY {self.quantity} {self.symbol} LMT {self.entry_limit:.2f} "
-            f"(marketable, capped at armed price + drift allowance); "
-            f"children OCA={self.oca_group}, sized from the parent's actual fill: "
-            f"SELL STP LMT {self.stop_price:.2f}/{stop_limit:.2f} / SELL LMT {self.target_price:.2f}"
+            f"(marketable, capped at armed price + drift allowance); children "
+            f"OCA={self.oca_group}, re-anchored to the parent's actual fill price: "
+            f"SELL STP LMT {self.stop_price:.2f} (trigger {self.stop_trigger_price:.2f}) / "
+            f"SELL LMT {self.target_price:.2f} -- planned, assuming the fill matches the arm"
         )
 
 
@@ -242,12 +300,21 @@ def bracket_plan(snapshot: ArmedSnapshot) -> BracketPlan:
     max_entry_price, which is above the ask in the normal case (so it crosses
     and fills like a market order) but refuses to chase a sudden run-up into
     a position whose displayed R no longer holds.
+
+    stop_price/stop_trigger_price/target_price are the PLANNED figures --
+    recompute_bracket_exit(snapshot.price, snapshot), i.e. exactly what the
+    real fill-time recompute would produce if the fill lands right on the
+    armed price. Same formula both places, so there's a single source of
+    truth for the stop/trigger relationship rather than two that can drift
+    apart.
     """
+    exit_preview = recompute_bracket_exit(snapshot.price, snapshot)
     return BracketPlan(
         symbol=snapshot.symbol,
         quantity=snapshot.shares,
-        entry_limit=round(snapshot.max_entry_price, 2),
-        stop_price=round(snapshot.stop_price, 2),
-        target_price=round(snapshot.target_price, 2),
+        entry_limit=round_to_tick(snapshot.max_entry_price),
+        stop_price=exit_preview.stop_limit_price,
+        stop_trigger_price=exit_preview.stop_trigger_price,
+        target_price=exit_preview.target_price,
         oca_group=f"pad-{snapshot.symbol}-{int(snapshot.armed_at.timestamp())}",
     )

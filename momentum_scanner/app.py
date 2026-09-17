@@ -60,8 +60,16 @@ class _PadBracket:
 
     plan: orderpad.BracketPlan
     contract: Stock
+    snapshot: orderpad.ArmedSnapshot
     stop_trade: Trade | None = None
     target_trade: Trade | None = None
+    # The ACTUAL stop/target prices last sent to IB -- recomputed from the
+    # real fill price on every parent fill (see _on_pad_parent_fill), so
+    # these can differ from `plan`'s planned figures whenever the entry
+    # slips. None until the first fill creates the legs.
+    realized_stop_limit: float | None = None
+    realized_stop_trigger: float | None = None
+    realized_target_price: float | None = None
 
 
 class ScannerApp(App):
@@ -1013,7 +1021,7 @@ class ScannerApp(App):
             tif="DAY", outsideRth=True, orderRef=plan.oca_group,
         )
         trade = self.ib.placeOrder(contract, parent)
-        bracket = _PadBracket(plan=plan, contract=contract)
+        bracket = _PadBracket(plan=plan, contract=contract, snapshot=snapshot)
         self._pad_order_ids[trade.order.orderId] = bracket
         trade.fillEvent += self._on_pad_parent_fill
         trade.cancelledEvent += self._on_pad_parent_cancelled
@@ -1034,10 +1042,12 @@ class ScannerApp(App):
 
     def _on_pad_parent_fill(self, trade: Trade, fill) -> None:
         """A parent fill (partial or full) arrived -- (re)create the stop and
-        target legs sized to shares actually held so far. Reuses the existing
-        stop/target orderIds on a later fill so this is a resize (placeOrder
-        with a non-zero orderId modifies in place), not a second pair of
-        orders stacking on top of the first."""
+        target legs sized to shares actually held so far, and re-anchored to
+        the order's running average fill price (not the armed price), so
+        entry slippage can't silently widen realized risk past risk_usd.
+        Reuses the existing stop/target orderIds on a later fill so this is
+        a resize (placeOrder with a non-zero orderId modifies in place), not
+        a second pair of orders stacking on top of the first."""
         bracket = self._pad_order_ids.get(trade.order.orderId)
         if bracket is None:
             return
@@ -1045,19 +1055,27 @@ class ScannerApp(App):
         if filled <= 0:
             return
 
+        # execution.avgPrice, not orderStatus.avgFillPrice: IB delivers it
+        # atomically as part of THIS fill's own execDetails report, with no
+        # risk of racing a separate orderStatus message that may not have
+        # caught up yet. Falls back to this fill's own price if avgPrice
+        # isn't populated (seen on some synthetic/first-fill feeds).
+        fill_price = fill.execution.avgPrice or fill.execution.price
+        exit_prices = orderpad.recompute_bracket_exit(fill_price, bracket.snapshot)
+        bracket.realized_stop_limit = exit_prices.stop_limit_price
+        bracket.realized_stop_trigger = exit_prices.stop_trigger_price
+        bracket.realized_target_price = exit_prices.target_price
+
         # STP LMT, not plain STP: confirmed live 2026-09-17 (TURB) that a
         # plain stop order's outsideRth flag is silently ignored on US
         # stocks -- IB's own IB 2109 warning says as much ("ignored based on
         # the order type and destination") -- so the stop never actually
-        # triggers outside regular hours. STP LMT IS eligible; the limit sits
-        # ORDER_PAD_STOP_SLIPPAGE below the trigger so it can still cross the
-        # spread and fill rather than resting at one exact price a
-        # fast-moving name gaps straight through.
-        stop_limit = round(bracket.plan.stop_price - config.ORDER_PAD_STOP_SLIPPAGE, 2)
+        # triggers outside regular hours. STP LMT IS eligible.
         stop = StopLimitOrder(
-            "SELL", filled, stop_limit, bracket.plan.stop_price, tif="DAY", outsideRth=True,
+            "SELL", filled, exit_prices.stop_limit_price, exit_prices.stop_trigger_price,
+            tif="DAY", outsideRth=True,
         )
-        target = LimitOrder("SELL", filled, bracket.plan.target_price, tif="DAY", outsideRth=True)
+        target = LimitOrder("SELL", filled, exit_prices.target_price, tif="DAY", outsideRth=True)
         stop.ocaGroup = target.ocaGroup = bracket.plan.oca_group
         stop.ocaType = target.ocaType = 1  # cancel the other leg outright once either fills
         # First creation vs. a later resize: placeOrder with an existing
@@ -1085,12 +1103,17 @@ class ScannerApp(App):
             bracket.target_trade.cancelledEvent += self._on_pad_exit_cancelled
 
         log.info(
-            "Order pad %s filled %d/%d -- protective stop %.2f / target %.2f now cover %d sh",
-            bracket.plan.symbol, filled, bracket.plan.quantity,
-            bracket.plan.stop_price, bracket.plan.target_price, filled,
+            "Order pad %s filled %d/%d @ avg %.4f -- protective stop %.2f "
+            "(trigger %.2f) / target %.2f now cover %d sh",
+            bracket.plan.symbol, filled, bracket.plan.quantity, fill_price,
+            exit_prices.stop_limit_price, exit_prices.stop_trigger_price,
+            exit_prices.target_price, filled,
         )
         if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
-            self.pad.show_result(f"FILLED {filled}/{bracket.plan.quantity} -- stop/target live")
+            self.pad.show_result(
+                f"FILLED {filled}/{bracket.plan.quantity} -- stop {exit_prices.stop_limit_price:.2f} "
+                f"(trig {exit_prices.stop_trigger_price:.2f}) / tgt {exit_prices.target_price:.2f}"
+            )
         order_history.log_event(
             datetime.now(config.TZ), "PARENT_FILL",
             symbol=bracket.plan.symbol,
@@ -1098,15 +1121,18 @@ class ScannerApp(App):
             filled=filled,
             planned_quantity=bracket.plan.quantity,
             fill_price=fill.execution.price,
-            fill_avg_price=fill.execution.avgPrice,
+            avg_fill_price=fill_price,
             fill_cum_qty=fill.execution.cumQty,
             commission=fill.commissionReport.commission,
             entry_limit=bracket.plan.entry_limit,
             stop_order_id=bracket.stop_trade.order.orderId,
-            stop_price=bracket.plan.stop_price,
-            stop_limit=stop_limit,
             target_order_id=bracket.target_trade.order.orderId,
-            target_price=bracket.plan.target_price,
+            planned_stop_price=bracket.plan.stop_price,
+            planned_stop_trigger_price=bracket.plan.stop_trigger_price,
+            planned_target_price=bracket.plan.target_price,
+            realized_stop_price=exit_prices.stop_limit_price,
+            realized_stop_trigger_price=exit_prices.stop_trigger_price,
+            realized_target_price=exit_prices.target_price,
         )
 
     def _on_pad_parent_cancelled(self, trade: Trade) -> None:
@@ -1147,12 +1173,36 @@ class ScannerApp(App):
             return
         leg = self._leg_name(bracket, trade.order.orderId)
         filled = int(trade.filled())
+        fill_price = fill.execution.price
         log.info(
             "Order pad %s %s leg filled %d/%d @ %.2f",
-            bracket.plan.symbol, leg, filled, bracket.plan.quantity, fill.execution.price,
+            bracket.plan.symbol, leg, filled, bracket.plan.quantity, fill_price,
         )
+
+        # Fill-quality measurement for the STOP leg only -- empirical data to
+        # tune tunables.stop_trigger_lead_pct against, rather than guessing.
+        # slipped_past_limit should be rare-to-never for a genuine LMT fill
+        # (a limit order fills at its price or better); it's here as a
+        # sanity flag. fill_vs_trigger is the real signal: how far price ran
+        # between the trigger waking the order and it actually filling --
+        # too tight a lead and this (or the fill itself) gets worse.
+        stop_fields = {}
+        pad_message = f"{leg} FILLED {filled}sh @ {fill_price:.2f}"
+        if leg == "STOP":
+            limit_price = bracket.realized_stop_limit
+            trigger_price = bracket.realized_stop_trigger
+            stop_fields = dict(
+                stop_limit_price=limit_price,
+                stop_trigger_price=trigger_price,
+                slipped_past_limit=limit_price is not None and fill_price < limit_price,
+                fill_vs_limit=None if limit_price is None else fill_price - limit_price,
+                fill_vs_trigger=None if trigger_price is None else fill_price - trigger_price,
+            )
+            if limit_price is not None:
+                pad_message = f"STOP FILLED {filled}sh @ {fill_price:.2f} (limit {limit_price:.2f})"
+
         if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
-            self.pad.show_result(f"{leg} FILLED {filled}sh @ {fill.execution.price:.2f}")
+            self.pad.show_result(pad_message)
         order_history.log_event(
             datetime.now(config.TZ), "EXIT_FILL",
             symbol=bracket.plan.symbol,
@@ -1160,13 +1210,14 @@ class ScannerApp(App):
             order_id=trade.order.orderId,
             filled=filled,
             planned_quantity=bracket.plan.quantity,
-            fill_price=fill.execution.price,
+            fill_price=fill_price,
             fill_avg_price=fill.execution.avgPrice,
             fill_cum_qty=fill.execution.cumQty,
             commission=fill.commissionReport.commission,
             entry_limit=bracket.plan.entry_limit,
-            stop_price=bracket.plan.stop_price,
-            target_price=bracket.plan.target_price,
+            realized_stop_price=bracket.realized_stop_limit,
+            realized_target_price=bracket.realized_target_price,
+            **stop_fields,
         )
 
     def _on_pad_exit_cancelled(self, trade: Trade) -> None:

@@ -10,6 +10,7 @@ testing_approach) -- FakeIB stands in for app.ib exactly the way FakePad
 stands in for OrderPadWindow, fabricating Trade objects instead of talking
 to TWS. The actual placeOrder round-trip still needs a real paper session.
 """
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -18,7 +19,7 @@ from ib_async import LimitOrder, Order, StopLimitOrder, Trade
 from ib_async.objects import CommissionReport, Execution, Fill
 from ib_async.order import OrderStatus
 
-from momentum_scanner import config
+from momentum_scanner import config, order_history
 
 from test_orderpad_wiring import make_app, make_state
 
@@ -78,10 +79,16 @@ def fire_live(states=(), port=7497, dry_run=False):
     return app
 
 
-def add_fill(trade: Trade, shares: float) -> Fill:
+def add_fill(trade: Trade, shares: float, price: float = 4.12) -> Fill:
+    """price defaults to 4.12 -- the `last` every FakeIB test in this file
+    arms at, so a fill "matches the arm" (no slippage) unless a test passes
+    a different price on purpose (see the entry-slippage tests below).
+    avgPrice mirrors price: _on_pad_parent_fill anchors the stop/target
+    recompute to execution.avgPrice (falling back to execution.price), not
+    orderStatus.avgFillPrice -- see its comment for why."""
     fill = Fill(
         trade.contract,
-        Execution(orderId=trade.order.orderId, shares=shares),
+        Execution(orderId=trade.order.orderId, shares=shares, price=price, avgPrice=price),
         CommissionReport(),
         datetime.now(),
     )
@@ -146,10 +153,11 @@ def test_partial_fill_creates_protective_orders_sized_to_the_fill_not_the_plan()
     app = fire_live([state])
     _contract, parent = app.ib.placed[0]
     parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
-    assert app._pad_order_ids[parent.orderId].stop_trade is None
+    bracket = app._pad_order_ids[parent.orderId]
+    assert bracket.stop_trade is None
 
-    plan = app._pad_order_ids[parent.orderId].plan
-    add_fill(parent_trade, shares=20)  # less than plan.quantity
+    plan = bracket.plan
+    add_fill(parent_trade, shares=20)  # less than plan.quantity, price matches the arm
     app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
 
     assert len(app.ib.placed) == 3  # parent + stop + target
@@ -159,14 +167,41 @@ def test_partial_fill_creates_protective_orders_sized_to_the_fill_not_the_plan()
     assert isinstance(target, LimitOrder) and target.action == "SELL" and target.totalQuantity == 20
     # STP LMT, not plain STP -- a plain STP's outsideRth is silently ignored
     # on US stocks (confirmed live 2026-09-17: TURB's stop never triggered
-    # falling through it during extended hours). auxPrice is still the
-    # trigger; lmtPrice sits ORDER_PAD_STOP_SLIPPAGE below it.
-    assert stop.auxPrice == plan.stop_price
-    assert stop.lmtPrice == round(plan.stop_price - config.ORDER_PAD_STOP_SLIPPAGE, 2)
-    assert target.lmtPrice == plan.target_price
+    # falling through it during extended hours). lmtPrice is the REAL stop
+    # (fill_price - stop_distance); auxPrice (the trigger) sits above it --
+    # fixed 2026-09-17, previously inverted (see config.STOP_TRIGGER_LEAD_PCT).
+    assert stop.lmtPrice == pytest.approx(plan.stop_price)
+    assert stop.auxPrice == pytest.approx(plan.stop_trigger_price)
+    assert stop.auxPrice > stop.lmtPrice
+    assert target.lmtPrice == pytest.approx(plan.target_price)
     assert stop.ocaGroup == target.ocaGroup == plan.oca_group
     assert stop.ocaType == target.ocaType == 1
     assert any("FILLED 20/" in (r or "") for r in app.pad.results)
+    assert bracket.realized_stop_limit == pytest.approx(plan.stop_price)
+    assert bracket.realized_stop_trigger == pytest.approx(plan.stop_trigger_price)
+
+
+def test_entry_slippage_does_not_widen_realized_risk():
+    """Regression for the exact bug reported live 2026-09-17 (order 25002:
+    armed 2.26, filled 2.28, planned risk $9.92, realized $11.16) -- the
+    stop must re-anchor to the actual fill, not the stale armed price."""
+    state = make_state("CVDK", last=2.26)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+    bracket = app._pad_order_ids[parent.orderId]
+    snapshot = bracket.snapshot
+
+    add_fill(parent_trade, shares=snapshot.shares, price=2.28)  # filled 2c above the arm
+    app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
+
+    _stop_contract, stop = app.ib.placed[1]
+    realized_risk = snapshot.shares * (2.28 - stop.lmtPrice)
+    assert realized_risk == pytest.approx(snapshot.risk_usd, abs=0.05)
+    # Sanity: the OLD (broken) construction would have kept the stop at the
+    # armed-price-based level regardless of the fill, realizing MORE risk.
+    assert stop.lmtPrice > bracket.plan.stop_price
 
 
 def test_second_fill_resizes_the_same_protective_orders_instead_of_stacking():
@@ -239,6 +274,13 @@ def _fill_parent(app, parent_trade, shares):
     app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
 
 
+def _read_order_history():
+    path = order_history.file_for(datetime.now(config.TZ).date())
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 def test_target_fill_is_reported_and_the_stop_cancel_is_logged_not_erased():
     state = make_state("CVDK", last=4.12)
     state.conid = 12345
@@ -274,6 +316,51 @@ def test_stop_fill_is_identified_as_the_stop_leg():
     bracket.stop_trade.fillEvent.emit(bracket.stop_trade, fill)
 
     assert any("STOP FILLED" in (r or "") for r in app.pad.results)
+
+
+def test_stop_fill_logs_fill_quality_against_limit_and_trigger():
+    """User's empirical-tuning ask: enough on every STOP EXIT_FILL to build
+    a fill rate for stop-limits and tune stop_trigger_lead_pct from real
+    data rather than guessing."""
+    state = make_state("CVDK", last=4.12)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+    _fill_parent(app, parent_trade, 31)
+    bracket = app._pad_order_ids[parent.orderId]
+    limit_price = bracket.realized_stop_limit
+    trigger_price = bracket.realized_stop_trigger
+
+    fill_price = limit_price - 0.02  # filled worse than the limit
+    fill = add_fill(bracket.stop_trade, shares=31, price=fill_price)
+    bracket.stop_trade.fillEvent.emit(bracket.stop_trade, fill)
+
+    exit_fill = next(r for r in _read_order_history() if r["event"] == "EXIT_FILL")
+    assert exit_fill["leg"] == "STOP"
+    assert exit_fill["stop_limit_price"] == pytest.approx(limit_price)
+    assert exit_fill["stop_trigger_price"] == pytest.approx(trigger_price)
+    assert exit_fill["slipped_past_limit"] is True
+    assert exit_fill["fill_vs_limit"] == pytest.approx(-0.02)
+    assert exit_fill["fill_vs_trigger"] == pytest.approx(fill_price - trigger_price)
+
+
+def test_target_fill_does_not_log_stop_only_fill_quality_fields():
+    state = make_state("CVDK", last=4.12)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+    _fill_parent(app, parent_trade, 31)
+    bracket = app._pad_order_ids[parent.orderId]
+
+    fill = add_fill(bracket.target_trade, shares=31, price=bracket.realized_target_price)
+    bracket.target_trade.fillEvent.emit(bracket.target_trade, fill)
+
+    exit_fill = next(r for r in _read_order_history() if r["event"] == "EXIT_FILL")
+    assert exit_fill["leg"] == "TARGET"
+    assert "slipped_past_limit" not in exit_fill
+    assert "fill_vs_limit" not in exit_fill
 
 
 def test_exit_fill_subscription_is_not_duplicated_across_a_resize():

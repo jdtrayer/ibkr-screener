@@ -113,6 +113,12 @@ def _fmt_sizing_target(sizing: SizingResult | None) -> Text:
 
 
 def _fmt_sizing_stop(sizing: SizingResult | None) -> Text:
+    """sizing.stop_price is the real, risk-math stop -- price minus
+    stop_distance. This is the same number the order pad uses as the STOP
+    LIMIT once armed (see orderpad.recompute_bracket_exit); there's no
+    trigger concept at this layer, only here so a reader going from this
+    column to the pad's actual order construction isn't left wondering
+    which of the two prices "Stop" refers to."""
     if _sizing_blocked(sizing):
         return Text("-", style="dim")
     return Text(f"{sizing.stop_price:.2f}", style=SIZING_STOP_STYLE)

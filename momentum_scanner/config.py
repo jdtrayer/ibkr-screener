@@ -557,10 +557,19 @@ ORDER_PAD_MAX_QUOTE_AGE_SEC = 5.0
 # live 2026-09-17 (TURB) and against IBKR's own docs that a plain STP order
 # is NOT eligible to trigger outside regular trading hours on US stocks
 # (unlike STP LMT, which can be); the parent/target legs stay LMT, which IS
-# RTH-eligible. This is the stop's limit price's distance below (for a
-# sell) the stop trigger, so it can still cross the spread and fill rather
-# than resting at an exact price a fast-moving name gaps straight through.
-ORDER_PAD_STOP_SLIPPAGE = 0.02
+# RTH-eligible.
+#
+# The LIMIT price is the real, risk-math stop (fill_price - stop_distance) --
+# see orderpad.recompute_bracket_exit. The TRIGGER sits ABOVE it, so the
+# order wakes and starts working before price actually reaches the intended
+# stop rather than only once it's already there. Fixed at 2026-09-17 (order
+# 28420: trigger 1.94/limit 1.92 had this backwards -- the computed stop
+# was used as the TRIGGER with limit a flat $0.02 below it, so every stop
+# fill realized ~2 cents worse than risk_usd priced in). Proportional to the
+# stock's own volatility (stop_distance already blends ATR and the spread
+# floor) rather than a flat cent amount, so a wide-spread/volatile name gets
+# proportionally more room to actually trigger and fill.
+STOP_TRIGGER_LEAD_PCT = 0.25
 
 # Window geometry (position + size), so the pad comes back where you left it
 # over TWS instead of wherever the WM decides. Same cache/ + plain-JSON

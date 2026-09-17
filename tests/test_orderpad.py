@@ -11,6 +11,7 @@ import pytest
 
 from momentum_scanner import config, orderpad
 from momentum_scanner.models import SymbolState
+from momentum_scanner.sizing import round_to_tick
 from momentum_scanner.tunables import Tunables
 
 NOW = datetime(2026, 9, 16, 10, 30, tzinfo=config.TZ)
@@ -175,16 +176,22 @@ def test_entry_limit_caps_at_the_drift_budget(tunables):
     snapshot = orderpad.build_snapshot(make_state(), tunables, NOW)
     plan = orderpad.bracket_plan(snapshot)
     assert plan.entry_limit == pytest.approx(
-        round(snapshot.price + snapshot.drift_allowance, 2)
+        round_to_tick(snapshot.price + snapshot.drift_allowance)
     )
     assert plan.entry_limit > snapshot.price  # marketable: crosses the spread
 
 
-def test_plan_carries_the_armed_stop_and_target(tunables):
+def test_plan_stop_and_target_are_the_no_slippage_preview(tunables):
+    """plan.stop_price/target_price are what recompute_bracket_exit would
+    produce if the fill lands exactly on the armed price -- planned, not
+    what's actually sent to IB (that's recomputed from the real fill, see
+    app.py's _on_pad_parent_fill)."""
     snapshot = orderpad.build_snapshot(make_state(), tunables, NOW)
     plan = orderpad.bracket_plan(snapshot)
-    assert plan.stop_price == pytest.approx(round(snapshot.stop_price, 2))
-    assert plan.target_price == pytest.approx(round(snapshot.target_price, 2))
+    preview = orderpad.recompute_bracket_exit(snapshot.price, snapshot)
+    assert plan.stop_price == preview.stop_limit_price
+    assert plan.stop_trigger_price == preview.stop_trigger_price
+    assert plan.target_price == preview.target_price
     assert plan.quantity == snapshot.shares
 
 
@@ -192,3 +199,69 @@ def test_oca_group_is_unique_per_arm(tunables):
     a = orderpad.build_snapshot(make_state(symbol="AAA"), tunables, NOW)
     b = orderpad.build_snapshot(make_state(symbol="BBB"), tunables, NOW)
     assert orderpad.bracket_plan(a).oca_group != orderpad.bracket_plan(b).oca_group
+
+
+# -- recompute_bracket_exit --------------------------------------------------
+# The 2026-09-17 fix: the stop LIMIT is the real, risk-math stop
+# (fill_price - stop_distance); the TRIGGER sits above it so the order wakes
+# early. Previously inverted -- the computed stop was used as the trigger
+# with the limit a flat $0.02 below it, which realized worse-than-risk_usd
+# losses on every stopped trade (see config.STOP_TRIGGER_LEAD_PCT).
+
+
+def test_stop_limit_is_the_real_stop_and_trigger_sits_above_it(tunables):
+    snapshot = orderpad.build_snapshot(make_state(last=4.12), tunables, NOW)
+    exit_prices = orderpad.recompute_bracket_exit(4.12, snapshot)
+    assert exit_prices.stop_limit_price == pytest.approx(4.12 - snapshot.stop_distance, abs=0.01)
+    assert exit_prices.stop_trigger_price > exit_prices.stop_limit_price
+    expected_lead = snapshot.stop_distance * snapshot.stop_trigger_lead_pct
+    assert exit_prices.stop_trigger_price == pytest.approx(
+        exit_prices.stop_limit_price + expected_lead, abs=0.01
+    )
+
+
+def test_recompute_uses_the_fill_price_not_the_armed_price(tunables):
+    """Entry slippage must not silently widen realized risk: the stop has to
+    re-anchor to the real fill, not the (possibly stale) armed price."""
+    snapshot = orderpad.build_snapshot(make_state(last=2.26), tunables, NOW)
+    armed = orderpad.recompute_bracket_exit(2.26, snapshot)
+    filled_high = orderpad.recompute_bracket_exit(2.28, snapshot)  # filled 2c above armed
+    assert filled_high.stop_limit_price > armed.stop_limit_price
+    # The realized distance from the ACTUAL fill to the new stop must still
+    # equal stop_distance -- risk_usd protected regardless of where the
+    # entry filled.
+    assert (2.28 - filled_high.stop_limit_price) == pytest.approx(snapshot.stop_distance, abs=0.01)
+
+
+def test_recompute_ticks_sub_dollar_names_finer_than_a_penny(tunables):
+    state = make_state(last=0.85, bid=0.8495, ask=0.8505, atr=0.0537)
+    snapshot = orderpad.build_snapshot(state, tunables, NOW)
+    exit_prices = orderpad.recompute_bracket_exit(0.85, snapshot)
+    # 0.7963 is not a multiple of $0.01 -- proves the $0.0001 tick was
+    # actually applied, not just the general 2-decimal rounding (which would
+    # have given 0.80 instead).
+    assert exit_prices.stop_limit_price == pytest.approx(0.7963)
+    assert round(exit_prices.stop_limit_price, 2) != exit_prices.stop_limit_price
+
+
+def test_recompute_widens_a_trigger_that_collapses_onto_the_limit(tunables):
+    """A near-zero lead can round the trigger onto the exact same tick as
+    the limit -- IB requires the trigger to sit outside the limit for a SELL
+    STP LMT, so this must widen by one tick rather than submit two equal
+    prices."""
+    tunables.stop_trigger_lead_pct = 0.0001  # rounds away to nothing
+    snapshot = orderpad.build_snapshot(make_state(last=4.12), tunables, NOW)
+    exit_prices = orderpad.recompute_bracket_exit(4.12, snapshot)
+    assert exit_prices.stop_trigger_price > exit_prices.stop_limit_price
+    from momentum_scanner.sizing import tick_size
+    assert exit_prices.stop_trigger_price == pytest.approx(
+        exit_prices.stop_limit_price + tick_size(exit_prices.stop_limit_price)
+    )
+
+
+def test_recompute_target_uses_fill_price_and_frozen_r_multiple(tunables):
+    snapshot = orderpad.build_snapshot(make_state(last=4.12), tunables, NOW)
+    exit_prices = orderpad.recompute_bracket_exit(4.14, snapshot)
+    assert exit_prices.target_price == pytest.approx(
+        4.14 + snapshot.stop_distance * snapshot.nominal_r, abs=0.01
+    )
