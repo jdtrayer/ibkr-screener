@@ -162,6 +162,12 @@ class OrderPadWindow:
         # press must work regardless of which widget inside the pad holds it.
         self._root.bind_all(f"<{config.ORDER_PAD_FIRE_KEY}>", lambda _e: self._fire())
         self._root.bind_all("<Escape>", lambda _e: self._on_disarm())
+        # Same arm key as the scanner TUI (Tk keysyms are uppercase where
+        # Textual's are lowercase), so a drifted/blocked snapshot can be
+        # refreshed without alt-tabbing back to reacquire the row cursor.
+        # Re-arms whatever symbol is currently on screen -- there's no row
+        # cursor here, so this is a no-op while fully disarmed.
+        self._root.bind_all(f"<{config.ORDER_PAD_ARM_KEY.upper()}>", lambda _e: self._rearm())
 
     # -- app-facing API ----------------------------------------------------
 
@@ -244,6 +250,11 @@ class OrderPadWindow:
         if self.snapshot is None:
             return
         self._on_fire()
+
+    def _rearm(self) -> None:
+        if self.snapshot is None:
+            return
+        self._on_manual_arm(self.snapshot.symbol)
 
     def _on_entry_submit(self, _event) -> None:
         symbol = self._entry.get().strip().upper()

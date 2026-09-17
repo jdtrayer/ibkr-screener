@@ -549,10 +549,13 @@ ORDER_PAD_MAX_QUOTE_AGE_SEC = 5.0
 ORDER_PAD_STATE_FILE = "./cache/order_pad_window.json"
 ORDER_PAD_DEFAULT_GEOMETRY = "300x150+40+40"
 
-# Arm is pressed in the scanner TUI (where the row cursor already is), fire
-# in the pad itself (which takes focus on arm, so firing is one keypress
-# with no focus dance). Two different key-name conventions, unavoidably:
-# Textual spells function keys lowercase, Tk uses X keysyms.
+# Arm is pressed in the scanner TUI (where the row cursor already is) to
+# arm a new symbol, and also bound inside the pad itself to re-arm whatever
+# symbol is already on screen (e.g. after a drift block) without alt-tabbing
+# back for the row cursor. Fire is pad-only (which takes focus on arm, so
+# firing is one keypress with no focus dance). Two different key-name
+# conventions, unavoidably: Textual spells function keys lowercase, Tk uses
+# X keysyms (padwindow.py upper-cases ORDER_PAD_ARM_KEY for its own bind).
 #
 # Both are deliberately function keys rather than letters: the sidebar's
 # non-tradable Input swallows printable keys whenever it has focus, which
