@@ -1066,6 +1066,33 @@ class ScannerApp(App):
         bracket.realized_stop_trigger = exit_prices.stop_trigger_price
         bracket.realized_target_price = exit_prices.target_price
 
+        # Entry slippage, in dollars -- planned_risk_usd is the frozen,
+        # arm-time number (shares * stop_distance); actual_risk_usd is what
+        # the JUST-recomputed stop actually locks in for the shares filled
+        # so far (filled * distance-to-the-real-stop), so the two land on
+        # the same value once the fix is working, with only tick-rounding
+        # residue between them -- logged on every PARENT_FILL so the gap (or
+        # lack of one) is visible without recomputing it from the snapshot.
+        armed_price = bracket.snapshot.price
+        slip = fill_price - armed_price
+        planned_risk_usd = bracket.snapshot.risk_usd
+        actual_risk_usd = filled * (fill_price - exit_prices.stop_limit_price)
+        # The parent's entry_limit already caps how far a BUY can slip
+        # (marketable limit at armed_price + drift_allowance), so this
+        # should never trip -- if it does, the fill landed worse than the
+        # fire-time drift check + entry_limit should have permitted, and
+        # that gap is worth knowing about immediately, not just in the log.
+        slip_exceeds_drift_allowance = abs(slip) > bracket.snapshot.drift_allowance
+        if slip_exceeds_drift_allowance:
+            log.warning(
+                "Order pad %s filled %.4f, slipped %.4f from armed %.4f -- exceeds the "
+                "%.4f drift allowance checked at fire time (entry_limit was %.4f); the "
+                "fill landed worse than the drift check + entry_limit should have "
+                "permitted -- check for a gap between them",
+                bracket.plan.symbol, fill_price, slip, armed_price,
+                bracket.snapshot.drift_allowance, bracket.plan.entry_limit,
+            )
+
         # STP LMT, not plain STP: confirmed live 2026-09-17 (TURB) that a
         # plain stop order's outsideRth flag is silently ignored on US
         # stocks -- IB's own IB 2109 warning says as much ("ignored based on
@@ -1133,6 +1160,11 @@ class ScannerApp(App):
             realized_stop_price=exit_prices.stop_limit_price,
             realized_stop_trigger_price=exit_prices.stop_trigger_price,
             realized_target_price=exit_prices.target_price,
+            armed_price=armed_price,
+            slip=slip,
+            planned_risk_usd=planned_risk_usd,
+            actual_risk_usd=actual_risk_usd,
+            slip_exceeds_drift_allowance=slip_exceeds_drift_allowance,
         )
 
     def _on_pad_parent_cancelled(self, trade: Trade) -> None:

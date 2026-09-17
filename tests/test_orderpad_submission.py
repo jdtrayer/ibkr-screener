@@ -204,6 +204,51 @@ def test_entry_slippage_does_not_widen_realized_risk():
     assert stop.lmtPrice > bracket.plan.stop_price
 
 
+def test_parent_fill_logs_slip_and_planned_vs_actual_risk():
+    """User's ask: armed_price/fill_price/slip/planned_risk_usd/
+    actual_risk_usd inline on PARENT_FILL, without cross-referencing the ARM
+    record -- and the two risk figures should land on the same value (tick
+    rounding aside) once the fix is working."""
+    state = make_state("CVDK", last=2.26)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+    snapshot = app._pad_order_ids[parent.orderId].snapshot
+
+    add_fill(parent_trade, shares=snapshot.shares, price=2.28)
+    app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
+
+    record = next(r for r in _read_order_history() if r["event"] == "PARENT_FILL")
+    assert record["armed_price"] == pytest.approx(2.26)
+    assert record["avg_fill_price"] == pytest.approx(2.28)
+    assert record["slip"] == pytest.approx(0.02)
+    assert record["planned_risk_usd"] == pytest.approx(snapshot.risk_usd)
+    assert record["actual_risk_usd"] == pytest.approx(snapshot.risk_usd, abs=0.05)
+    assert record["slip_exceeds_drift_allowance"] is False
+
+
+def test_slip_past_the_drift_allowance_is_flagged(caplog):
+    """The entry_limit should make this unreachable in practice (a BUY can't
+    fill above armed_price + drift_allowance) -- this proves the flag fires
+    if it somehow does, rather than silently logging a normal-looking fill."""
+    state = make_state("CVDK", last=2.26)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+    snapshot = app._pad_order_ids[parent.orderId].snapshot
+    blown_through = 2.26 + snapshot.drift_allowance * 3  # well past what entry_limit permits
+
+    add_fill(parent_trade, shares=snapshot.shares, price=blown_through)
+    with caplog.at_level("WARNING"):
+        app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
+
+    assert any("drift allowance" in r.message for r in caplog.records)
+    record = next(r for r in _read_order_history() if r["event"] == "PARENT_FILL")
+    assert record["slip_exceeds_drift_allowance"] is True
+
+
 def test_second_fill_resizes_the_same_protective_orders_instead_of_stacking():
     state = make_state("CVDK", last=4.12)
     state.conid = 12345
