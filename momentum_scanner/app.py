@@ -898,8 +898,17 @@ class ScannerApp(App):
         """Send the parent (entry) leg standalone -- not IB's own linked
         bracket -- because the stop/target legs are sized from the actual
         fill, not the requested quantity (see orderpad.BracketPlan). They get
-        created in _on_pad_parent_fill once the first fill reports in."""
-        contract = Stock(conId=state.conid)
+        created in _on_pad_parent_fill once the first fill reports in.
+
+        conId alone identifies the security but is NOT enough for
+        placeOrder -- unlike _contract_for_news's bare-conId contract (only
+        used for reqHistoricalNewsAsync), IB's order validation rejects a
+        contract with no exchange ("Error 321: Missing order exchange"),
+        confirmed against IB's own contract-by-conId docs, which pair conId
+        with an explicit exchange in every example. SMART/USD matches every
+        other contract built in this codebase (_add_symbol, rvol.py,
+        scorer.py)."""
+        contract = Stock(conId=state.conid, exchange="SMART", currency="USD")
         parent = LimitOrder(
             "BUY", plan.quantity, plan.entry_limit,
             tif="DAY", outsideRth=True, orderRef=plan.oca_group,

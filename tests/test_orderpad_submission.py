@@ -93,6 +93,10 @@ def test_fire_submits_a_marketable_limit_parent():
     assert len(app.ib.placed) == 1
     contract, order = app.ib.placed[0]
     assert contract.conId == 12345
+    # Regression: conId alone isn't enough for placeOrder -- IB rejected a
+    # bare-conId contract live with "Error 321: Missing order exchange."
+    assert contract.exchange == "SMART"
+    assert contract.currency == "USD"
     assert isinstance(order, LimitOrder)
     assert order.action == "BUY"
     assert order.tif == "DAY"
