@@ -58,10 +58,17 @@ def tick_size(price: float) -> float:
     return 0.0001 if price < 1.0 else 0.01
 
 
-def round_to_tick(price: float) -> float:
-    tick = tick_size(price)
+def round_to_tick(value: float, reference: float | None = None) -> float:
+    """Round `value` to the applicable tick. `reference` picks which tick
+    tier applies (< $1 vs >= $1) when `value` isn't itself a price whose own
+    magnitude should decide that -- rounding a STOP DISTANCE (e.g. 0.106) by
+    its own magnitude would wrongly classify it as a sub-$1 price and use
+    the $0.0001 tick; it needs the tier of the PRICE it will be subtracted
+    from. Defaults to `value` itself, which is correct for rounding an
+    actual price (the common case, e.g. an already-computed stop/target)."""
+    tick = tick_size(value if reference is None else reference)
     decimals = 4 if tick == 0.0001 else 2
-    return round(round(price / tick) * tick, decimals)
+    return round(round(value / tick) * tick, decimals)
 
 
 def _commission_per_order(shares: int, price: float, pass_through_per_share: float) -> float:
@@ -91,6 +98,22 @@ def compute_sizing(price: float, tick: LiveTick, atr_value: float | None, tunabl
     atr_distance = (atr_value or 0.0) * tunables.atr_multiplier
     spread_floor = (spread_abs or 0.0) * tunables.min_spreads
     stop_distance = max(atr_distance, spread_floor)
+
+    if stop_distance > 0:
+        # Round to the tick BEFORE sizing shares from it and deriving
+        # stop_price by plain subtraction -- not after. Rounding the
+        # resulting PRICE instead (the old order of operations) leaves
+        # shares computed against a distance the actual stop order can't
+        # exactly honor: confirmed live 2026-09-17, order 31872 -- 94sh *
+        # 0.106 = $9.96 planned, but the stop price independently rounds to
+        # imply a 0.11 distance, realizing $10.34. Not a rounding-noise
+        # residual, an order-of-operations bug: shares and the stop price
+        # have to be derived from the SAME (already-rounded) distance for
+        # planned and actual risk to match exactly. reference=price, not
+        # stop_distance itself, so the tick tier matches the PRICE the
+        # distance is subtracted from, not the (usually much smaller)
+        # distance's own magnitude.
+        stop_distance = round_to_tick(stop_distance, reference=price)
 
     if stop_distance <= 0:
         return SizingResult(

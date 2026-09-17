@@ -3,6 +3,8 @@ with stop-distance-first sizing: max(ATR, spread floor) drives shares, not
 the other way around. Real money math, so these pin the formula down
 precisely rather than just smoke-testing it -- see sizing.py's module
 docstring for the spec."""
+import math
+
 import pytest
 
 from momentum_scanner.models import LiveTick
@@ -198,3 +200,45 @@ def test_round_to_tick_rounds_penny_stocks_to_two_decimals():
 def test_round_to_tick_rounds_sub_dollar_names_to_four_decimals():
     assert round_to_tick(0.85006) == pytest.approx(0.8501)
     assert round_to_tick(0.85002) == pytest.approx(0.8500)
+
+
+def test_round_to_tick_uses_the_reference_tier_not_the_values_own_magnitude():
+    """A stop DISTANCE like 0.106 is smaller than $1, but the price it's
+    being subtracted from (2.04) is not -- rounding by the distance's own
+    magnitude would wrongly apply the sub-dollar $0.0001 tick."""
+    assert round_to_tick(0.106, reference=2.04) == pytest.approx(0.11)
+    assert round_to_tick(0.106) == pytest.approx(0.106)  # no reference: rounds by its own (wrong) tier
+
+
+# -- stop_distance is tick-rounded BEFORE shares are sized from it ----------
+# Order of operations matters: sizing shares from the raw distance, then
+# rounding the resulting stop price independently, lets the two disagree.
+# Confirmed live 2026-09-17, order 31872: 94sh * 0.106 = $9.96 planned, but
+# the stop price rounds to imply a 0.11 distance, realizing $10.34.
+
+
+def test_stop_distance_is_tick_rounded_before_sizing_shares():
+    tick = make_tick(2.035, 2.045)  # spread_abs = 0.01
+    t = base_tunables(min_spreads=8, atr_multiplier=1.0, risk_usd=10.0, r_multiple=2.0)
+    r = compute_sizing(2.04, tick, atr_value=0.106, tunables=t)  # atr_distance 0.106 > spread_floor 0.08
+
+    assert r.stop_distance == pytest.approx(0.11)
+    assert r.shares == 90  # floor(10.0 / 0.11), not floor(10.0 / 0.106) == 94
+    assert r.stop_price == pytest.approx(1.93)
+
+    # The point of the fix: shares and the stop price now derive from the
+    # SAME rounded distance, so planned risk (shares * stop_distance) equals
+    # what stopping out at stop_price actually realizes.
+    realized_risk = r.shares * (2.04 - r.stop_price)
+    planned_risk = r.shares * r.stop_distance
+    assert realized_risk == pytest.approx(planned_risk)
+
+    # Regression check: the OLD order of operations -- shares sized from the
+    # RAW 0.106 distance, the resulting price rounded independently after --
+    # would have sized 94sh against a price that actually implies 0.11, a
+    # ~$0.38 planned-vs-realized gap that this fix eliminates.
+    old_shares = math.floor(t.risk_usd / 0.106)
+    assert old_shares == 94
+    old_realized_risk = old_shares * 0.11
+    old_planned_risk = old_shares * 0.106
+    assert old_realized_risk - old_planned_risk == pytest.approx(0.376, abs=0.01)
