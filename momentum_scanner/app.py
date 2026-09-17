@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -17,7 +17,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header
 
-from . import atr, config, country, display, floatref, orderpad, rvol, short_interest, spikes, trend
+from . import atr, config, country, display, floatref, order_history, orderpad, rvol, short_interest, spikes, trend
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
 from .padwindow import OrderPadWindow
@@ -155,6 +155,10 @@ class ScannerApp(App):
         # set for consistency with the other hold-outs above, though only one
         # symbol is ever armed at a time.
         self._pinned: set[str] = set()
+        # Symbols currently being subscribed on demand for a manually-typed
+        # pad arm (see _on_pad_manual_arm) -- guards against a second F2/Enter
+        # while the qualify/subscribe pipeline for the first one is in flight.
+        self._manual_pending: set[str] = set()
         self.pad: OrderPadWindow | None = None
         self._pad_pump_task: asyncio.Task | None = None
         # Every orderId belonging to a live pad-submitted bracket (parent,
@@ -201,6 +205,10 @@ class ScannerApp(App):
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
         self.ib.errorEvent += self._on_ib_order_error
+        # Commission arrives on its own event, after the fill it belongs to
+        # (see wrapper.commissionReport) -- global on the IB object, like
+        # errorEvent, so the handler filters down to pad-tracked orders.
+        self.ib.commissionReportEvent += self._on_pad_commission_report
         self.float_map = floatref.load()
         self._load_non_tradable()
         await self.news.load_providers()
@@ -796,18 +804,78 @@ class ScannerApp(App):
     def action_arm_pad(self) -> None:
         symbol = self._cursor_symbol()
         if symbol is None:
-            self.notify("Nothing under the cursor to arm", severity="warning")
+            # Nothing under the cursor -- most likely a symbol the user wants
+            # to trade isn't on either table at all. Raise the pad (if it
+            # isn't already up) so they can type it into the manual-entry box
+            # rather than just telling them F2 didn't find anything.
+            if self.pad is not None:
+                self.pad.prompt_manual_entry()
+            else:
+                self.notify("Order pad is not available", severity="warning")
             return
         self._arm(symbol)
 
     def _on_pad_manual_arm(self, symbol: str) -> None:
-        """Typed-symbol fallback. Only symbols that are already live can be
-        armed: sizing needs a price, a spread and an ATR, all of which come
-        from a live subscription this symbol would not have."""
+        """Typed-symbol path. A symbol already live arms immediately; one
+        that isn't gets admitted on demand -- the same qualify/subscribe
+        pipeline a scan hit goes through -- so a name outside the scan/scorer
+        universe can still be sized and fired from here."""
+        if symbol in self.states:
+            self._arm(symbol)
+            return
+        if symbol in self._ignored_until or symbol in self._dead_hold or symbol in self._excluded_stock_types:
+            if self.pad:
+                self.pad.disarm(f"{symbol} is held out (non-tradable / dead-hold / excluded type)")
+            return
+        if symbol in self._manual_pending:
+            return  # already being subscribed from an earlier Enter/F2
+        asyncio.create_task(self._admit_manual(symbol))
+
+    async def _admit_manual(self, symbol: str) -> None:
+        """On-demand admission for a symbol typed into the pad that isn't in
+        the live pool. Bumps a slot exactly the way a qualifying scan hit
+        would (same bump_candidate call, same pressure-only rule: only a
+        weak occupant gets bumped, never a healthy one just to make room) --
+        a manual request is demand too, but it doesn't get to skip the gate
+        that everything else goes through."""
+        non_scorer_states = {s: st for s, st in self.states.items() if st.scan_source != "SCORER"}
+        if len(non_scorer_states) >= self.tunables.max_live_symbols - self.tunables.scorer_reserved_slots:
+            now = datetime.now(config.TZ)
+            bump = bump_candidate(non_scorer_states, self.session, now, pinned=self._pinned)
+            if bump is None:
+                if self.pad:
+                    self.pad.disarm(f"{symbol}: pool full, nothing bump-eligible")
+                return
+            log.info(
+                "Bumped %s (%s) to admit %s (order pad, manual entry); re-entry barred for %.0fs",
+                bump.symbol, bump_reason(bump, self.session), symbol, self.tunables.slot_reentry_cooldown_sec,
+            )
+            self._remove_symbol(bump.symbol)
+            self._slot_cooldown[bump.symbol] = now
+
+        self._manual_pending.add(symbol)
+        if self.pad:
+            self.pad.disarm(f"subscribing to {symbol}...")
+        try:
+            await self._add_symbol(ScanHit(symbol=symbol, con_id=0, rank=None, source="PAD"))
+        finally:
+            self._manual_pending.discard(symbol)
+
         if symbol not in self.states:
             if self.pad:
-                self.pad.disarm(f"{symbol} is not in the live pool")
+                self.pad.disarm(f"{symbol}: could not subscribe (bad symbol or excluded type)")
             return
+
+        # Give the fresh subscription a few seconds to deliver a first tick
+        # before falling back to _arm's own "has no price yet" message --
+        # ATR/tick data land asynchronously right after _add_symbol returns.
+        for _ in range(20):
+            state = self.states.get(symbol)
+            if state is None:
+                break
+            if orderpad.build_snapshot(state, self.tunables, datetime.now(config.TZ)) is not None:
+                break
+            await asyncio.sleep(0.5)
         self._arm(symbol)
 
     def _arm(self, symbol: str) -> None:
@@ -831,6 +899,18 @@ class ScannerApp(App):
             snapshot.target_price, snapshot.risk_usd,
             f"{snapshot.stop_in_spreads:.1f}" if snapshot.stop_in_spreads is not None else "unknown",
             f"{snapshot.effective_r:.2f}" if snapshot.effective_r is not None else "unknown",
+        )
+        order_history.log_event(
+            snapshot.armed_at, "ARM",
+            symbol=symbol,
+            session=self.session.value,
+            dry_run=self.tunables.order_pad_dry_run,
+            scan_source=state.scan_source,
+            scan_rank=state.scan_rank,
+            conid=state.conid,
+            atr_value=atr.atr_value(state.atr),
+            tunables=asdict(self.tunables),
+            snapshot=orderpad.snapshot_to_dict(snapshot),
         )
 
     def _on_pad_disarm(self) -> None:
@@ -858,13 +938,24 @@ class ScannerApp(App):
             return
         snapshot = self.pad.snapshot
         state = self.states.get(snapshot.symbol)
+        now = datetime.now(config.TZ)
         reason = orderpad.validate_fire(
-            snapshot, state, datetime.now(config.TZ),
+            snapshot, state, now,
             non_tradable_listed=snapshot.symbol in self._ignored_until,
         )
         if reason is not None:
             log.info("Order pad REFUSED to fire %s: %s", snapshot.symbol, reason)
             self.pad.show_block(reason)
+            order_history.log_event(
+                now, "FIRE_BLOCKED",
+                symbol=snapshot.symbol,
+                reason=reason,
+                snapshot=orderpad.snapshot_to_dict(snapshot),
+                live_price=state.tick.last if state else None,
+                live_bid=state.tick.bid if state else None,
+                live_ask=state.tick.ask if state else None,
+                quote_age_sec=orderpad.quote_age_sec(state, now),
+            )
             return
 
         plan = orderpad.bracket_plan(snapshot)
@@ -875,6 +966,12 @@ class ScannerApp(App):
             # testing is exactly what the live path will send.
             log.info("Order pad DRY RUN (dry run on) -- would submit: %s", plan.describe())
             self.pad.show_result(f"DRY RUN: {plan.quantity}sh @ {plan.entry_limit:.2f}")
+            order_history.log_event(
+                now, "FIRE_DRY_RUN",
+                symbol=snapshot.symbol,
+                snapshot=orderpad.snapshot_to_dict(snapshot),
+                plan=orderpad.bracket_plan_to_dict(plan),
+            )
             return
 
         if config.IB_PORT not in config.ORDER_PAD_PAPER_PORTS:
@@ -892,9 +989,11 @@ class ScannerApp(App):
             self.pad.show_block("no qualified contract yet")
             return
 
-        self._submit_pad_bracket(plan, state)
+        self._submit_pad_bracket(plan, snapshot, state)
 
-    def _submit_pad_bracket(self, plan: orderpad.BracketPlan, state: SymbolState) -> None:
+    def _submit_pad_bracket(
+        self, plan: orderpad.BracketPlan, snapshot: orderpad.ArmedSnapshot, state: SymbolState,
+    ) -> None:
         """Send the parent (entry) leg standalone -- not IB's own linked
         bracket -- because the stop/target legs are sized from the actual
         fill, not the requested quantity (see orderpad.BracketPlan). They get
@@ -924,8 +1023,16 @@ class ScannerApp(App):
         )
         if self.pad:
             self.pad.show_result(f"SENT {plan.quantity}sh @ {plan.entry_limit:.2f}")
+        order_history.log_event(
+            datetime.now(config.TZ), "SUBMITTED",
+            symbol=plan.symbol,
+            order_id=trade.order.orderId,
+            conid=state.conid,
+            snapshot=orderpad.snapshot_to_dict(snapshot),
+            plan=orderpad.bracket_plan_to_dict(plan),
+        )
 
-    def _on_pad_parent_fill(self, trade: Trade, _fill) -> None:
+    def _on_pad_parent_fill(self, trade: Trade, fill) -> None:
         """A parent fill (partial or full) arrived -- (re)create the stop and
         target legs sized to shares actually held so far. Reuses the existing
         stop/target orderIds on a later fill so this is a resize (placeOrder
@@ -953,6 +1060,15 @@ class ScannerApp(App):
         target = LimitOrder("SELL", filled, bracket.plan.target_price, tif="DAY", outsideRth=True)
         stop.ocaGroup = target.ocaGroup = bracket.plan.oca_group
         stop.ocaType = target.ocaType = 1  # cancel the other leg outright once either fills
+        # First creation vs. a later resize: placeOrder with an existing
+        # orderId modifies in place and hands back the SAME Trade object
+        # (ib_async keys its trade table on (clientId, orderId) once orderId
+        # is set -- confirmed against ib_async's own placeOrder/orderKey), so
+        # subscribing fillEvent/cancelledEvent only here, on first creation,
+        # is both necessary and sufficient -- a resize would otherwise stack
+        # a duplicate handler on the same object and double-log the eventual
+        # exit fill.
+        first_creation = bracket.stop_trade is None
         if bracket.stop_trade is not None:
             stop.orderId = bracket.stop_trade.order.orderId
         if bracket.target_trade is not None:
@@ -962,6 +1078,11 @@ class ScannerApp(App):
         bracket.target_trade = self.ib.placeOrder(bracket.contract, target)
         self._pad_order_ids[bracket.stop_trade.order.orderId] = bracket
         self._pad_order_ids[bracket.target_trade.order.orderId] = bracket
+        if first_creation:
+            bracket.stop_trade.fillEvent += self._on_pad_exit_fill
+            bracket.stop_trade.cancelledEvent += self._on_pad_exit_cancelled
+            bracket.target_trade.fillEvent += self._on_pad_exit_fill
+            bracket.target_trade.cancelledEvent += self._on_pad_exit_cancelled
 
         log.info(
             "Order pad %s filled %d/%d -- protective stop %.2f / target %.2f now cover %d sh",
@@ -970,6 +1091,23 @@ class ScannerApp(App):
         )
         if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
             self.pad.show_result(f"FILLED {filled}/{bracket.plan.quantity} -- stop/target live")
+        order_history.log_event(
+            datetime.now(config.TZ), "PARENT_FILL",
+            symbol=bracket.plan.symbol,
+            order_id=trade.order.orderId,
+            filled=filled,
+            planned_quantity=bracket.plan.quantity,
+            fill_price=fill.execution.price,
+            fill_avg_price=fill.execution.avgPrice,
+            fill_cum_qty=fill.execution.cumQty,
+            commission=fill.commissionReport.commission,
+            entry_limit=bracket.plan.entry_limit,
+            stop_order_id=bracket.stop_trade.order.orderId,
+            stop_price=bracket.plan.stop_price,
+            stop_limit=stop_limit,
+            target_order_id=bracket.target_trade.order.orderId,
+            target_price=bracket.plan.target_price,
+        )
 
     def _on_pad_parent_cancelled(self, trade: Trade) -> None:
         bracket = self._pad_order_ids.get(trade.order.orderId)
@@ -984,6 +1122,89 @@ class ScannerApp(App):
             del self._pad_order_ids[trade.order.orderId]
             if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
                 self.pad.show_result("order cancelled, nothing filled")
+        order_history.log_event(
+            datetime.now(config.TZ), "PARENT_CANCELLED",
+            symbol=bracket.plan.symbol,
+            order_id=trade.order.orderId,
+            filled=filled,
+            planned_quantity=bracket.plan.quantity,
+        )
+
+    def _leg_name(self, bracket: _PadBracket, order_id: int) -> str:
+        if bracket.stop_trade is not None and order_id == bracket.stop_trade.order.orderId:
+            return "STOP"
+        return "TARGET"
+
+    def _on_pad_exit_fill(self, trade: Trade, fill) -> None:
+        """The stop or target leg filled, partially or fully -- this is how
+        a position actually closes. Wired once per bracket, right when the
+        legs are first created (see _on_pad_parent_fill), off IB's own
+        execDetails stream -- the same mechanism (not market data) that
+        already delivers the parent's fills, so it fires whether or not the
+        symbol still holds one of the live pool's slots."""
+        bracket = self._pad_order_ids.get(trade.order.orderId)
+        if bracket is None:
+            return
+        leg = self._leg_name(bracket, trade.order.orderId)
+        filled = int(trade.filled())
+        log.info(
+            "Order pad %s %s leg filled %d/%d @ %.2f",
+            bracket.plan.symbol, leg, filled, bracket.plan.quantity, fill.execution.price,
+        )
+        if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+            self.pad.show_result(f"{leg} FILLED {filled}sh @ {fill.execution.price:.2f}")
+        order_history.log_event(
+            datetime.now(config.TZ), "EXIT_FILL",
+            symbol=bracket.plan.symbol,
+            leg=leg,
+            order_id=trade.order.orderId,
+            filled=filled,
+            planned_quantity=bracket.plan.quantity,
+            fill_price=fill.execution.price,
+            fill_avg_price=fill.execution.avgPrice,
+            fill_cum_qty=fill.execution.cumQty,
+            commission=fill.commissionReport.commission,
+            entry_limit=bracket.plan.entry_limit,
+            stop_price=bracket.plan.stop_price,
+            target_price=bracket.plan.target_price,
+        )
+
+    def _on_pad_exit_cancelled(self, trade: Trade) -> None:
+        """The sibling of whichever leg just filled -- IB's OCA group
+        (ocaType=1) cancels it automatically. Expected, not an error; logged
+        so the order history shows the whole bracket resolving rather than
+        one leg silently vanishing."""
+        bracket = self._pad_order_ids.get(trade.order.orderId)
+        if bracket is None:
+            return
+        leg = self._leg_name(bracket, trade.order.orderId)
+        log.info("Order pad %s %s leg cancelled (OCA -- other leg filled)", bracket.plan.symbol, leg)
+        order_history.log_event(
+            datetime.now(config.TZ), "EXIT_LEG_CANCELLED",
+            symbol=bracket.plan.symbol,
+            leg=leg,
+            order_id=trade.order.orderId,
+        )
+
+    def _on_pad_commission_report(self, trade: Trade, fill, report) -> None:
+        """Commission (and, for a closing fill, IB's own realizedPNL) arrives
+        on its own event after the fill it belongs to -- see ib_async's
+        wrapper.commissionReport, which patches the same Fill object
+        fillEvent already emitted. Global on the IB object like errorEvent
+        (fires for every fill on the account), so filtered down to
+        pad-tracked orders here."""
+        bracket = self._pad_order_ids.get(trade.order.orderId)
+        if bracket is None:
+            return
+        order_history.log_event(
+            datetime.now(config.TZ), "COMMISSION",
+            symbol=bracket.plan.symbol,
+            order_id=trade.order.orderId,
+            fill_price=fill.execution.price,
+            fill_shares=fill.execution.shares,
+            commission=report.commission,
+            realized_pnl=report.realizedPNL,
+        )
 
     def _on_ib_order_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
         """Surface an IB-side reject/warning for a pad-submitted order onto
@@ -995,6 +1216,13 @@ class ScannerApp(App):
         log.error(
             "Order pad %s order %d error %d: %s",
             bracket.plan.symbol, reqId, errorCode, errorString,
+        )
+        order_history.log_event(
+            datetime.now(config.TZ), "IB_ERROR",
+            symbol=bracket.plan.symbol,
+            order_id=reqId,
+            error_code=errorCode,
+            error_string=errorString,
         )
         if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
             self.pad.show_result(f"IB {errorCode}: {errorString}")

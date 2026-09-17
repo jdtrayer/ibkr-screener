@@ -15,6 +15,8 @@ screenshotting the real window, per memory: textual_ui_verification.
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+import pytest
+
 from momentum_scanner import config
 from momentum_scanner.app import ScannerApp
 from momentum_scanner.filters import bump_candidate
@@ -23,6 +25,14 @@ from momentum_scanner.session import Session
 from momentum_scanner.tunables import Tunables
 
 NOW = datetime(2026, 9, 16, 10, 30, tzinfo=config.TZ)
+
+
+@pytest.fixture(autouse=True)
+def isolated_order_history_dir(tmp_path, monkeypatch):
+    """Every arm/fire in this file writes a real order_history.log_event --
+    without this, every test run pollutes the real ./logs/orders/, same
+    reasoning as test_news.py's isolated_news_state_file."""
+    monkeypatch.setattr(config, "ORDER_HISTORY_DIR", str(tmp_path / "orders"))
 
 
 @dataclass
@@ -84,6 +94,7 @@ def make_app(states=(), persistence_streak=999) -> ScannerApp:
     app.states = {s.symbol: s for s in states}
     app.session = Session.REGULAR
     app._pinned = set()
+    app._manual_pending = set()
     app._pending_hits = {}
     app._slot_cooldown = {}
     app._dead_hold = {}
@@ -115,13 +126,18 @@ def test_arming_a_second_symbol_releases_the_first_pin():
     assert app._pinned == {"BBB"}
 
 
-def test_manual_arm_refuses_a_symbol_that_is_not_live():
-    """Sizing needs a price, a spread and an ATR -- all of which come from a
-    live subscription a non-pooled symbol doesn't have."""
+def test_manual_arm_refuses_a_held_out_symbol():
+    """A symbol on the manual non-tradable list, dead-held, or of an
+    excluded instrument type is refused synchronously and without touching
+    IB. A symbol that's merely unknown to the live pool instead goes through
+    on-demand admission (_admit_manual) -- the same qualify/subscribe
+    pipeline a scan hit uses, which is IB-integration and is verified live
+    rather than here (see memory: testing_approach)."""
     app = make_app([make_state("CVDK")])
+    app._ignored_until["NOPE"] = NOW + timedelta(hours=1)
     app._on_pad_manual_arm("NOPE")
     assert app._pinned == set()
-    assert "NOPE is not in the live pool" in app.pad.disarm_reasons
+    assert any("held out" in (r or "") for r in app.pad.disarm_reasons)
 
 
 def test_manual_arm_works_for_a_live_symbol():

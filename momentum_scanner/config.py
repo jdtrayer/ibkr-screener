@@ -582,3 +582,9 @@ ORDER_PAD_DEFAULT_GEOMETRY = "300x150+40+40"
 # so a slipped finger on the arm key can't land on fire.
 ORDER_PAD_ARM_KEY = "f2"    # Textual binding, pressed in the scanner TUI
 ORDER_PAD_FIRE_KEY = "F4"   # Tk keysym, pressed in the pad
+
+# One JSON-lines file per trading day (see order_history.py) -- kept out of
+# cache/ since it's not disposable state to rebuild, it's a record meant to
+# be read (by a human or another agent checking the pricing math), same
+# reasoning that keeps it out of scanner.log too.
+ORDER_HISTORY_DIR = "./logs/orders"

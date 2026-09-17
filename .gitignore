@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 cache/
+logs/
 scanner.log
 premarket_scan_check.log
 .pytest_cache/

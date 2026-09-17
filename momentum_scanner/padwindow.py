@@ -194,6 +194,23 @@ class OrderPadWindow:
             return
         self._render()
 
+    def prompt_manual_entry(self) -> None:
+        """Raise the pad and focus its manual-entry box, without touching
+        whatever is currently armed (or not). For F2 pressed with nothing
+        under the row cursor -- typically a symbol the user wants to trade
+        that isn't on either table at all, so there's nothing to transfer in
+        and typing it is the only way in."""
+        if self._closed:
+            return
+        try:
+            self._root.deiconify()
+            self._root.lift()
+            self._root.attributes("-topmost", True)
+            self._root.focus_force()
+            self._entry.focus_set()
+        except tk.TclError:
+            self._closed = True
+
     def disarm(self, reason: str | None = None) -> None:
         """Clear the armed symbol. `reason` is shown for an involuntary
         disarm (the symbol left the pool, the session rolled over) so the pad

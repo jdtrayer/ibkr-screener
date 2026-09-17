@@ -24,7 +24,7 @@ Two ideas drive the design:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 
 from . import config
@@ -122,6 +122,20 @@ def build_snapshot(state: SymbolState, tunables: Tunables, now: datetime) -> Arm
     )
 
 
+def snapshot_to_dict(snapshot: ArmedSnapshot) -> dict:
+    """Every field on `snapshot` plus its derived properties (risk_usd,
+    drift_allowance, max_entry_price), for the order history log (see
+    order_history.py). That log exists so another agent can recompute this
+    against sizing.compute_sizing() and cross-check it, so nothing here is
+    rounded or summarized the way the pad's own display is."""
+    return {
+        **asdict(snapshot),
+        "risk_usd": snapshot.risk_usd,
+        "drift_allowance": snapshot.drift_allowance,
+        "max_entry_price": snapshot.max_entry_price,
+    }
+
+
 def quote_age_sec(state: SymbolState | None, now: datetime) -> float | None:
     """Seconds since this symbol last ticked. None if it has never ticked.
 
@@ -211,6 +225,12 @@ class BracketPlan:
             f"children OCA={self.oca_group}, sized from the parent's actual fill: "
             f"SELL STP LMT {self.stop_price:.2f}/{stop_limit:.2f} / SELL LMT {self.target_price:.2f}"
         )
+
+
+def bracket_plan_to_dict(plan: BracketPlan) -> dict:
+    """`plan`'s fields plus its human-readable describe() text, for the
+    order history log."""
+    return {**asdict(plan), "describe": plan.describe()}
 
 
 def bracket_plan(snapshot: ArmedSnapshot) -> BracketPlan:
