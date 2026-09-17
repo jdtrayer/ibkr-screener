@@ -504,3 +504,59 @@ TOP_DISPLAY_ROWS = 20       # rows rendered in the table
 # rows hold still while their cell values (price, RVOL, flags) keep updating
 # live in place -- avoids rows jumping around every 2s on minor RVOL noise.
 SORT_REFRESH_SEC = 8.0
+
+# --------------------------------------------------------------------------
+# Order pad (orderpad.py = logic, padwindow.py = the Tk window) -- a small
+# always-on-top bracket-entry window that sits over TWS, so the scanner's
+# own per-symbol sizing can be submitted with a keypress while your eyes are
+# on TWS's chart/Level 2/time-and-sales. Two-step: arm (transfer a FROZEN
+# sizing snapshot from the selected row) then fire (submit the bracket).
+#
+# The pad never computes sizing -- it calls sizing.compute_sizing(), the
+# same function display.py renders the table's Shares/Target/Stop columns
+# from. One source of truth; the pad shows exactly the numbers the row did.
+# --------------------------------------------------------------------------
+
+# Master switch for actually transmitting orders. While False, the fire key
+# runs every validation check and logs the exact bracket it WOULD have sent
+# without touching the order API at all -- that's the arm/display/validation
+# path, testable live against a real session with zero order risk. Flip this
+# only after that path has been watched through a real weekday session.
+ORDER_PAD_SUBMIT_ENABLED = False
+
+# How far the live price may drift from the ARMED price before firing is
+# refused, as a fraction of the armed stop distance. The pad deliberately
+# shows frozen numbers (a display that changes under your cursor is not
+# glanceable), which means the longer you sit armed, the more the displayed
+# risk/reward can diverge from reality -- a symbol that's run 25% of its
+# stop distance since arming no longer has the R that's on screen, so the
+# snapshot is stale by definition and has to be re-armed rather than fired.
+# Expressed against stop distance, not a fixed %/cents, so it self-scales:
+# a volatile wide-stop name gets proportionally more room than a tight one.
+ORDER_PAD_MAX_DRIFT_FRACTION = 0.25
+
+# Refuse to fire on a symbol that hasn't ticked at all in this long. Drift
+# is measured against the last price we received, so a feed that's gone
+# quiet makes the drift check itself meaningless -- it would compare the
+# armed price against an equally old price and happily conclude "no drift."
+# Short by design: this is a scalp pad, and a name worth firing on is one
+# that's actively printing.
+ORDER_PAD_MAX_QUOTE_AGE_SEC = 5.0
+
+# Window geometry (position + size), so the pad comes back where you left it
+# over TWS instead of wherever the WM decides. Same cache/ + plain-JSON
+# convention as NON_TRADABLE_STATE_FILE.
+ORDER_PAD_STATE_FILE = "./cache/order_pad_window.json"
+ORDER_PAD_DEFAULT_GEOMETRY = "300x150+40+40"
+
+# Arm is pressed in the scanner TUI (where the row cursor already is), fire
+# in the pad itself (which takes focus on arm, so firing is one keypress
+# with no focus dance). Two different key-name conventions, unavoidably:
+# Textual spells function keys lowercase, Tk uses X keysyms.
+#
+# Both are deliberately function keys rather than letters: the sidebar's
+# non-tradable Input swallows printable keys whenever it has focus, which
+# would silently eat an arm press. F3 is deliberately skipped between them
+# so a slipped finger on the arm key can't land on fire.
+ORDER_PAD_ARM_KEY = "f2"    # Textual binding, pressed in the scanner TUI
+ORDER_PAD_FIRE_KEY = "F4"   # Tk keysym, pressed in the pad

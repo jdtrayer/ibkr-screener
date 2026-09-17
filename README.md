@@ -297,6 +297,87 @@ rather than growing the panel. Holds expire at the next trading day
 (`config.NON_TRADABLE_STATE_FILE` persists them across a restart within
 the same day).
 
+## Order pad
+
+A small always-on-top window (~300x150, `padwindow.py`) that sits over TWS,
+so the scanner's own per-symbol sizing can be fired with a keypress while
+your eyes are on TWS's chart, Level 2 and time-and-sales. It runs in the
+same process as the scanner and shares its IB connection, so it reads live
+`SymbolState`s and calls `sizing.compute_sizing()` directly — the pad shows
+exactly the numbers the row does, because it isn't doing its own arithmetic.
+
+**Submission is currently disabled** (`config.ORDER_PAD_SUBMIT_ENABLED =
+False`). The fire key runs every validation check and logs the exact bracket
+it *would* have sent; nothing reaches the order API.
+
+### Arm, then fire
+
+| Key | Where | Does |
+| --- | --- | --- |
+| `F2` | scanner TUI | Arms the row under the cursor (main or scorer table) |
+| `F4` | the pad | Fires the bracket |
+| `Esc` | the pad | Disarms |
+
+Arm is pressed in the TUI, where the row cursor already is; the pad then
+takes keyboard focus, so firing is one keypress with no focus dance. Both
+are function keys because the sidebar's non-tradable `Input` swallows
+printable keys whenever it has focus. `F3` is deliberately skipped between
+them so a slipped finger on arm can't land on fire. Typing a symbol into the
+pad's entry field arms it too, as a fallback — but only for symbols already
+in the live pool, since sizing needs a price, a spread and an ATR that only
+a live subscription provides.
+
+### Frozen numbers
+
+Everything on the pad except the quote age is captured once, at arm time,
+and never recomputed. A pad whose numbers shift while you look at it isn't
+glanceable, which is the whole point of it sitting over TWS. The cost is
+that the snapshot goes stale, which is what the fire-time checks catch.
+
+### What refuses a fire
+
+Checked in this order, with the reason shown on the pad (status bar turns
+red, stays armed):
+
+1. **Symbol left the live pool** — nothing to validate against.
+2. **Marked non-tradable** (the manual list above).
+3. **Non-tradeable sizing** — shares below `min_shares`, or position over
+   `max_position_usd`, as evaluated at arm time.
+4. **Stale quote** — nothing has ticked in `ORDER_PAD_MAX_QUOTE_AGE_SEC`
+   (5s). Checked *before* drift on purpose: drift is measured against the
+   last price received, so on a dead feed the two prices agree perfectly and
+   a drift-first check would wave through exactly the case it exists to stop.
+5. **Price drift** — the live price has moved more than
+   `ORDER_PAD_MAX_DRIFT_FRACTION` (25%) of the armed stop distance from the
+   armed price. Expressed against stop distance rather than a fixed
+   percentage so it self-scales: a volatile wide-stop name gets
+   proportionally more room than a tight one. Requires a re-arm.
+
+### Slot pinning
+
+Arming pins the symbol's live slot, exempting it from **all four** eviction
+paths — bump (`filters.bump_candidate`), scorer swap, persistence decay and
+spike-quiet — until it's disarmed. Spike-quiet matters most here: it would
+otherwise fire on exactly the symbol you're likeliest to be armed on, one
+that popped and then went quiet for a minute while you waited for an entry.
+
+A pinned symbol is *live*, not queued, so it doesn't appear in any of the
+three slot-status counts. It does reduce effective capacity, so
+`_log_no_slot` names it rather than claiming every occupant is healthy.
+Removal for any reason a pin shouldn't override (session rollover, a manual
+non-tradable mark, a contract that won't qualify) disarms the pad, since a
+frozen snapshot with no live quote behind it can only ever be refused.
+
+### The bracket (not yet wired)
+
+A marketable-limit parent capped at `armed price + drift allowance` — it
+crosses the spread so it fills, but can never fill worse than the price that
+would have refused the trade — plus two OCA-grouped children (stop and
+target). The children are deliberately quantity-less in `BracketPlan`: their
+size has to come from the parent's *reported fill quantity*, because sizing
+them from the intended quantity leaves exits larger than the position on a
+partial fill, which IBKR then flags as a short sale.
+
 ## Related fixed thresholds (`config.py`, restart required)
 
 These aren't runtime-tunable but directly affect what you see: `PRICE_MIN`/`PRICE_MAX`

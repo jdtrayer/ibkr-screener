@@ -263,16 +263,26 @@ def bump_reason(state: SymbolState, session: Session) -> str:
 
 
 def bump_candidate(
-    states: dict[str, SymbolState], session: Session, now: datetime | None = None
+    states: dict[str, SymbolState],
+    session: Session,
+    now: datetime | None = None,
+    pinned: set[str] | frozenset[str] = frozenset(),
 ) -> SymbolState | None:
     """
     The weakest current occupant that may be bumped to admit a newly
     qualified symbol when all slots are full -- past warm-up, not spike-held,
-    and failing either the $ volume floor or the spread ceiling. This is the
-    ONLY eviction path for these two signals -- deliberately no idle timer --
-    so an occupant that's actually failing keeps its slot indefinitely as
-    long as nothing better is waiting for it; hidden from display (see
-    display_reason) but otherwise left alone.
+    not pinned, and failing either the $ volume floor or the spread ceiling.
+    This is the ONLY eviction path for these two signals -- deliberately no
+    idle timer -- so an occupant that's actually failing keeps its slot
+    indefinitely as long as nothing better is waiting for it; hidden from
+    display (see display_reason) but otherwise left alone.
+
+    `pinned` holds the order pad's armed symbol (app.py's _pinned): you can't
+    place a bracket against a frozen sizing snapshot whose live quote has
+    been unsubscribed out from under it, so an armed symbol keeps its slot
+    unconditionally until it's disarmed. Unlike spike_held/slot_warmed_up
+    above, that exemption also has to hold against the two _evict_unqualified
+    paths -- see app.py, which checks _pinned there too.
 
     Weakness on each axis is normalized to "how many threshold-multiples past
     the line" so the signals compare on equal footing rather than one axis
@@ -282,7 +292,7 @@ def bump_candidate(
     now = now or datetime.now(TZ)
     best, best_score = None, 0.0
     for s in states.values():
-        if not slot_warmed_up(s, now) or spike_held(s, now):
+        if s.symbol in pinned or not slot_warmed_up(s, now) or spike_held(s, now):
             continue
         score = max(_dv_weakness(s, session), _spread_weakness(s), _recent_volume_weakness(s, session))
         if score > best_score:

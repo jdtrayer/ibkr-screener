@@ -16,9 +16,10 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header
 
-from . import atr, config, country, display, floatref, rvol, short_interest, spikes, trend
+from . import atr, config, country, display, floatref, orderpad, rvol, short_interest, spikes, trend
 from .controls import SymbolActionsPanel, TunablesPanel
 from .news import NewsTracker
+from .padwindow import OrderPadWindow
 from .scorer import SnapshotScorer
 from .sentiment import SentimentClassifier
 from .filters import (
@@ -45,6 +46,13 @@ SORT_REFRESH_EVERY_N_TICKS = int(config.SORT_REFRESH_SEC / config.DISPLAY_REFRES
 
 
 class ScannerApp(App):
+    BINDINGS = [
+        # Arm is pressed here, in the TUI, because that's where the row
+        # cursor already is; fire is pressed in the pad, which takes focus on
+        # arm. See config.ORDER_PAD_ARM_KEY for why it's a function key.
+        (config.ORDER_PAD_ARM_KEY, "arm_pad", "Arm order pad"),
+    ]
+
     CSS = """
     #main-column {
         width: 1fr;
@@ -122,6 +130,14 @@ class ScannerApp(App):
         # even though none of them would ever actually get one.
         self._excluded_stock_types: set[str] = set()
         self._reconnecting = False
+        # The order pad's armed symbol. A live slot it holds is exempt from
+        # every eviction path (bump, scorer swap, persistence decay, spike-
+        # quiet) for as long as it's armed -- see _pinned_reason. Sized like a
+        # set for consistency with the other hold-outs above, though only one
+        # symbol is ever armed at a time.
+        self._pinned: set[str] = set()
+        self.pad: OrderPadWindow | None = None
+        self._pad_pump_task: asyncio.Task | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -183,6 +199,8 @@ class ScannerApp(App):
         # scrolling through the panel.
         news_table.zebra_stripes = True
         news_table.add_columns(*display.NEWS_TABLE_COLUMNS)
+
+        self._start_order_pad()
 
         self._render(reorder=True)
         self.set_interval(config.DISPLAY_REFRESH_SEC, self._tick)
@@ -462,7 +480,7 @@ class ScannerApp(App):
         non_scorer_states = {s: st for s, st in self.states.items() if st.scan_source != "SCORER"}
         if len(non_scorer_states) >= self.tunables.max_live_symbols - self.tunables.scorer_reserved_slots:
             now = datetime.now(config.TZ)
-            bump = bump_candidate(non_scorer_states, self.session, now)
+            bump = bump_candidate(non_scorer_states, self.session, now, pinned=self._pinned)
             if bump is None:
                 self._log_no_slot(symbol)
                 return
@@ -524,7 +542,8 @@ class ScannerApp(App):
                 continue  # at most one reserved-slot swap per sweep, to limit churn
             bumpable = [
                 s for s in scorer_syms
-                if slot_warmed_up(self.states[s], now) and not spike_held(self.states[s], now)
+                if s not in self._pinned
+                and slot_warmed_up(self.states[s], now) and not spike_held(self.states[s], now)
             ]
             if not bumpable:
                 continue
@@ -559,10 +578,16 @@ class ScannerApp(App):
     def _log_no_slot(self, symbol: str) -> None:
         if symbol in self._logged_no_slot:
             return  # already logged for this symbol; avoid spamming every tick
+        pinned_note = ""
+        if self._pinned:
+            # Without this the message actively misleads: it would claim every
+            # occupant clears the $ floor and spread ceiling when one of them
+            # may be failing both and simply be un-bumpable because it's armed.
+            pinned_note = f", {len(self._pinned)} pinned by the order pad"
         log.info(
-            "%s qualified but no live-symbol slot free (%d/%d in use, none bump-eligible: "
+            "%s qualified but no live-symbol slot free (%d/%d in use%s, none bump-eligible: "
             "all clear the $ floor and spread ceiling, are warming up, or spiked recently)",
-            symbol, len(self.states), self.tunables.max_live_symbols,
+            symbol, len(self.states), self.tunables.max_live_symbols, pinned_note,
         )
         self._logged_no_slot.add(symbol)
 
@@ -606,6 +631,16 @@ class ScannerApp(App):
                 log.info("%s dead-hold expired (%.0fm elapsed)", sym, self.tunables.dead_hold_sec / 60)
         for symbol in list(self.states.keys()):
             state = self.states[symbol]
+            # A pinned symbol is exempt from BOTH evictions below, not just
+            # from bumping: spike-quiet in particular would fire on exactly
+            # the symbol you're most likely to be sitting armed on -- one
+            # that popped, got armed, and then went quiet for a minute while
+            # you waited for an entry. Losing its subscription mid-arm would
+            # leave the pad holding a snapshot with no live quote to validate
+            # against, which validate_fire can only turn into a refusal.
+            pin = self._pinned_reason(symbol)
+            if pin is not None:
+                continue
             # Scorer-admitted symbols (state.scan_source == "SCORER") never
             # entered via the scan-rank persistence gate, so they have no
             # streak to decay -- _scorer_admit's pressure-only swap is their
@@ -677,6 +712,149 @@ class ScannerApp(App):
             path.write_text(json.dumps({sym: until.isoformat() for sym, until in self._ignored_until.items()}))
         except Exception:
             log.exception("Non-tradable list save failed (non-fatal)")
+
+    # -- order pad (arm / fire) --------------------------------------------
+
+    def _start_order_pad(self) -> None:
+        """Bring up the always-on-top pad window and start pumping it from
+        this app's own asyncio loop.
+
+        Non-fatal by design: the scanner is useful without the pad, so a
+        machine with no DISPLAY (or no Tk) logs and carries on rather than
+        taking the whole TUI down over a secondary window.
+        """
+        try:
+            self.pad = OrderPadWindow(
+                on_fire=self._on_pad_fire,
+                on_disarm=self._on_pad_disarm,
+                on_manual_arm=self._on_pad_manual_arm,
+                quote_age_provider=self._pad_quote_age,
+            )
+        except Exception:
+            log.exception("Order pad window failed to start (non-fatal); scanner continues without it")
+            self.pad = None
+            return
+        self._pad_pump_task = asyncio.create_task(self.pad.pump())
+        log.info(
+            "Order pad ready -- %s arms the selected row, %s fires, submission %s",
+            config.ORDER_PAD_ARM_KEY, config.ORDER_PAD_FIRE_KEY,
+            "ENABLED" if config.ORDER_PAD_SUBMIT_ENABLED else "DISABLED (dry run)",
+        )
+
+    def _pad_quote_age(self) -> float | None:
+        """Quote age for the armed symbol. The one number on the pad that is
+        deliberately NOT frozen -- everything else is a snapshot, but a stale
+        feed is precisely what the frozen numbers can't tell you about."""
+        snapshot = self.pad.snapshot if self.pad else None
+        if snapshot is None:
+            return None
+        return orderpad.quote_age_sec(self.states.get(snapshot.symbol), datetime.now(config.TZ))
+
+    def _cursor_symbol(self) -> str | None:
+        """The symbol under the row cursor of whichever of the two symbol
+        tables currently has focus, falling back to the main scanner table.
+        The news table is excluded on purpose -- its row keys aren't symbols
+        (see on_mount's comment on why it has no row cursor)."""
+        focused = self.focused
+        table = None
+        if isinstance(focused, DataTable) and focused.id in ("scanner-table", "scorer-table"):
+            table = focused
+        else:
+            table = self.query_one("#scanner-table", DataTable)
+        try:
+            return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None  # empty table, or the cursor is on a row that just went away
+
+    def action_arm_pad(self) -> None:
+        symbol = self._cursor_symbol()
+        if symbol is None:
+            self.notify("Nothing under the cursor to arm", severity="warning")
+            return
+        self._arm(symbol)
+
+    def _on_pad_manual_arm(self, symbol: str) -> None:
+        """Typed-symbol fallback. Only symbols that are already live can be
+        armed: sizing needs a price, a spread and an ATR, all of which come
+        from a live subscription this symbol would not have."""
+        if symbol not in self.states:
+            if self.pad:
+                self.pad.disarm(f"{symbol} is not in the live pool")
+            return
+        self._arm(symbol)
+
+    def _arm(self, symbol: str) -> None:
+        if self.pad is None:
+            return
+        state = self.states.get(symbol)
+        if state is None:
+            self.pad.disarm(f"{symbol} is not in the live pool")
+            return
+        snapshot = orderpad.build_snapshot(state, self.tunables, datetime.now(config.TZ))
+        if snapshot is None:
+            self.pad.disarm(f"{symbol} has no price yet")
+            return
+        self._unpin()
+        self._pinned.add(symbol)
+        self.pad.arm(snapshot)
+        log.info(
+            "Order pad armed %s: %dsh @ %.2f, stop %.2f, target %.2f, risk $%.2f, "
+            "S/spr %s, effR %s -- slot pinned",
+            symbol, snapshot.shares, snapshot.price, snapshot.stop_price,
+            snapshot.target_price, snapshot.risk_usd,
+            f"{snapshot.stop_in_spreads:.1f}" if snapshot.stop_in_spreads is not None else "unknown",
+            f"{snapshot.effective_r:.2f}" if snapshot.effective_r is not None else "unknown",
+        )
+
+    def _on_pad_disarm(self) -> None:
+        if self.pad is None:
+            return
+        symbol = self.pad.snapshot.symbol if self.pad.snapshot else None
+        self._unpin()
+        self.pad.disarm()
+        if symbol:
+            log.info("Order pad disarmed %s -- slot unpinned", symbol)
+
+    def _unpin(self) -> None:
+        self._pinned.clear()
+
+    def _pinned_reason(self, symbol: str) -> str | None:
+        """Why `symbol` is exempt from eviction right now, or None. Every
+        eviction path routes its pin check through here so the log says
+        'pinned by the order pad' rather than silently skipping a symbol."""
+        if symbol in self._pinned:
+            return "armed on the order pad"
+        return None
+
+    def _on_pad_fire(self) -> None:
+        if self.pad is None or self.pad.snapshot is None:
+            return
+        snapshot = self.pad.snapshot
+        state = self.states.get(snapshot.symbol)
+        reason = orderpad.validate_fire(
+            snapshot, state, datetime.now(config.TZ),
+            non_tradable_listed=snapshot.symbol in self._ignored_until,
+        )
+        if reason is not None:
+            log.info("Order pad REFUSED to fire %s: %s", snapshot.symbol, reason)
+            self.pad.show_block(reason)
+            return
+
+        plan = orderpad.bracket_plan(snapshot)
+        if not config.ORDER_PAD_SUBMIT_ENABLED:
+            # The full arm -> validate path has run and passed; this is the
+            # only thing being skipped. Logging the real BracketPlan (not a
+            # paraphrase of it) means what's read back in scanner.log during
+            # testing is exactly what the live path will send.
+            log.info("Order pad DRY RUN (submission disabled) -- would submit: %s", plan.describe())
+            self.pad.show_result(f"DRY RUN: {plan.quantity}sh @ {plan.entry_limit:.2f}")
+            return
+
+        log.error(
+            "Order pad fire reached the submission path, which is not wired up yet "
+            "(ORDER_PAD_SUBMIT_ENABLED is True but no placeOrder exists) -- nothing sent"
+        )
+        self.pad.show_block("submission not wired up yet")
 
     # -- per-symbol lifecycle ----------------------------------------------
 
@@ -797,6 +975,18 @@ class ScannerApp(App):
         state = self.states.pop(symbol, None)
         self._logged_no_slot.discard(symbol)
         self._filter_reasons.pop(symbol, None)
+        # Belt and braces for the pin: _evict_unqualified and both bump paths
+        # already skip pinned symbols, but removal also happens for reasons a
+        # pin has no business overriding (session rollover, a manual
+        # non-tradable mark, a contract that fails to qualify). Disarming here
+        # -- the single choke point every one of those routes through --
+        # guarantees the pad can never be left armed on a symbol whose live
+        # subscription has just been cancelled.
+        if symbol in self._pinned:
+            self._unpin()
+            if self.pad is not None:
+                self.pad.disarm(f"{symbol} left the live pool -- disarmed")
+            log.info("Order pad disarmed: %s was removed from live tracking while armed", symbol)
         if state is None:
             return
         ticker = getattr(state, "_ticker", None)
@@ -813,6 +1003,12 @@ class ScannerApp(App):
                 log.exception("Error cancelling ATR subscription for %s", symbol)
 
     def _apply_tick(self, state: SymbolState, t: Ticker) -> None:
+        # Feed liveness, stamped on every update regardless of which fields
+        # moved -- this is what the order pad's staleness guard reads (see
+        # orderpad.quote_age_sec). Deliberately not "when the price last
+        # CHANGED": a symbol genuinely printing at a steady 4.12 isn't stale,
+        # one whose feed has stopped delivering is.
+        state.tick.updated_at = datetime.now(config.TZ)
         if t.last is not None and not _isnan(t.last):
             state.tick.last = t.last
             now = datetime.now(config.TZ)
@@ -846,6 +1042,15 @@ class ScannerApp(App):
 
     async def on_unmount(self) -> None:
         self.scanner_mgr.stop()
+        if self._pad_pump_task is not None:
+            self._pad_pump_task.cancel()
+        if self.pad is not None:
+            self.pad.close()  # also flushes the window geometry to disk
+            # Dropped before the teardown loop below, which routes through
+            # _remove_symbol and would otherwise try to render a disarm into
+            # a window that no longer exists.
+            self.pad = None
+        self._unpin()
         for symbol in list(self.states.keys()):
             self._remove_symbol(symbol)
         self.ib.disconnect()
