@@ -13,7 +13,7 @@ to TWS. The actual placeOrder round-trip still needs a real paper session.
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ib_async import LimitOrder, Order, StopOrder, Trade
+from ib_async import LimitOrder, Order, StopLimitOrder, Trade
 from ib_async.objects import CommissionReport, Execution, Fill
 from ib_async.order import OrderStatus
 
@@ -131,9 +131,14 @@ def test_partial_fill_creates_protective_orders_sized_to_the_fill_not_the_plan()
     assert len(app.ib.placed) == 3  # parent + stop + target
     _stop_contract, stop = app.ib.placed[1]
     _tgt_contract, target = app.ib.placed[2]
-    assert isinstance(stop, StopOrder) and stop.action == "SELL" and stop.totalQuantity == 20
+    assert isinstance(stop, StopLimitOrder) and stop.action == "SELL" and stop.totalQuantity == 20
     assert isinstance(target, LimitOrder) and target.action == "SELL" and target.totalQuantity == 20
+    # STP LMT, not plain STP -- a plain STP's outsideRth is silently ignored
+    # on US stocks (confirmed live 2026-09-17: TURB's stop never triggered
+    # falling through it during extended hours). auxPrice is still the
+    # trigger; lmtPrice sits ORDER_PAD_STOP_SLIPPAGE below it.
     assert stop.auxPrice == plan.stop_price
+    assert stop.lmtPrice == round(plan.stop_price - config.ORDER_PAD_STOP_SLIPPAGE, 2)
     assert target.lmtPrice == plan.target_price
     assert stop.ocaGroup == target.ocaGroup == plan.oca_group
     assert stop.ocaType == target.ocaType == 1

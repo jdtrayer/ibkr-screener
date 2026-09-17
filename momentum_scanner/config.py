@@ -553,6 +553,15 @@ ORDER_PAD_MAX_DRIFT_FRACTION = 0.25
 # that's actively printing.
 ORDER_PAD_MAX_QUOTE_AGE_SEC = 5.0
 
+# The protective stop is submitted as STP LMT, not a plain STP -- confirmed
+# live 2026-09-17 (TURB) and against IBKR's own docs that a plain STP order
+# is NOT eligible to trigger outside regular trading hours on US stocks
+# (unlike STP LMT, which can be); the parent/target legs stay LMT, which IS
+# RTH-eligible. This is the stop's limit price's distance below (for a
+# sell) the stop trigger, so it can still cross the spread and fill rather
+# than resting at an exact price a fast-moving name gaps straight through.
+ORDER_PAD_STOP_SLIPPAGE = 0.02
+
 # Window geometry (position + size), so the pad comes back where you left it
 # over TWS instead of wherever the WM decides. Same cache/ + plain-JSON
 # convention as NON_TRADABLE_STATE_FILE.

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from ib_async import IB, LimitOrder, Stock, StopOrder, Ticker, Trade
+from ib_async import IB, LimitOrder, Stock, StopLimitOrder, Ticker, Trade
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header
@@ -938,7 +938,18 @@ class ScannerApp(App):
         if filled <= 0:
             return
 
-        stop = StopOrder("SELL", filled, bracket.plan.stop_price, tif="DAY", outsideRth=True)
+        # STP LMT, not plain STP: confirmed live 2026-09-17 (TURB) that a
+        # plain stop order's outsideRth flag is silently ignored on US
+        # stocks -- IB's own IB 2109 warning says as much ("ignored based on
+        # the order type and destination") -- so the stop never actually
+        # triggers outside regular hours. STP LMT IS eligible; the limit sits
+        # ORDER_PAD_STOP_SLIPPAGE below the trigger so it can still cross the
+        # spread and fill rather than resting at one exact price a
+        # fast-moving name gaps straight through.
+        stop_limit = round(bracket.plan.stop_price - config.ORDER_PAD_STOP_SLIPPAGE, 2)
+        stop = StopLimitOrder(
+            "SELL", filled, stop_limit, bracket.plan.stop_price, tif="DAY", outsideRth=True,
+        )
         target = LimitOrder("SELL", filled, bracket.plan.target_price, tif="DAY", outsideRth=True)
         stop.ocaGroup = target.ocaGroup = bracket.plan.oca_group
         stop.ocaType = target.ocaType = 1  # cancel the other leg outright once either fills

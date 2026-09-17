@@ -203,11 +203,13 @@ class BracketPlan:
     oca_group: str
 
     def describe(self) -> str:
+        # STP LMT, not plain STP -- see config.ORDER_PAD_STOP_SLIPPAGE.
+        stop_limit = round(self.stop_price - config.ORDER_PAD_STOP_SLIPPAGE, 2)
         return (
             f"BUY {self.quantity} {self.symbol} LMT {self.entry_limit:.2f} "
             f"(marketable, capped at armed price + drift allowance); "
             f"children OCA={self.oca_group}, sized from the parent's actual fill: "
-            f"SELL STP {self.stop_price:.2f} / SELL LMT {self.target_price:.2f}"
+            f"SELL STP LMT {self.stop_price:.2f}/{stop_limit:.2f} / SELL LMT {self.target_price:.2f}"
         )
 
 
