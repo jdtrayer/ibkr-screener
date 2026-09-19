@@ -24,6 +24,7 @@ _SIZING_ATTRS = {
     "risk_usd", "atr_multiplier", "min_spreads", "r_multiple",
     "max_position_usd", "min_shares", "pass_through_per_share",
 }
+_ORDER_PAD_ATTRS = {"order_pad_max_quote_age_sec", "order_pad_arm_timeout_sec"}
 _SLOT_ATTRS = {
     "slot_reentry_cooldown_sec", "max_live_symbols",
     "scorer_reserved_slots", "scorer_admit_min_score", "dead_hold_sec",
@@ -70,6 +71,17 @@ class TunablesPanel(VerticalScroll):
         self.tunables = tunables
 
     def compose(self) -> ComposeResult:
+        yield Static("Order Pad", classes="section-header")
+        yield self._dry_run_row()
+        for spec in TUNABLE_SPECS:
+            if spec.attr not in _ORDER_PAD_ATTRS:
+                continue
+            yield self._row(spec)
+        yield Static("Sizing", classes="section-header")
+        for spec in TUNABLE_SPECS:
+            if spec.attr not in _SIZING_ATTRS:
+                continue
+            yield self._row(spec)
         yield Static("Persistence", classes="section-header")
         for spec in TUNABLE_SPECS:
             if spec.attr not in _PERSISTENCE_ATTRS:
@@ -90,18 +102,11 @@ class TunablesPanel(VerticalScroll):
             if spec.attr not in _TREND_ATTRS:
                 continue
             yield self._row(spec)
-        yield Static("Sizing", classes="section-header")
-        for spec in TUNABLE_SPECS:
-            if spec.attr not in _SIZING_ATTRS:
-                continue
-            yield self._row(spec)
         yield Static("Slots", classes="section-header")
         for spec in TUNABLE_SPECS:
             if spec.attr not in _SLOT_ATTRS:
                 continue
             yield self._row(spec)
-        yield Static("Order Pad", classes="section-header")
-        yield self._dry_run_row()
 
     def _row(self, spec) -> Horizontal:
         # compact=True -- same built-in borderless/single-line Button style

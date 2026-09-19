@@ -513,45 +513,58 @@ SORT_REFRESH_SEC = 8.0
 
 # --------------------------------------------------------------------------
 # Order pad (orderpad.py = logic, padwindow.py = the Tk window) -- a small
-# always-on-top bracket-entry window that sits over TWS, so the scanner's
-# own per-symbol sizing can be submitted with a keypress while your eyes are
-# on TWS's chart/Level 2/time-and-sales. Two-step: arm (transfer a FROZEN
-# sizing snapshot from the selected row) then fire (submit the bracket).
+# bracket-entry window that sits over TWS, so the scanner's own per-symbol
+# sizing can be submitted with a keypress while your eyes are on TWS's
+# chart/Level 2/time-and-sales. Three states: Empty (no symbol), Loaded
+# (symbol typed or sent from a scanner row; feed subscribed; sizing
+# recalculating live on every tick), Armed (Loaded + F4 is live, for a
+# limited time). F4 fires immediately -- no confirmation.
 #
-# The pad never computes sizing -- it calls sizing.compute_sizing(), the
-# same function display.py renders the table's Shares/Target/Stop columns
-# from. One source of truth; the pad shows exactly the numbers the row did.
+# The pad never does its own sizing arithmetic -- it calls
+# sizing.compute_sizing(), the same function display.py renders the table's
+# Shares/Target/Stop columns from.
 # --------------------------------------------------------------------------
 
 # Master switch for actually transmitting orders is
-# tunables.Tunables.order_pad_dry_run, toggled live from a button at the
-# bottom of the TunablesPanel sidebar (default: dry run ON). While on, the
-# fire key runs every validation check and logs the exact bracket it WOULD
-# have sent without touching the order API at all -- that's the
-# arm/display/validation path, testable live against a real session with
-# zero order risk. Flipping it off submits for real (see app.py's
-# _on_pad_fire / _submit_pad_bracket) -- gated a second, independent way by
-# ORDER_PAD_PAPER_PORTS below, so a live account can't be reached by
-# mistake even with dry run off.
+# tunables.Tunables.order_pad_dry_run, toggled live from a button in the
+# scanner's TunablesPanel sidebar (NOT on the pad itself; the pad only
+# DISPLAYS it -- see padwindow.py -- so it can never be flipped by a stray
+# key while watching the tape). Default OFF: fire submits for real, gated a
+# second, independent way by ORDER_PAD_PAPER_PORTS below, so a live account
+# can't be reached by mistake. While ON, the fire key runs every validation
+# check and logs the exact bracket it WOULD have sent without touching the
+# order API at all -- and the pad's state bar says DRY RUN in every state,
+# in a colour family that is never the live-armed red, because a simulated
+# fire mistaken for a live one is a silent failure.
 
-# How far the live price may drift from the ARMED price before firing is
-# refused, as a fraction of the armed stop distance. The pad deliberately
-# shows frozen numbers (a display that changes under your cursor is not
-# glanceable), which means the longer you sit armed, the more the displayed
-# risk/reward can diverge from reality -- a symbol that's run 25% of its
-# stop distance since arming no longer has the R that's on screen, so the
-# snapshot is stale by definition and has to be re-armed rather than fired.
-# Expressed against stop distance, not a fixed %/cents, so it self-scales:
-# a volatile wide-stop name gets proportionally more room than a tight one.
-ORDER_PAD_MAX_DRIFT_FRACTION = 0.25
+# How far above the price at F4 the parent (entry) order may fill, as a
+# fraction of the fire-time stop distance. NOT a guard on firing -- the pad
+# recalculates live, so there is no earlier price to have drifted from -- but
+# the price of the entry order itself: a marketable limit rather than a
+# market order, so a fast run-up between the last tick and the fill can't
+# drag the entry past the risk the pad displayed. Expressed against stop
+# distance, not a fixed %/cents, so it self-scales: a volatile wide-stop
+# name gets proportionally more room than a tight one.
+ORDER_PAD_ENTRY_SLIPPAGE_FRACTION = 0.25
 
-# Refuse to fire on a symbol that hasn't ticked at all in this long. Drift
-# is measured against the last price we received, so a feed that's gone
-# quiet makes the drift check itself meaningless -- it would compare the
-# armed price against an equally old price and happily conclude "no drift."
-# Short by design: this is a scalp pad, and a name worth firing on is one
-# that's actively printing.
-ORDER_PAD_MAX_QUOTE_AGE_SEC = 5.0
+# Refuse to fire on a symbol that hasn't ticked in this long (seed for
+# tunables.order_pad_max_quote_age_sec). Short by design: this is a scalp
+# pad, and every number on it is computed from the last tick, so a name
+# whose feed has gone quiet is one whose displayed shares/stop/target can't
+# be trusted. Measured per ticker UPDATE, not per trade, so a quiet small
+# cap outside regular hours can legitimately exceed it between updates.
+ORDER_PAD_MAX_QUOTE_AGE_SEC = 2.0
+
+# How long an F2 arm lasts before the pad silently returns to Loaded (seed
+# for tunables.order_pad_arm_timeout_sec). Deliberately no warning as it
+# runs down: a countdown alarm creates urgency to enter.
+ORDER_PAD_ARM_TIMEOUT_SEC = 300.0
+
+# Ceiling for the pad's own editable risk $. Mirrors the risk_usd tunable's
+# own upper bound (tunables.TUNABLE_SPECS) -- typing 2500 for 25 is a
+# one-keystroke mistake, and max_position_usd is the only other thing that
+# would catch it.
+ORDER_PAD_MAX_RISK_USD = 500.0
 
 # The protective stop is submitted as STP LMT, not a plain STP -- confirmed
 # live 2026-09-17 (TURB) and against IBKR's own docs that a plain STP order
@@ -571,26 +584,26 @@ ORDER_PAD_MAX_QUOTE_AGE_SEC = 5.0
 # proportionally more room to actually trigger and fill.
 STOP_TRIGGER_LEAD_PCT = 0.25
 
-# Window geometry (position + size), so the pad comes back where you left it
-# over TWS instead of wherever the WM decides. Same cache/ + plain-JSON
-# convention as NON_TRADABLE_STATE_FILE.
+# Window position, so the pad comes back where you left it over TWS instead
+# of wherever the WM decides. Position only -- the window sizes itself to its
+# content. Same cache/ + plain-JSON convention as NON_TRADABLE_STATE_FILE.
 ORDER_PAD_STATE_FILE = "./cache/order_pad_window.json"
-ORDER_PAD_DEFAULT_GEOMETRY = "300x150+40+40"
+ORDER_PAD_DEFAULT_POSITION = "+40+40"
 
-# Arm is pressed in the scanner TUI (where the row cursor already is) to
-# arm a new symbol, and also bound inside the pad itself to re-arm whatever
-# symbol is already on screen (e.g. after a drift block) without alt-tabbing
-# back for the row cursor. Fire is pad-only (which takes focus on arm, so
-# firing is one keypress with no focus dance). Two different key-name
-# conventions, unavoidably: Textual spells function keys lowercase, Tk uses
-# X keysyms (padwindow.py upper-cases ORDER_PAD_ARM_KEY for its own bind).
+# The toggle key (Loaded <-> Armed) is pressed in the pad; in the scanner TUI
+# the same key LOADS the row under the cursor into the pad (never arms it).
+# Fire is pad-only. Two different key-name conventions, unavoidably: Textual
+# spells function keys lowercase, Tk uses X keysyms (padwindow.py upper-cases
+# ORDER_PAD_TOGGLE_KEY for its own bind). The pad is a normal (not
+# always-on-top) window: keys work when it is visible and focused, and not
+# otherwise.
 #
 # Both are deliberately function keys rather than letters: the sidebar's
 # non-tradable Input swallows printable keys whenever it has focus, which
-# would silently eat an arm press. F3 is deliberately skipped between them
-# so a slipped finger on the arm key can't land on fire.
-ORDER_PAD_ARM_KEY = "f2"    # Textual binding, pressed in the scanner TUI
-ORDER_PAD_FIRE_KEY = "F4"   # Tk keysym, pressed in the pad
+# would silently eat a press. F3 is deliberately skipped between them so a
+# slipped finger on the toggle key can't land on fire.
+ORDER_PAD_TOGGLE_KEY = "f2"   # Textual binding in the TUI; Tk keysym F2 in the pad
+ORDER_PAD_FIRE_KEY = "F4"     # Tk keysym, pressed in the pad
 
 # One JSON-lines file per trading day (see order_history.py) -- kept out of
 # cache/ since it's not disposable state to rebuild, it's a record meant to

@@ -299,84 +299,132 @@ the same day).
 
 ## Order pad
 
-A small always-on-top window (~300x150, `padwindow.py`) that sits over TWS,
-so the scanner's own per-symbol sizing can be fired with a keypress while
-your eyes are on TWS's chart, Level 2 and time-and-sales. It runs in the
-same process as the scanner and shares its IB connection, so it reads live
-`SymbolState`s and calls `sizing.compute_sizing()` directly — the pad shows
-exactly the numbers the row does, because it isn't doing its own arithmetic.
+A small window (`padwindow.py`) that sits over TWS, so the scanner's own
+per-symbol sizing can be fired with a keypress while your eyes are on TWS's
+chart, Level 2 and time-and-sales. It runs in the same process as the
+scanner and shares its IB connection, so it reads live `SymbolState`s and
+calls `sizing.compute_sizing()` directly — the pad does no arithmetic of its
+own. It is a normal window, deliberately **not** always-on-top: if it is
+visible and focused its keys work, and if not they don't.
 
-**Submission is currently disabled** (`config.ORDER_PAD_SUBMIT_ENABLED =
-False`). The fire key runs every validation check and logs the exact bracket
-it *would* have sent; nothing reaches the order API.
+### Three states
 
-### Arm, then fire
-
-| Key | Where | Does |
+| State | Meaning | State bar |
 | --- | --- | --- |
-| `F2` | scanner TUI | Arms the row under the cursor (main or scorer table) |
-| `F4` | the pad | Fires the bracket |
-| `Esc` | the pad | Disarms |
+| **Empty** | no symbol loaded | neutral |
+| **Loaded** | symbol loaded, feed subscribed, sizing recalculating live; `F4` does nothing | neutral |
+| **Armed** | Loaded, plus `F4` is live, with a countdown | **red** |
 
-Arm is pressed in the TUI, where the row cursor already is; the pad then
-takes keyboard focus, so firing is one keypress with no focus dance. Both
-are function keys because the sidebar's non-tradable `Input` swallows
-printable keys whenever it has focus. `F3` is deliberately skipped between
-them so a slipped finger on arm can't land on fire. Typing a symbol into the
-pad's entry field arms it too, as a fallback — but only for symbols already
-in the live pool, since sizing needs a price, a spread and an ATR that only
-a live subscription provides.
+| Key | Does |
+| --- | --- |
+| type a symbol, `Enter` | loads it (no scanner row needed) |
+| `F2` in the TUI | loads the row under the cursor (main or scorer table) — Loaded, never Armed |
+| `F2` in the pad | pure toggle Loaded ⇄ Armed. Restarting the timer is `F2` twice |
+| `F4` in the pad | fires immediately, no confirmation — Armed only |
+| `Esc` in the pad | clears the symbol and releases its subscription |
 
-### Frozen numbers
+A **symbol change always forces Armed back to Loaded**; arm state never
+carries across symbols. A fire (or a dry run) also drops back to Loaded, so
+a double press can't send a second order — `F2` again to fire again.
 
-Everything on the pad except the quote age is captured once, at arm time,
-and never recomputed. A pad whose numbers shift while you look at it isn't
-glanceable, which is the whole point of it sitting over TWS. The cost is
-that the snapshot goes stale, which is what the fire-time checks catch.
+Arming starts a countdown (`order_pad_arm_timeout_sec`, default 5 minutes)
+shown in the state bar. On expiry the bar silently returns to neutral and
+`F4` stops working: no flashing, no warning — a countdown alarm creates
+artificial urgency to enter. Press `F2` and fire again.
+
+`F2` and `F4` are function keys because the sidebar's non-tradable `Input`
+swallows printable keys whenever it has focus; `F3` is skipped between them
+so a slipped finger on the toggle can't land on fire.
+
+### Live numbers
+
+There is no frozen snapshot. While a symbol is loaded, shares, stop, stop
+trigger, target and risk are recomputed from the current tick
+(`orderpad.live_sizing`, ~4µs), the window redraws at up to 10Hz, and `F4`
+recomputes once more at the instant of the press. What's on screen is what
+would be sent, give or take one tick. **Risk $ is editable on the pad** and
+recalculates live; it is pad-local and does not write back to the
+`risk_usd` tunable that sizes the scanner tables.
+
+The window is laid out for two reading distances: a large, high-contrast
+state bar for the peripheral glance, and large fixed-position numbers for
+the one deliberate read at arm time. Shares and the entry limit are in
+fixed cells (top row) so they can be made editable later without moving
+anything. A sizing `F4` would refuse is shown greyed with the reason.
+
+### Dry run
+
+The `Dry run` toggle lives in the scanner sidebar (not on the pad) and
+defaults **off**. While it is on, the pad's state bar says
+`DRY RUN -- NO ORDER WILL BE SENT` in every state, in an amber colour family
+that is never the live-armed red. `F4` still runs every check and logs the
+exact bracket it would have sent, but nothing reaches the order API. Live
+fires are additionally gated by `config.ORDER_PAD_PAPER_PORTS`, so a live
+account can't be reached even with dry run off.
 
 ### What refuses a fire
 
-Checked in this order, with the reason shown on the pad (status bar turns
-red, stays armed):
+`F4` on an Armed pad is refused, with the reason shown in red and the arm
+kept, when any of these hold:
 
-1. **Symbol left the live pool** — nothing to validate against.
-2. **Marked non-tradable** (the manual list above).
-3. **Non-tradeable sizing** — shares below `min_shares`, or position over
-   `max_position_usd`, as evaluated at arm time.
-4. **Stale quote** — nothing has ticked in `ORDER_PAD_MAX_QUOTE_AGE_SEC`
-   (5s). Checked *before* drift on purpose: drift is measured against the
-   last price received, so on a dead feed the two prices agree perfectly and
-   a drift-first check would wave through exactly the case it exists to stop.
-5. **Price drift** — the live price has moved more than
-   `ORDER_PAD_MAX_DRIFT_FRACTION` (25%) of the armed stop distance from the
-   armed price. Expressed against stop distance rather than a fixed
-   percentage so it self-scales: a volatile wide-stop name gets
-   proportionally more room than a tight one. Requires a re-arm.
+1. **No live feed** for the symbol, or it is on the manual non-tradable list.
+2. **Stale quote** — nothing has ticked in `order_pad_max_quote_age_sec`
+   (default 2s). Checked before the sizing-derived checks: a frozen feed
+   makes everything computed from it look fine. (This is per ticker *update*,
+   not per trade, so a quiet small cap can legitimately exceed it.)
+3. **Non-tradeable sizing** — ATR not yet warmed (the pad won't send an order
+   from a spread-only stop), shares below `min_shares`, or position over
+   `max_position_usd`.
+4. **Sanity bounds** — shares > 0, stop below entry, target above entry,
+   stop trigger below entry, no missing prices.
 
-### Slot pinning
+There is no drift check: with live sizing there is no armed price to drift
+from. The symbol box and risk box are also guarded — `F4` refuses if the
+symbol box holds a name other than the loaded one (Enter not yet pressed) or
+the risk box doesn't parse.
 
-Arming pins the symbol's live slot, exempting it from **all four** eviction
-paths — bump (`filters.bump_candidate`), scorer swap, persistence decay and
-spike-quiet — until it's disarmed. Spike-quiet matters most here: it would
-otherwise fire on exactly the symbol you're likeliest to be armed on, one
-that popped and then went quiet for a minute while you waited for an entry.
+### The pad's feed (and the slot pool)
 
-A pinned symbol is *live*, not queued, so it doesn't appear in any of the
-three slot-status counts. It does reduce effective capacity, so
-`_log_no_slot` names it rather than claiming every occupant is healthy.
-Removal for any reason a pin shouldn't override (session rollover, a manual
-non-tradable mark, a contract that won't qualify) disarms the pad, since a
-frozen snapshot with no live quote behind it can only ever be refused.
+Typing a symbol subscribes it immediately so ATR is warm by the time you
+arm. The pad's subscription is **exempt from the live-slot pool** — it's not
+speculative — and comes in one of two forms:
 
-### The bracket (not yet wired)
+- **Own feed** (symbol not in the pool): a private `SymbolState` *outside*
+  `ScannerApp.states`, so it takes no slot and none of the bump / evict /
+  persistence / cooldown machinery ever sees it. Released on `Esc` and on
+  symbol change.
+- **Borrowed feed** (symbol already live in the pool): the pad reuses that
+  state instead of opening a second market-data line, and pins it against all
+  four eviction paths (bump, scorer swap, persistence decay, spike-quiet).
+  Releasing a borrowed feed only unpins it — it never cancels the scanner's
+  line. If the pool is forced to drop it (session rollover, reconnect, a
+  non-tradable mark), the pad re-opens the symbol on its own feed rather than
+  losing it. If the scanner admits a symbol the pad owns, the pool adopts the
+  pad's state.
 
-A marketable-limit parent capped at `armed price + drift allowance` — it
-crosses the spread so it fills, but can never fill worse than the price that
-would have refused the trade — plus two OCA-grouped children (stop and
-target). The children are deliberately quantity-less in `BracketPlan`: their
-size has to come from the parent's *reported fill quantity*, because sizing
-them from the intended quantity leaves exits larger than the position on a
-partial fill, which IBKR then flags as a short sale.
+The one-line reason for all this: ib_async keys tickers by contract, so two
+`reqMktData` calls on one contract open two IB lines on one shared `Ticker`,
+and a single `cancelMktData` can only ever cancel the latest — the other line
+leaks for the session.
+
+IB error 101 (max tickers reached) on the pad's own feed is logged distinctly
+and shown on the pad. A typed symbol IB can't qualify is refused on the pad
+with the reason.
+
+### The bracket
+
+A marketable-limit parent capped at `price at F4 + entry slippage allowance`
+(`ORDER_PAD_ENTRY_SLIPPAGE_FRACTION` = 25% of the stop distance) — it crosses
+the spread so it fills, but can't chase a run-up into a position whose
+displayed risk no longer holds. That cap is an order price, not a guard on
+firing. Two OCA-grouped children (stop-limit and target) follow, created only
+once the parent reports a fill and sized to the shares actually held (they
+are quantity-less in `BracketPlan`: sizing them from the intended quantity
+leaves exits larger than the position on a partial fill, which IBKR flags as
+a short sale). They re-anchor to the parent's running average fill price on
+every partial fill, using the **fire record** — the one immutable `PadSizing`
+taken at `F4`, kept for the life of the position so a later ATR change can't
+move the stop under an open trade.
 
 ## Related fixed thresholds (`config.py`, restart required)
 

@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,12 @@ SESSION_CHECK_EVERY_N_TICKS = int(30 / config.DISPLAY_REFRESH_SEC) or 1
 FLOAT_REFRESH_EVERY_N_TICKS = int(60 / config.DISPLAY_REFRESH_SEC) or 1
 SORT_REFRESH_EVERY_N_TICKS = int(config.SORT_REFRESH_SEC / config.DISPLAY_REFRESH_SEC) or 1
 
+# IB codes delivered through errorEvent that are notices, not failures -- the
+# order itself is fine. 2161: IB's regulatory price cap on a limit order
+# (confirmed live 2026-09-18, PAAI target: the limit was capped to the
+# reference price band and the order went on to fill normally).
+INFORMATIONAL_IB_CODES = frozenset({2161})
+
 
 @dataclass
 class _PadBracket:
@@ -60,7 +67,11 @@ class _PadBracket:
 
     plan: orderpad.BracketPlan
     contract: Stock
-    snapshot: orderpad.ArmedSnapshot
+    # The fire record: the PadSizing computed at F4, frozen for the life of
+    # the position -- partial-fill re-anchoring reads its stop_distance /
+    # nominal_r / stop_trigger_lead_pct, never live state (see
+    # orderpad.recompute_bracket_exit).
+    sizing: orderpad.PadSizing
     stop_trade: Trade | None = None
     target_trade: Trade | None = None
     # The ACTUAL stop/target prices last sent to IB -- recomputed from the
@@ -70,14 +81,35 @@ class _PadBracket:
     realized_stop_limit: float | None = None
     realized_stop_trigger: float | None = None
     realized_target_price: float | None = None
+    # time.monotonic() of the first stop/target placeOrder -- diagnostics
+    # only (see _leg_diagnostics), never read by order logic.
+    legs_first_placed_at: float | None = None
+
+
+@dataclass
+class _PadFeed:
+    """The market-data feed behind the order pad's loaded symbol.
+
+    owned=True: the pad opened this subscription itself (a private
+    SymbolState that is NOT in ScannerApp.states, so it takes no live slot
+    and none of the pool's bump/evict/persistence machinery ever sees it),
+    and is responsible for cancelling it. owned=False: the symbol was
+    already live in the pool, so the pad borrows that state instead of
+    opening a second line -- and must never cancel it (see _pad_release_feed
+    for why that matters with ib_async).
+    """
+
+    symbol: str
+    state: SymbolState
+    owned: bool
 
 
 class ScannerApp(App):
     BINDINGS = [
-        # Arm is pressed here, in the TUI, because that's where the row
-        # cursor already is; fire is pressed in the pad, which takes focus on
-        # arm. See config.ORDER_PAD_ARM_KEY for why it's a function key.
-        (config.ORDER_PAD_ARM_KEY, "arm_pad", "Arm order pad"),
+        # In the TUI this key LOADS the row under the cursor into the pad
+        # (Loaded, never Armed -- arming is the pad's own F2). See
+        # config.ORDER_PAD_TOGGLE_KEY for why it's a function key.
+        (config.ORDER_PAD_TOGGLE_KEY, "load_pad", "Load order pad"),
     ]
 
     CSS = """
@@ -157,24 +189,31 @@ class ScannerApp(App):
         # even though none of them would ever actually get one.
         self._excluded_stock_types: set[str] = set()
         self._reconnecting = False
-        # The order pad's armed symbol. A live slot it holds is exempt from
-        # every eviction path (bump, scorer swap, persistence decay, spike-
-        # quiet) for as long as it's armed -- see _pinned_reason. Sized like a
-        # set for consistency with the other hold-outs above, though only one
-        # symbol is ever armed at a time.
+        # Symbols the pad is BORROWING from the live pool (see _PadFeed): a
+        # borrowed slot is exempt from every eviction path (bump, scorer
+        # swap, persistence decay, spike-quiet) while the pad has it loaded
+        # -- see _pinned_reason. Only ever the pad's one loaded symbol, and
+        # only when that symbol was already live; a pad-owned feed is never
+        # in the pool and needs no pin. Sized like a set for consistency
+        # with the other hold-outs above.
         self._pinned: set[str] = set()
-        # Symbols currently being subscribed on demand for a manually-typed
-        # pad arm (see _on_pad_manual_arm) -- guards against a second F2/Enter
-        # while the qualify/subscribe pipeline for the first one is in flight.
-        self._manual_pending: set[str] = set()
         self.pad: OrderPadWindow | None = None
         self._pad_pump_task: asyncio.Task | None = None
+        # Empty / Loaded / Armed and the arm timer; the clock is injectable
+        # (monotonic seconds) so tests never sleep.
+        self._pad_ctl = orderpad.PadController()
+        self._pad_clock = time.monotonic
+        self._pad_feed: _PadFeed | None = None
+        # The pad's own risk $, editable on the pad and deliberately NOT
+        # written back to tunables.risk_usd (which sizes the scanner tables).
+        # Seeded from the tunable once, at startup.
+        self._pad_risk_usd: float = self.tunables.risk_usd
         # Every orderId belonging to a live pad-submitted bracket (parent,
         # then its stop/target once created) maps back to the same
         # _PadBracket, so fill/cancel/error events on any leg can find their
-        # way back to the plan and the pad. Entries outlive the pad being
-        # disarmed/re-armed -- a fired position stays protected regardless
-        # of what's currently on screen.
+        # way back to the plan and the pad. Entries outlive the pad's loaded
+        # symbol changing -- a fired position stays protected regardless of
+        # what's currently on screen.
         self._pad_order_ids: dict[int, _PadBracket] = {}
 
     def compose(self) -> ComposeResult:
@@ -213,6 +252,7 @@ class ScannerApp(App):
         await self.connect()
         self.ib.disconnectedEvent += self._on_disconnected
         self.ib.errorEvent += self._on_ib_order_error
+        self.ib.errorEvent += self._on_ib_feed_error
         # Commission arrives on its own event, after the fill it belongs to
         # (see wrapper.commissionReport) -- global on the IB object, like
         # errorEvent, so the handler filters down to pad-tracked orders.
@@ -271,7 +311,13 @@ class ScannerApp(App):
                     log.warning("Reconnect attempt failed, retrying in %ds", config.RECONNECT_RETRY_SEC)
                     await asyncio.sleep(config.RECONNECT_RETRY_SEC)
             log.info("Reconnected to IB -- restarting scanner for session %s", self.session.value)
+            # The pad's own feed died with the socket too. A BORROWED feed is
+            # re-homed by _remove_symbol during the reconfigure below, so only
+            # a feed that was already the pad's own needs re-opening here.
+            pad_feed_was_own = self._pad_feed is not None and self._pad_feed.owned
             self._reconfigure_for_session(self.session)
+            if pad_feed_was_own:
+                self._pad_reopen_feed()
             self._render()
         finally:
             self._reconnecting = False
@@ -679,8 +725,8 @@ class ScannerApp(App):
             # the symbol you're most likely to be sitting armed on -- one
             # that popped, got armed, and then went quiet for a minute while
             # you waited for an entry. Losing its subscription mid-arm would
-            # leave the pad holding a snapshot with no live quote to validate
-            # against, which validate_fire can only turn into a refusal.
+            # leave the pad holding a symbol with no live quote, which
+            # validate_fire can only turn into a refusal.
             pin = self._pinned_reason(symbol)
             if pin is not None:
                 continue
@@ -756,11 +802,11 @@ class ScannerApp(App):
         except Exception:
             log.exception("Non-tradable list save failed (non-fatal)")
 
-    # -- order pad (arm / fire) --------------------------------------------
+    # -- order pad (load / arm / fire) -------------------------------------
 
     def _start_order_pad(self) -> None:
-        """Bring up the always-on-top pad window and start pumping it from
-        this app's own asyncio loop.
+        """Bring up the pad window and start pumping it from this app's own
+        asyncio loop.
 
         Non-fatal by design: the scanner is useful without the pad, so a
         machine with no DISPLAY (or no Tk) logs and carries on rather than
@@ -768,10 +814,13 @@ class ScannerApp(App):
         """
         try:
             self.pad = OrderPadWindow(
+                on_symbol=self._on_pad_symbol,
+                on_toggle_arm=self._on_pad_toggle_arm,
                 on_fire=self._on_pad_fire,
-                on_disarm=self._on_pad_disarm,
-                on_manual_arm=self._on_pad_manual_arm,
-                quote_age_provider=self._pad_quote_age,
+                on_clear=self._on_pad_clear,
+                on_risk=self._on_pad_risk,
+                view_provider=self._pad_view,
+                initial_risk_usd=self._pad_risk_usd,
             )
         except Exception:
             log.exception("Order pad window failed to start (non-fatal); scanner continues without it")
@@ -779,19 +828,57 @@ class ScannerApp(App):
             return
         self._pad_pump_task = asyncio.create_task(self.pad.pump())
         log.info(
-            "Order pad ready -- %s arms the selected row, %s fires, dry run %s",
-            config.ORDER_PAD_ARM_KEY, config.ORDER_PAD_FIRE_KEY,
-            "ON" if self.tunables.order_pad_dry_run else "OFF",
+            "Order pad ready -- type a symbol (or %s on a scanner row) to load, %s toggles "
+            "armed, %s fires, Esc clears; dry run %s",
+            config.ORDER_PAD_TOGGLE_KEY, config.ORDER_PAD_TOGGLE_KEY.upper(),
+            config.ORDER_PAD_FIRE_KEY, "ON" if self.tunables.order_pad_dry_run else "OFF",
         )
 
-    def _pad_quote_age(self) -> float | None:
-        """Quote age for the armed symbol. The one number on the pad that is
-        deliberately NOT frozen -- everything else is a snapshot, but a stale
-        feed is precisely what the frozen numbers can't tell you about."""
-        snapshot = self.pad.snapshot if self.pad else None
-        if snapshot is None:
-            return None
-        return orderpad.quote_age_sec(self.states.get(snapshot.symbol), datetime.now(config.TZ))
+    def _pad_state(self) -> SymbolState | None:
+        return self._pad_feed.state if self._pad_feed is not None else None
+
+    def _pad_shows(self, symbol: str) -> bool:
+        """Whether the pad currently has `symbol` loaded -- gates every
+        message that reports on a fired bracket (fills, exits, IB errors),
+        which outlives whatever the pad has moved on to."""
+        return self.pad is not None and self._pad_ctl.symbol == symbol
+
+    def _pad_view(self) -> orderpad.PadView:
+        """One frame's worth of pad state, assembled fresh on every redraw:
+        sizing is recomputed from the current tick right here (4us -- see
+        orderpad.live_sizing), so what is drawn is always what a fire at
+        this instant would send. The window calls this at most ~10x/s, on a
+        dirty flag set by every tick (see _apply_tick) plus a slower timer
+        for the countdown and quote age."""
+        now_mono = self._pad_clock()
+        timeout = self.tunables.order_pad_arm_timeout_sec
+        if self._pad_ctl.expire_if_due(now_mono, timeout):
+            # Silent on the pad by design; the log is the only trace.
+            log.info("Order pad arm on %s expired -- back to Loaded", self._pad_ctl.symbol)
+        mode = self._pad_ctl.mode(now_mono, timeout)
+        state = self._pad_state()
+        sizing = None
+        quote_age = None
+        note = None
+        if state is not None:
+            now = datetime.now(config.TZ)
+            sizing = orderpad.live_sizing(state, self.tunables, now, self._pad_risk_usd)
+            quote_age = orderpad.quote_age_sec(state, now)
+            if getattr(state, "_ticker", None) is None:
+                note = "subscribing..."
+            elif sizing is None:
+                note = "waiting for first tick"
+        return orderpad.PadView(
+            mode=mode,
+            symbol=self._pad_ctl.symbol,
+            sizing=sizing,
+            quote_age=quote_age,
+            armed_remaining=self._pad_ctl.armed_remaining(now_mono, timeout),
+            dry_run=self.tunables.order_pad_dry_run,
+            risk_usd=self._pad_risk_usd,
+            max_quote_age=self.tunables.order_pad_max_quote_age_sec,
+            feed_note=note,
+        )
 
     def _cursor_symbol(self) -> str | None:
         """The symbol under the row cursor of whichever of the two symbol
@@ -809,156 +896,273 @@ class ScannerApp(App):
         except Exception:
             return None  # empty table, or the cursor is on a row that just went away
 
-    def action_arm_pad(self) -> None:
+    def action_load_pad(self) -> None:
+        """TUI F2: load the row under the cursor into the pad -- Loaded,
+        never Armed; arming is deliberately the pad's own key so nothing
+        typed in the terminal can put the pad in a live state."""
+        if self.pad is None:
+            self.notify("Order pad is not available", severity="warning")
+            return
         symbol = self._cursor_symbol()
         if symbol is None:
-            # Nothing under the cursor -- most likely a symbol the user wants
-            # to trade isn't on either table at all. Raise the pad (if it
-            # isn't already up) so they can type it into the manual-entry box
-            # rather than just telling them F2 didn't find anything.
-            if self.pad is not None:
-                self.pad.prompt_manual_entry()
-            else:
-                self.notify("Order pad is not available", severity="warning")
+            # Nothing under the cursor: raise the pad with its symbol box
+            # focused so the name can just be typed.
+            self.pad.raise_window(focus_entry=True)
             return
-        self._arm(symbol)
+        self._on_pad_symbol(symbol)
+        self.pad.raise_window()
 
-    def _on_pad_manual_arm(self, symbol: str) -> None:
-        """Typed-symbol path. A symbol already live arms immediately; one
-        that isn't gets admitted on demand -- the same qualify/subscribe
-        pipeline a scan hit goes through -- so a name outside the scan/scorer
-        universe can still be sized and fired from here."""
-        if symbol in self.states:
-            self._arm(symbol)
+    # -- pad symbol / feed ownership ----------------------------------------
+
+    def _on_pad_symbol(self, symbol: str) -> None:
+        """A symbol was typed into the pad (or sent from a scanner row).
+        Always lands in Loaded: a symbol CHANGE drops any arm (see
+        PadController.load), and the feed is (re)acquired immediately so
+        ATR is already there by the time the name is armed."""
+        symbol = symbol.strip().upper()
+        if not symbol or self.pad is None:
             return
-        if symbol in self._ignored_until or symbol in self._dead_hold or symbol in self._excluded_stock_types:
-            if self.pad:
-                self.pad.disarm(f"{symbol} is held out (non-tradable / dead-hold / excluded type)")
+        if symbol == self._pad_ctl.symbol and self._pad_feed is not None:
+            return  # Enter pressed again on the symbol that's already loaded
+        if symbol in self._ignored_until or symbol in self._excluded_stock_types:
+            self._pad_release_feed()
+            self._pad_ctl.clear()
+            self.pad.set_symbol_text("")
+            self.pad.show_block(f"{symbol} is held out (non-tradable list / excluded type)")
             return
-        if symbol in self._manual_pending:
-            return  # already being subscribed from an earlier Enter/F2
-        asyncio.create_task(self._admit_manual(symbol))
+        previous = self._pad_ctl.symbol
+        self._pad_release_feed()
+        self._pad_ctl.load(symbol)
+        self.pad.set_symbol_text(symbol)
+        self.pad.clear_message()
+        self._pad_attach(symbol)
+        log.info(
+            "Order pad loaded %s%s (%s feed)", symbol,
+            f" (was {previous})" if previous else "",
+            "borrowed" if self._pad_feed is not None and not self._pad_feed.owned else "own",
+        )
+        self.pad.mark_dirty()
 
-    async def _admit_manual(self, symbol: str) -> None:
-        """On-demand admission for a symbol typed into the pad that isn't in
-        the live pool. Bumps a slot exactly the way a qualifying scan hit
-        would (same bump_candidate call, same pressure-only rule: only a
-        weak occupant gets bumped, never a healthy one just to make room) --
-        a manual request is demand too, but it doesn't get to skip the gate
-        that everything else goes through."""
-        non_scorer_states = {s: st for s, st in self.states.items() if st.scan_source != "SCORER"}
-        if len(non_scorer_states) >= self.tunables.max_live_symbols - self.tunables.scorer_reserved_slots:
-            now = datetime.now(config.TZ)
-            bump = bump_candidate(non_scorer_states, self.session, now, pinned=self._pinned)
-            if bump is None:
-                if self.pad:
-                    self.pad.disarm(f"{symbol}: pool full, nothing bump-eligible")
-                return
-            log.info(
-                "Bumped %s (%s) to admit %s (order pad, manual entry); re-entry barred for %.0fs",
-                bump.symbol, bump_reason(bump, self.session), symbol, self.tunables.slot_reentry_cooldown_sec,
-            )
-            self._remove_symbol(bump.symbol)
-            self._slot_cooldown[bump.symbol] = now
+    def _pad_attach(self, symbol: str) -> None:
+        """Acquire a feed for `symbol`. If the scanner already has it live,
+        borrow that state rather than subscribing again: a second
+        reqMktData on the same contract opens a second IB line but shares
+        ONE ib_async Ticker (Wrapper.startTicker keys on hash(contract)), and
+        cancelMktData(contract) then cancels only the latest line -- the
+        other can never be cancelled by contract and keeps updating the
+        shared Ticker for the rest of the session (reproduced live
+        2026-09-18: reqIds 5 and 7 on one Ticker, a second cancel returns
+        "No reqId found"). Otherwise open a private feed outside the pool."""
+        state = self.states.get(symbol)
+        if state is not None:
+            self._pad_feed = _PadFeed(symbol, state, owned=False)
+            self._pinned.clear()
+            self._pinned.add(symbol)
+            return
+        feed = _PadFeed(symbol, SymbolState(symbol=symbol, scan_source="PAD"), owned=True)
+        self._pad_feed = feed
+        asyncio.create_task(self._open_pad_feed(feed))
 
-        self._manual_pending.add(symbol)
-        if self.pad:
-            self.pad.disarm(f"subscribing to {symbol}...")
+    async def _open_pad_feed(self, feed: _PadFeed) -> None:
         try:
-            await self._add_symbol(ScanHit(symbol=symbol, con_id=0, rank=None, source="PAD"))
-        finally:
-            self._manual_pending.discard(symbol)
-
-        if symbol not in self.states:
-            if self.pad:
-                self.pad.disarm(f"{symbol}: could not subscribe (bad symbol or excluded type)")
+            reason = await self._open_feed(feed.state)
+        except Exception:
+            # This runs as a fire-and-forget task: an escape here would leave
+            # the pad Loaded on a feed that will never deliver, with nothing
+            # on screen to say so.
+            log.exception("Order pad feed for %s failed unexpectedly", feed.symbol)
+            reason = "feed failed to open (see scanner.log)"
+        if self._pad_feed is not feed:
+            # Cleared or changed while the contract was qualifying: whatever
+            # was just opened belongs to nobody now.
+            self._close_feed(feed.state)
             return
+        if reason is not None:
+            self._pad_fail(feed, reason)
 
-        # Give the fresh subscription a few seconds to deliver a first tick
-        # before falling back to _arm's own "has no price yet" message --
-        # ATR/tick data land asynchronously right after _add_symbol returns.
-        for _ in range(20):
-            state = self.states.get(symbol)
-            if state is None:
-                break
-            if orderpad.build_snapshot(state, self.tunables, datetime.now(config.TZ)) is not None:
-                break
-            await asyncio.sleep(0.5)
-        self._arm(symbol)
+    def _pad_fail(self, feed: _PadFeed, reason: str) -> None:
+        """The pad's feed could not be established: back to Empty, with the
+        reason on screen (the failure itself was already logged)."""
+        symbol = feed.symbol
+        self._pad_release_feed()
+        self._pad_ctl.clear()
+        if self.pad is not None:
+            self.pad.set_symbol_text("")
+            self.pad.show_block(f"{symbol}: {reason}")
+            self.pad.mark_dirty()
 
-    def _arm(self, symbol: str) -> None:
+    def _pad_release_feed(self) -> None:
+        """Drop the pad's feed. Cancels only a feed the pad OPENED; a
+        borrowed one is merely unpinned and keeps running for the scanner."""
+        feed = self._pad_feed
+        self._pad_feed = None
+        self._pinned.clear()
+        if feed is not None and feed.owned:
+            self._close_feed(feed.state)
+
+    def _adopt_pad_feed(self, feed: _PadFeed, hit) -> None:
+        """The scanner admitted a symbol the pad already has its own feed
+        for. Opening a second line would double the subscription and double-
+        wire on_tick onto the shared Ticker, so the pool takes over the
+        pad's state instead: the pad's feed becomes a borrowed (pinned) one,
+        and the pool-only loaders (RVOL baseline, float, short interest),
+        which a pad feed never runs, start now."""
+        state = feed.state
+        state.scan_rank = hit.rank
+        state.scan_source = hit.source
+        self._apply_float(state)
+        self.states[hit.symbol] = state
+        feed.owned = False
+        self._pinned.clear()
+        self._pinned.add(hit.symbol)
+        log.info(
+            "%s admitted to live tracking (%d/%d slots, scan_rank=%s, source=%s) by adopting the "
+            "order pad's existing feed (no second market data line) -- RVOL/$Vol start from zero",
+            hit.symbol, len(self.states), self.tunables.max_live_symbols, hit.rank, hit.source,
+        )
+        asyncio.create_task(self._load_baseline(state))
+        asyncio.create_task(self._load_float(state))
+        asyncio.create_task(self._load_short_interest(state))
+
+    def _on_ib_feed_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        """IB error 101 (max number of tickers reached) on the PAD's own
+        subscription. Logged distinctly from ordinary errors: it means the
+        account is out of market data lines, which the pool's admission
+        (capped by max_live_symbols, not by IB's line limit) can't see coming
+        and which the pad's slot exemption makes possible."""
+        if errorCode != 101:
+            return
+        feed = self._pad_feed
+        if (
+            feed is None or not feed.owned or contract is None
+            or getattr(contract, "conId", None) != feed.state.conid
+        ):
+            return
+        log.error(
+            "Order pad %s: IB error 101 (max tickers reached) -- the pad's own market data line "
+            "was REFUSED (pool holds %d/%d symbols; the pad's feed is outside the pool): %s",
+            feed.symbol, len(self.states), self.tunables.max_live_symbols, errorString,
+        )
+        self._pad_fail(feed, "IB 101: max market data lines reached")
+
+    def _pad_reopen_feed(self) -> None:
+        """After an IB reconnect every market-data subscription is gone,
+        including the pad's own. Re-acquire the loaded symbol's feed without
+        cancelling the dead one (its reqIds no longer exist)."""
+        symbol = self._pad_ctl.symbol
+        if symbol is None or self.pad is None:
+            return
+        self._pad_feed = None
+        self._pinned.clear()
+        self._pad_attach(symbol)
+        log.info("Order pad re-subscribed %s after reconnect", symbol)
+
+    # -- pad keys -------------------------------------------------------------
+
+    def _on_pad_clear(self) -> None:
+        """Escape: forget the symbol entirely and release its subscription."""
+        symbol = self._pad_ctl.symbol
+        self._pad_release_feed()
+        self._pad_ctl.clear()
+        if self.pad is not None:
+            self.pad.set_symbol_text("")
+            self.pad.clear_message()
+            self.pad.mark_dirty()
+        if symbol:
+            log.info("Order pad cleared %s -- feed released", symbol)
+
+    def _on_pad_risk(self, risk_usd: float) -> None:
+        self._pad_risk_usd = risk_usd
+        if self.pad is not None:
+            self.pad.mark_dirty()
+        log.info("Order pad risk set to $%.2f (pad-local; tunables.risk_usd unchanged)", risk_usd)
+
+    def _on_pad_toggle_arm(self) -> None:
+        """F2: a pure Loaded <-> Armed toggle (the timer restarts only via
+        F2 twice)."""
         if self.pad is None:
             return
-        state = self.states.get(symbol)
-        if state is None:
-            self.pad.disarm(f"{symbol} is not in the live pool")
+        now_mono = self._pad_clock()
+        timeout = self.tunables.order_pad_arm_timeout_sec
+        if self._pad_ctl.mode(now_mono, timeout) is orderpad.PadMode.EMPTY:
             return
-        snapshot = orderpad.build_snapshot(state, self.tunables, datetime.now(config.TZ))
-        if snapshot is None:
-            self.pad.disarm(f"{symbol} has no price yet")
+        mode = self._pad_ctl.toggle_arm(now_mono, timeout)
+        symbol = self._pad_ctl.symbol
+        self.pad.clear_message()
+        self.pad.mark_dirty()
+        if mode is not orderpad.PadMode.ARMED:
+            log.info("Order pad disarmed %s (F2 toggle)", symbol)
             return
-        self._unpin()
-        self._pinned.add(symbol)
-        self.pad.arm(snapshot)
-        log.info(
-            "Order pad armed %s: %dsh @ %.2f, stop %.2f, target %.2f, risk $%.2f, "
-            "S/spr %s, effR %s -- slot pinned",
-            symbol, snapshot.shares, snapshot.price, snapshot.stop_price,
-            snapshot.target_price, snapshot.risk_usd,
-            f"{snapshot.stop_in_spreads:.1f}" if snapshot.stop_in_spreads is not None else "unknown",
-            f"{snapshot.effective_r:.2f}" if snapshot.effective_r is not None else "unknown",
-        )
+        state = self._pad_state()
+        now = datetime.now(config.TZ)
+        sizing = orderpad.live_sizing(state, self.tunables, now, self._pad_risk_usd) if state else None
+        if sizing is not None:
+            log.info(
+                "Order pad ARMED %s for %.0fs: %dsh @ %.2f, stop %.2f (trigger %.2f), target %.2f, "
+                "risk $%.2f, S/spr %s, effR %s%s",
+                symbol, timeout, sizing.shares, sizing.price, sizing.stop_price or 0.0,
+                sizing.stop_trigger_price or 0.0, sizing.target_price or 0.0, sizing.risk_usd,
+                f"{sizing.stop_in_spreads:.1f}" if sizing.stop_in_spreads is not None else "unknown",
+                f"{sizing.effective_r:.2f}" if sizing.effective_r is not None else "unknown",
+                " [DRY RUN]" if self.tunables.order_pad_dry_run else "",
+            )
+        else:
+            log.info("Order pad ARMED %s for %.0fs with no price yet", symbol, timeout)
         order_history.log_event(
-            snapshot.armed_at, "ARM",
+            now, "ARM",
             symbol=symbol,
             session=self.session.value,
             dry_run=self.tunables.order_pad_dry_run,
-            scan_source=state.scan_source,
-            scan_rank=state.scan_rank,
-            conid=state.conid,
-            atr_value=atr.atr_value(state.atr),
+            scan_source=state.scan_source if state else None,
+            scan_rank=state.scan_rank if state else None,
+            conid=state.conid if state else None,
+            atr_value=atr.atr_value(state.atr) if state else None,
+            pad_risk_usd=self._pad_risk_usd,
             tunables=asdict(self.tunables),
-            snapshot=orderpad.snapshot_to_dict(snapshot),
+            sizing=orderpad.sizing_to_dict(sizing) if sizing else None,
         )
-
-    def _on_pad_disarm(self) -> None:
-        if self.pad is None:
-            return
-        symbol = self.pad.snapshot.symbol if self.pad.snapshot else None
-        self._unpin()
-        self.pad.disarm()
-        if symbol:
-            log.info("Order pad disarmed %s -- slot unpinned", symbol)
-
-    def _unpin(self) -> None:
-        self._pinned.clear()
 
     def _pinned_reason(self, symbol: str) -> str | None:
         """Why `symbol` is exempt from eviction right now, or None. Every
         eviction path routes its pin check through here so the log says
-        'pinned by the order pad' rather than silently skipping a symbol."""
+        'loaded on the order pad' rather than silently skipping a symbol."""
         if symbol in self._pinned:
-            return "armed on the order pad"
+            return "loaded on the order pad"
         return None
 
     def _on_pad_fire(self) -> None:
-        if self.pad is None or self.pad.snapshot is None:
+        """F4. Fires immediately -- no confirmation -- but only when Armed;
+        Loaded, Empty and an expired arm all do nothing (a line in the log,
+        nothing on screen). Sizing is recomputed here from the current tick
+        rather than trusting the last drawn frame. A refusal (stale quote,
+        non-tradeable, failed sanity bounds) keeps the arm and says why; a
+        dispatched order (or dry run) drops back to Loaded so a double press
+        can't send a second one."""
+        if self.pad is None:
             return
-        snapshot = self.pad.snapshot
-        state = self.states.get(snapshot.symbol)
+        now_mono = self._pad_clock()
+        timeout = self.tunables.order_pad_arm_timeout_sec
+        mode = self._pad_ctl.mode(now_mono, timeout)
+        symbol = self._pad_ctl.symbol
+        if mode is not orderpad.PadMode.ARMED:
+            log.info("Order pad F4 ignored: pad is %s (%s)", mode.value, symbol or "no symbol")
+            return
+
+        state = self._pad_state()
         now = datetime.now(config.TZ)
+        sizing = orderpad.live_sizing(state, self.tunables, now, self._pad_risk_usd) if state else None
         reason = orderpad.validate_fire(
-            snapshot, state, now,
-            non_tradable_listed=snapshot.symbol in self._ignored_until,
+            sizing, state, now, self.tunables.order_pad_max_quote_age_sec,
+            non_tradable_listed=symbol in self._ignored_until, symbol=symbol,
         )
         if reason is not None:
-            log.info("Order pad REFUSED to fire %s: %s", snapshot.symbol, reason)
+            log.info("Order pad REFUSED to fire %s: %s", symbol, reason)
             self.pad.show_block(reason)
             order_history.log_event(
                 now, "FIRE_BLOCKED",
-                symbol=snapshot.symbol,
+                symbol=symbol,
                 reason=reason,
-                snapshot=orderpad.snapshot_to_dict(snapshot),
+                sizing=orderpad.sizing_to_dict(sizing) if sizing else None,
                 live_price=state.tick.last if state else None,
                 live_bid=state.tick.bid if state else None,
                 live_ask=state.tick.ask if state else None,
@@ -966,18 +1170,19 @@ class ScannerApp(App):
             )
             return
 
-        plan = orderpad.bracket_plan(snapshot)
+        plan = orderpad.bracket_plan(sizing)
         if self.tunables.order_pad_dry_run:
-            # The full arm -> validate path has run and passed; this is the
-            # only thing being skipped. Logging the real BracketPlan (not a
+            # Everything up to here has run and passed; this is the only
+            # thing being skipped. Logging the real BracketPlan (not a
             # paraphrase of it) means what's read back in scanner.log during
             # testing is exactly what the live path will send.
             log.info("Order pad DRY RUN (dry run on) -- would submit: %s", plan.describe())
-            self.pad.show_result(f"DRY RUN: {plan.quantity}sh @ {plan.entry_limit:.2f}")
+            self._pad_ctl.consume_arm()
+            self.pad.show_result(f"DRY RUN -- NO ORDER SENT: {plan.quantity}sh @ {plan.entry_limit:.2f}")
             order_history.log_event(
                 now, "FIRE_DRY_RUN",
-                symbol=snapshot.symbol,
-                snapshot=orderpad.snapshot_to_dict(snapshot),
+                symbol=symbol,
+                sizing=orderpad.sizing_to_dict(sizing),
                 plan=orderpad.bracket_plan_to_dict(plan),
             )
             return
@@ -993,14 +1198,15 @@ class ScannerApp(App):
             return
 
         if state.conid is None:
-            log.error("Order pad fire blocked: %s has no qualified contract yet", snapshot.symbol)
+            log.error("Order pad fire blocked: %s has no qualified contract yet", symbol)
             self.pad.show_block("no qualified contract yet")
             return
 
-        self._submit_pad_bracket(plan, snapshot, state)
+        self._pad_ctl.consume_arm()
+        self._submit_pad_bracket(plan, sizing, state)
 
     def _submit_pad_bracket(
-        self, plan: orderpad.BracketPlan, snapshot: orderpad.ArmedSnapshot, state: SymbolState,
+        self, plan: orderpad.BracketPlan, sizing: orderpad.PadSizing, state: SymbolState,
     ) -> None:
         """Send the parent (entry) leg standalone -- not IB's own linked
         bracket -- because the stop/target legs are sized from the actual
@@ -1021,7 +1227,7 @@ class ScannerApp(App):
             tif="DAY", outsideRth=True, orderRef=plan.oca_group,
         )
         trade = self.ib.placeOrder(contract, parent)
-        bracket = _PadBracket(plan=plan, contract=contract, snapshot=snapshot)
+        bracket = _PadBracket(plan=plan, contract=contract, sizing=sizing)
         self._pad_order_ids[trade.order.orderId] = bracket
         trade.fillEvent += self._on_pad_parent_fill
         trade.cancelledEvent += self._on_pad_parent_cancelled
@@ -1036,14 +1242,14 @@ class ScannerApp(App):
             symbol=plan.symbol,
             order_id=trade.order.orderId,
             conid=state.conid,
-            snapshot=orderpad.snapshot_to_dict(snapshot),
+            sizing=orderpad.sizing_to_dict(sizing),
             plan=orderpad.bracket_plan_to_dict(plan),
         )
 
     def _on_pad_parent_fill(self, trade: Trade, fill) -> None:
         """A parent fill (partial or full) arrived -- (re)create the stop and
         target legs sized to shares actually held so far, and re-anchored to
-        the order's running average fill price (not the armed price), so
+        the order's running average fill price (not the price at F4), so
         entry slippage can't silently widen realized risk past risk_usd.
         Reuses the existing stop/target orderIds on a later fill so this is
         a resize (placeOrder with a non-zero orderId modifies in place), not
@@ -1061,36 +1267,35 @@ class ScannerApp(App):
         # caught up yet. Falls back to this fill's own price if avgPrice
         # isn't populated (seen on some synthetic/first-fill feeds).
         fill_price = fill.execution.avgPrice or fill.execution.price
-        exit_prices = orderpad.recompute_bracket_exit(fill_price, bracket.snapshot)
+        exit_prices = orderpad.recompute_bracket_exit(fill_price, bracket.sizing)
         bracket.realized_stop_limit = exit_prices.stop_limit_price
         bracket.realized_stop_trigger = exit_prices.stop_trigger_price
         bracket.realized_target_price = exit_prices.target_price
 
         # Entry slippage, in dollars -- planned_risk_usd is the frozen,
-        # arm-time number (shares * stop_distance); actual_risk_usd is what
+        # fire-time number (shares * stop_distance); actual_risk_usd is what
         # the JUST-recomputed stop actually locks in for the shares filled
         # so far (filled * distance-to-the-real-stop), so the two land on
         # the same value once the fix is working, with only tick-rounding
         # residue between them -- logged on every PARENT_FILL so the gap (or
-        # lack of one) is visible without recomputing it from the snapshot.
-        armed_price = bracket.snapshot.price
-        slip = fill_price - armed_price
-        planned_risk_usd = bracket.snapshot.risk_usd
+        # lack of one) is visible without recomputing it from the fire record.
+        fire_price = bracket.sizing.price
+        slip = fill_price - fire_price
+        planned_risk_usd = bracket.sizing.risk_usd
         actual_risk_usd = filled * (fill_price - exit_prices.stop_limit_price)
         # The parent's entry_limit already caps how far a BUY can slip
-        # (marketable limit at armed_price + drift_allowance), so this
+        # (marketable limit at fire_price + entry_slippage_allowance), so this
         # should never trip -- if it does, the fill landed worse than the
-        # fire-time drift check + entry_limit should have permitted, and
-        # that gap is worth knowing about immediately, not just in the log.
-        slip_exceeds_drift_allowance = abs(slip) > bracket.snapshot.drift_allowance
-        if slip_exceeds_drift_allowance:
+        # entry_limit should have permitted, and that is worth knowing
+        # about immediately, not just in the log.
+        slip_exceeds_entry_allowance = abs(slip) > bracket.sizing.entry_slippage_allowance
+        if slip_exceeds_entry_allowance:
             log.warning(
-                "Order pad %s filled %.4f, slipped %.4f from armed %.4f -- exceeds the "
-                "%.4f drift allowance checked at fire time (entry_limit was %.4f); the "
-                "fill landed worse than the drift check + entry_limit should have "
-                "permitted -- check for a gap between them",
-                bracket.plan.symbol, fill_price, slip, armed_price,
-                bracket.snapshot.drift_allowance, bracket.plan.entry_limit,
+                "Order pad %s filled %.4f, slipped %.4f from the price at F4 (%.4f) -- exceeds the "
+                "%.4f entry slippage allowance (entry_limit was %.4f); the fill landed worse "
+                "than the entry limit should have permitted",
+                bracket.plan.symbol, fill_price, slip, fire_price,
+                bracket.sizing.entry_slippage_allowance, bracket.plan.entry_limit,
             )
 
         # STP LMT, not plain STP: confirmed live 2026-09-17 (TURB) that a
@@ -1114,11 +1319,19 @@ class ScannerApp(App):
         # a duplicate handler on the same object and double-log the eventual
         # exit fill.
         first_creation = bracket.stop_trade is None
+        # Diagnostics for the target-leg 404 investigation (see memory:
+        # ib_404_locate_hold_investigation): what the client believed about
+        # the position and about the legs' own state right BEFORE this
+        # placeOrder, so a 404 can be lined up against "did this modify race
+        # an unacknowledged order" / "was the position already booked".
+        leg_state_before = self._leg_diagnostics(bracket)
         if bracket.stop_trade is not None:
             stop.orderId = bracket.stop_trade.order.orderId
         if bracket.target_trade is not None:
             target.orderId = bracket.target_trade.order.orderId
 
+        if first_creation:
+            bracket.legs_first_placed_at = time.monotonic()
         bracket.stop_trade = self.ib.placeOrder(bracket.contract, stop)
         bracket.target_trade = self.ib.placeOrder(bracket.contract, target)
         self._pad_order_ids[bracket.stop_trade.order.orderId] = bracket
@@ -1136,7 +1349,7 @@ class ScannerApp(App):
             exit_prices.stop_limit_price, exit_prices.stop_trigger_price,
             exit_prices.target_price, filled,
         )
-        if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+        if self._pad_shows(bracket.plan.symbol):
             self.pad.show_result(
                 f"FILLED {filled}/{bracket.plan.quantity} -- stop {exit_prices.stop_limit_price:.2f} "
                 f"(trig {exit_prices.stop_trigger_price:.2f}) / tgt {exit_prices.target_price:.2f}"
@@ -1160,12 +1373,35 @@ class ScannerApp(App):
             realized_stop_price=exit_prices.stop_limit_price,
             realized_stop_trigger_price=exit_prices.stop_trigger_price,
             realized_target_price=exit_prices.target_price,
-            armed_price=armed_price,
+            fire_price=fire_price,
             slip=slip,
             planned_risk_usd=planned_risk_usd,
             actual_risk_usd=actual_risk_usd,
-            slip_exceeds_drift_allowance=slip_exceeds_drift_allowance,
+            slip_exceeds_entry_allowance=slip_exceeds_entry_allowance,
+            is_modify=not first_creation,
+            known_position=self._known_position(bracket.contract.conId),
+            **{f"{k}_before": v for k, v in leg_state_before.items()},
         )
+
+    def _known_position(self, conid: int) -> float:
+        """Shares of conid the client's own position cache shows right now
+        (ib.positions(), fed by IB's position stream) -- what the client
+        KNOWS it holds, which can lag the fill it just reported."""
+        return sum(p.position for p in self.ib.positions() if p.contract.conId == conid)
+
+    def _leg_diagnostics(self, bracket: _PadBracket) -> dict:
+        """Snapshot of both exit legs as the client currently sees them:
+        status/whyHeld/quantity, plus ms since the legs were first placed.
+        Empty-valued (None) before the legs exist."""
+        out: dict = {
+            "ms_since_first_placed": None if bracket.legs_first_placed_at is None
+            else round((time.monotonic() - bracket.legs_first_placed_at) * 1000),
+        }
+        for name, trade in (("stop", bracket.stop_trade), ("target", bracket.target_trade)):
+            out[f"{name}_status"] = None if trade is None else trade.orderStatus.status
+            out[f"{name}_why_held"] = None if trade is None else trade.orderStatus.whyHeld
+            out[f"{name}_qty"] = None if trade is None else trade.order.totalQuantity
+        return out
 
     def _on_pad_parent_cancelled(self, trade: Trade) -> None:
         bracket = self._pad_order_ids.get(trade.order.orderId)
@@ -1178,7 +1414,7 @@ class ScannerApp(App):
         )
         if filled == 0:
             del self._pad_order_ids[trade.order.orderId]
-            if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+            if self._pad_shows(bracket.plan.symbol):
                 self.pad.show_result("order cancelled, nothing filled")
         order_history.log_event(
             datetime.now(config.TZ), "PARENT_CANCELLED",
@@ -1233,7 +1469,7 @@ class ScannerApp(App):
             if limit_price is not None:
                 pad_message = f"STOP FILLED {filled}sh @ {fill_price:.2f} (limit {limit_price:.2f})"
 
-        if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+        if self._pad_shows(bracket.plan.symbol):
             self.pad.show_result(pad_message)
         order_history.log_event(
             datetime.now(config.TZ), "EXIT_FILL",
@@ -1292,9 +1528,39 @@ class ScannerApp(App):
     def _on_ib_order_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
         """Surface an IB-side reject/warning for a pad-submitted order onto
         the pad itself -- scanner.log alone isn't glanceable over TWS, which
-        is the entire reason the pad exists."""
+        is the entire reason the pad exists.
+
+        Informational codes (INFORMATIONAL_IB_CODES) are logged at INFO under
+        their own IB_INFO history event and kept off the pad, so a routine
+        notice neither reads as a failure in scanner.log/order history nor
+        overwrites a real result (e.g. FILLED ...) with IB's boilerplate."""
         bracket = self._pad_order_ids.get(reqId)
         if bracket is None:
+            return
+        if bracket.stop_trade is not None and reqId == bracket.stop_trade.order.orderId:
+            leg = "STOP"
+        elif bracket.target_trade is not None and reqId == bracket.target_trade.order.orderId:
+            leg = "TARGET"
+        else:
+            leg = "PARENT"
+        diagnostics = dict(
+            leg=leg,
+            known_position=self._known_position(bracket.contract.conId),
+            **self._leg_diagnostics(bracket),
+        )
+        if errorCode in INFORMATIONAL_IB_CODES:
+            log.info(
+                "Order pad %s order %d notice %d: %s",
+                bracket.plan.symbol, reqId, errorCode, errorString,
+            )
+            order_history.log_event(
+                datetime.now(config.TZ), "IB_INFO",
+                symbol=bracket.plan.symbol,
+                order_id=reqId,
+                error_code=errorCode,
+                error_string=errorString,
+                **diagnostics,
+            )
             return
         log.error(
             "Order pad %s order %d error %d: %s",
@@ -1306,8 +1572,9 @@ class ScannerApp(App):
             order_id=reqId,
             error_code=errorCode,
             error_string=errorString,
+            **diagnostics,
         )
-        if self.pad and self.pad.snapshot and self.pad.snapshot.symbol == bracket.plan.symbol:
+        if self._pad_shows(bracket.plan.symbol):
             self.pad.show_result(f"IB {errorCode}: {errorString}")
 
     # -- per-symbol lifecycle ----------------------------------------------
@@ -1321,21 +1588,52 @@ class ScannerApp(App):
             or hit.symbol in self._excluded_stock_types
         ):
             return
+        feed = self._pad_feed
+        if feed is not None and feed.owned and feed.symbol == hit.symbol:
+            # The pad already holds a live line for this contract -- adopt it
+            # rather than opening a second (see _adopt_pad_feed). Only once
+            # it is actually open; if the pad's own subscribe is still in
+            # flight the scan gate simply retries this symbol later.
+            if getattr(feed.state, "_ticker", None) is not None:
+                self._adopt_pad_feed(feed, hit)
+            return
         state = SymbolState(symbol=hit.symbol, scan_rank=hit.rank, scan_source=hit.source)
         self._apply_float(state)
         self.states[hit.symbol] = state
 
-        contract = Stock(hit.symbol, "SMART", "USD")
+        if await self._open_feed(state) is not None:
+            self._remove_symbol(hit.symbol)
+            return
+        log.info(
+            "%s admitted to live tracking (%d/%d slots, scan_rank=%s, source=%s) -- "
+            "RVOL/$Vol start from zero and rebuild from here",
+            hit.symbol, len(self.states), self.tunables.max_live_symbols, hit.rank, hit.source,
+        )
+
+        asyncio.create_task(self._load_baseline(state))
+        asyncio.create_task(self._load_float(state))
+        asyncio.create_task(self._load_short_interest(state))
+
+    async def _open_feed(self, state: SymbolState) -> str | None:
+        """Qualify the contract and open the symbol's market-data line and
+        1-min ATR stream -- the part of admission that is the same whether
+        the symbol is taking a live slot (_add_symbol) or is the order pad's
+        own feed outside the pool (_open_pad_feed). Returns None on success,
+        or a short reason on failure (already logged, nothing left open);
+        cleanup of the caller's own bookkeeping stays with the caller."""
+        symbol = state.symbol
+        contract = Stock(symbol, "SMART", "USD")
         try:
             qualified = await self.ib.qualifyContractsAsync(contract)
         except Exception:
-            log.exception("Failed to qualify contract for %s", hit.symbol)
-            self._remove_symbol(hit.symbol)
-            return
-        if not qualified:
-            log.info("%s dropped: IB could not qualify a contract for it", hit.symbol)
-            self._remove_symbol(hit.symbol)
-            return
+            log.exception("Failed to qualify contract for %s", symbol)
+            return "could not qualify contract"
+        # [None], not []: for an unknown symbol ib_async logs "Unknown
+        # contract" and hands back a list holding None (confirmed live
+        # 2026-09-18) -- reachable from the pad, where the symbol is typed.
+        if not qualified or qualified[0] is None:
+            log.info("%s dropped: IB could not qualify a contract for it", symbol)
+            return "IB could not qualify a contract"
         contract = qualified[0]
         state.conid = contract.conId
 
@@ -1343,17 +1641,16 @@ class ScannerApp(App):
             details_list = await self.ib.reqContractDetailsAsync(contract)
             stock_type = details_list[0].stockType if details_list else None
         except Exception:
-            log.exception("Failed to fetch contract details for %s (proceeding -- not excluded)", hit.symbol)
+            log.exception("Failed to fetch contract details for %s (proceeding -- not excluded)", symbol)
             stock_type = None
         if stock_type in config.EXCLUDE_STOCK_TYPES:
             log.info(
                 "%s dropped: excluded instrument type (stockType=%s) -- held out permanently, "
                 "won't be re-attempted",
-                hit.symbol, stock_type,
+                symbol, stock_type,
             )
-            self._excluded_stock_types.add(hit.symbol)
-            self._remove_symbol(hit.symbol)
-            return
+            self._excluded_stock_types.add(symbol)
+            return f"excluded instrument type ({stock_type})"
 
         # Halted status (tick 49) is pushed automatically by TWS whenever it applies --
         # it cannot be requested via genericTickList (IB rejects the whole reqMktData
@@ -1361,11 +1658,6 @@ class ScannerApp(App):
         ticker = self.ib.reqMktData(contract, snapshot=False)
         state.live_subscribed = True
         state.subscribed_at = datetime.now(config.TZ)
-        log.info(
-            "%s admitted to live tracking (%d/%d slots, scan_rank=%s, source=%s) -- "
-            "RVOL/$Vol start from zero and rebuild from here",
-            hit.symbol, len(self.states), self.tunables.max_live_symbols, hit.rank, hit.source,
-        )
 
         def on_tick(t: Ticker, _state=state):
             self._apply_tick(_state, t)
@@ -1373,10 +1665,35 @@ class ScannerApp(App):
         ticker.updateEvent += on_tick
         state._ticker = ticker  # keep a reference for cleanup
 
-        asyncio.create_task(self._load_baseline(state))
-        asyncio.create_task(self._load_float(state))
-        asyncio.create_task(self._load_short_interest(state))
         asyncio.create_task(self._start_atr(state, contract))
+        return None
+
+    def _close_feed(self, state: SymbolState) -> None:
+        """Cancel whatever _open_feed opened for `state` (market data and the
+        ATR bar stream). Safe on a state that never got that far. The one
+        place a feed is torn down, for the pool (_remove_symbol) and for a
+        pad-owned feed alike."""
+        ticker = getattr(state, "_ticker", None)
+        if ticker is not None:
+            state._ticker = None
+            try:
+                self.ib.cancelMktData(ticker.contract)
+            except Exception:
+                log.exception("Error cancelling market data for %s", state.symbol)
+        atr_bars = getattr(state, "_atr_bars", None)
+        if atr_bars is not None:
+            state._atr_bars = None
+            try:
+                self.ib.cancelHistoricalData(atr_bars)
+            except Exception:
+                log.exception("Error cancelling ATR subscription for %s", state.symbol)
+
+    def _feed_is_live(self, state: SymbolState) -> bool:
+        """Whether `state` is still what its symbol's feed should be feeding:
+        the pool's entry for it, or the pad's current feed."""
+        return self.states.get(state.symbol) is state or (
+            self._pad_feed is not None and self._pad_feed.state is state
+        )
 
     async def _start_atr(self, state: SymbolState, contract) -> None:
         try:
@@ -1384,11 +1701,11 @@ class ScannerApp(App):
         except Exception:
             log.exception("Failed to start ATR bar subscription for %s", state.symbol)
             return
-        current = self.states.get(state.symbol)
-        if current is not state:
-            # Evicted/removed while the throttled fetch was in flight -- this
-            # subscription was never registered on state, so _remove_symbol
-            # couldn't have cancelled it; do it here instead of leaking it.
+        if not self._feed_is_live(state):
+            # Evicted/removed (or the pad moved on) while the throttled fetch
+            # was in flight -- this subscription was never registered on
+            # state, so the teardown couldn't have cancelled it; do it here
+            # instead of leaking it.
             try:
                 self.ib.cancelHistoricalData(bars)
             except Exception:
@@ -1431,30 +1748,29 @@ class ScannerApp(App):
         self._filter_reasons.pop(symbol, None)
         # Belt and braces for the pin: _evict_unqualified and both bump paths
         # already skip pinned symbols, but removal also happens for reasons a
-        # pin has no business overriding (session rollover, a manual
-        # non-tradable mark, a contract that fails to qualify). Disarming here
-        # -- the single choke point every one of those routes through --
-        # guarantees the pad can never be left armed on a symbol whose live
-        # subscription has just been cancelled.
+        # pin has no business overriding (session rollover, reconnect, a
+        # manual non-tradable mark, a contract that fails to qualify). This
+        # is the single choke point every one of those routes through. The
+        # pad isn't speculative -- it was loaded deliberately -- so instead of
+        # losing its symbol to pool housekeeping it re-opens it on a feed of
+        # its own (below, after the pool's line is cancelled).
+        reopen_for_pad = False
         if symbol in self._pinned:
-            self._unpin()
+            self._pinned.discard(symbol)
+            feed = self._pad_feed
+            if feed is not None and not feed.owned and feed.symbol == symbol:
+                self._pad_feed = None
+                reopen_for_pad = True
+        if state is not None:
+            self._close_feed(state)
+        if reopen_for_pad:
+            log.info(
+                "Order pad: %s left the live pool while loaded -- re-subscribing on the pad's own feed",
+                symbol,
+            )
+            self._pad_attach(symbol)
             if self.pad is not None:
-                self.pad.disarm(f"{symbol} left the live pool -- disarmed")
-            log.info("Order pad disarmed: %s was removed from live tracking while armed", symbol)
-        if state is None:
-            return
-        ticker = getattr(state, "_ticker", None)
-        if ticker is not None:
-            try:
-                self.ib.cancelMktData(ticker.contract)
-            except Exception:
-                log.exception("Error cancelling market data for %s", symbol)
-        atr_bars = getattr(state, "_atr_bars", None)
-        if atr_bars is not None:
-            try:
-                self.ib.cancelHistoricalData(atr_bars)
-            except Exception:
-                log.exception("Error cancelling ATR subscription for %s", symbol)
+                self.pad.mark_dirty()
 
     def _apply_tick(self, state: SymbolState, t: Ticker) -> None:
         # Feed liveness, stamped on every update regardless of which fields
@@ -1481,6 +1797,14 @@ class ScannerApp(App):
         if halted is not None and not _isnan(halted):
             update_halt_state(state.halt, halted)
 
+        # The pad recalculates on every tick of ITS symbol: flag the window,
+        # which redraws (recomputing sizing from this fresh tick, see
+        # _pad_view) at most ~10x/s. Identity check, not a symbol compare --
+        # a pool state and the pad's own state for one symbol can't coexist
+        # (see _adopt_pad_feed), but a stale closure from a released feed can.
+        if self.pad is not None and self._pad_feed is not None and self._pad_feed.state is state:
+            self.pad.mark_dirty()
+
     def _apply_float(self, state: SymbolState) -> None:
         """Applies the CSV override, which always wins and re-applies live on
         every periodic refresh. If there's no CSV entry, leaves float_known/
@@ -1501,10 +1825,10 @@ class ScannerApp(App):
         if self.pad is not None:
             self.pad.close()  # also flushes the window geometry to disk
             # Dropped before the teardown loop below, which routes through
-            # _remove_symbol and would otherwise try to render a disarm into
-            # a window that no longer exists.
+            # _remove_symbol and would otherwise try to render into a window
+            # that no longer exists.
             self.pad = None
-        self._unpin()
+        self._pad_release_feed()
         for symbol in list(self.states.keys()):
             self._remove_symbol(symbol)
         self.ib.disconnect()

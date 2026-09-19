@@ -40,9 +40,12 @@ class Tunables:
     scorer_admit_min_score: float = config.SCORER_ADMIT_MIN_SCORE
     dead_hold_sec: float = config.DEAD_HOLD_SEC
     # Not a TunableSpec/bump() field -- boolean, toggled by its own button in
-    # TunablesPanel rather than +/-. Defaults on: a fresh session should
-    # never fire live without someone deliberately switching it off.
-    order_pad_dry_run: bool = True
+    # TunablesPanel rather than +/-. Defaults OFF (fire is live, on a paper
+    # port -- see config.ORDER_PAD_PAPER_PORTS); the pad's state bar shows
+    # DRY RUN unmistakably whenever it is on.
+    order_pad_dry_run: bool = False
+    order_pad_max_quote_age_sec: float = config.ORDER_PAD_MAX_QUOTE_AGE_SEC
+    order_pad_arm_timeout_sec: float = config.ORDER_PAD_ARM_TIMEOUT_SEC
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,8 @@ TUNABLE_SPECS: list[TunableSpec] = [
     TunableSpec("scorer_reserved_slots", "Scorer slots", 1, 0, 10, True, str),
     TunableSpec("scorer_admit_min_score", "Scorer min score", 0.25, -5.0, 5.0, False, lambda v: f"{v:+.2f}"),
     TunableSpec("dead_hold_sec", "Dead hold", 300, 300, 7200, False, lambda v: f"{v / 60:.0f}m"),
+    TunableSpec("order_pad_max_quote_age_sec", "Pad max quote age", 0.5, 0.5, 30, False, lambda v: f"{v:g}s"),
+    TunableSpec("order_pad_arm_timeout_sec", "Pad arm timeout", 30, 30, 1800, False, lambda v: f"{v / 60:g}m"),
 ]
 
 

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import pytest
-from ib_async import LimitOrder, Order, StopLimitOrder, Trade
+from ib_async import LimitOrder, Order, Position, StopLimitOrder, Trade
 from ib_async.objects import CommissionReport, Execution, Fill
 from ib_async.order import OrderStatus
 
@@ -48,6 +48,10 @@ class FakeIB:
     placed: list = field(default_factory=list)  # [(contract, order), ...] in call order
     _next_id: int = 1000
     _trades: dict = field(default_factory=dict)  # orderId -> Trade
+    held: list = field(default_factory=list)  # [ib_async Position, ...] for positions()
+
+    def positions(self, account: str = "") -> list:
+        return list(self.held)
 
     def placeOrder(self, contract, order: Order) -> Trade:
         if not order.orderId:
@@ -72,7 +76,8 @@ def fire_live(states=(), port=7497, dry_run=False):
     orig_port = config.IB_PORT
     config.IB_PORT = port
     try:
-        app._arm(states[0].symbol)
+        app._on_pad_symbol(states[0].symbol)
+        app._on_pad_toggle_arm()
         app._on_pad_fire()
     finally:
         config.IB_PORT = orig_port
@@ -191,21 +196,21 @@ def test_entry_slippage_does_not_widen_realized_risk():
     _contract, parent = app.ib.placed[0]
     parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
     bracket = app._pad_order_ids[parent.orderId]
-    snapshot = bracket.snapshot
+    sizing = bracket.sizing
 
-    add_fill(parent_trade, shares=snapshot.shares, price=2.28)  # filled 2c above the arm
+    add_fill(parent_trade, shares=sizing.shares, price=2.28)  # filled 2c above the arm
     app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
 
     _stop_contract, stop = app.ib.placed[1]
-    realized_risk = snapshot.shares * (2.28 - stop.lmtPrice)
-    assert realized_risk == pytest.approx(snapshot.risk_usd, abs=0.05)
+    realized_risk = sizing.shares * (2.28 - stop.lmtPrice)
+    assert realized_risk == pytest.approx(sizing.risk_usd, abs=0.05)
     # Sanity: the OLD (broken) construction would have kept the stop at the
     # armed-price-based level regardless of the fill, realizing MORE risk.
     assert stop.lmtPrice > bracket.plan.stop_price
 
 
 def test_parent_fill_logs_slip_and_planned_vs_actual_risk():
-    """User's ask: armed_price/fill_price/slip/planned_risk_usd/
+    """User's ask: fire_price/fill_price/slip/planned_risk_usd/
     actual_risk_usd inline on PARENT_FILL, without cross-referencing the ARM
     record -- and the two risk figures should land on the same value (tick
     rounding aside) once the fix is working."""
@@ -214,39 +219,39 @@ def test_parent_fill_logs_slip_and_planned_vs_actual_risk():
     app = fire_live([state])
     _contract, parent = app.ib.placed[0]
     parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
-    snapshot = app._pad_order_ids[parent.orderId].snapshot
+    sizing = app._pad_order_ids[parent.orderId].sizing
 
-    add_fill(parent_trade, shares=snapshot.shares, price=2.28)
+    add_fill(parent_trade, shares=sizing.shares, price=2.28)
     app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
 
     record = next(r for r in _read_order_history() if r["event"] == "PARENT_FILL")
-    assert record["armed_price"] == pytest.approx(2.26)
+    assert record["fire_price"] == pytest.approx(2.26)
     assert record["avg_fill_price"] == pytest.approx(2.28)
     assert record["slip"] == pytest.approx(0.02)
-    assert record["planned_risk_usd"] == pytest.approx(snapshot.risk_usd)
-    assert record["actual_risk_usd"] == pytest.approx(snapshot.risk_usd, abs=0.05)
-    assert record["slip_exceeds_drift_allowance"] is False
+    assert record["planned_risk_usd"] == pytest.approx(sizing.risk_usd)
+    assert record["actual_risk_usd"] == pytest.approx(sizing.risk_usd, abs=0.05)
+    assert record["slip_exceeds_entry_allowance"] is False
 
 
-def test_slip_past_the_drift_allowance_is_flagged(caplog):
+def test_slip_past_the_entry_allowance_is_flagged(caplog):
     """The entry_limit should make this unreachable in practice (a BUY can't
-    fill above armed_price + drift_allowance) -- this proves the flag fires
+    fill above fire price + entry_slippage_allowance) -- this proves the flag fires
     if it somehow does, rather than silently logging a normal-looking fill."""
     state = make_state("CVDK", last=2.26)
     state.conid = 12345
     app = fire_live([state])
     _contract, parent = app.ib.placed[0]
     parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
-    snapshot = app._pad_order_ids[parent.orderId].snapshot
-    blown_through = 2.26 + snapshot.drift_allowance * 3  # well past what entry_limit permits
+    sizing = app._pad_order_ids[parent.orderId].sizing
+    blown_through = 2.26 + sizing.entry_slippage_allowance * 3  # well past what entry_limit permits
 
-    add_fill(parent_trade, shares=snapshot.shares, price=blown_through)
+    add_fill(parent_trade, shares=sizing.shares, price=blown_through)
     with caplog.at_level("WARNING"):
         app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
 
-    assert any("drift allowance" in r.message for r in caplog.records)
+    assert any("entry slippage allowance" in r.message for r in caplog.records)
     record = next(r for r in _read_order_history() if r["event"] == "PARENT_FILL")
-    assert record["slip_exceeds_drift_allowance"] is True
+    assert record["slip_exceeds_entry_allowance"] is True
 
 
 def test_second_fill_resizes_the_same_protective_orders_instead_of_stacking():
@@ -271,6 +276,60 @@ def test_second_fill_resizes_the_same_protective_orders_instead_of_stacking():
     assert target2.orderId == first_target_id
     assert stop2.totalQuantity == 35
     assert target2.totalQuantity == 35
+
+
+def test_parent_fill_logs_position_and_leg_state_for_the_404_investigation():
+    """Diagnostics for the target-leg 404 (memory: ib_404_locate_hold_
+    investigation): each PARENT_FILL records what the client believed about
+    the position and the legs BEFORE the placeOrder -- nothing on the first
+    fill (legs don't exist yet), the legs' live status on the amend."""
+    state = make_state("CVDK", last=4.12)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+
+    app.ib.held = [Position("DU1", _contract, 20.0, 4.12)]
+    add_fill(parent_trade, shares=20)
+    app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
+    target_trade = app._pad_order_ids[app.ib.placed[2][1].orderId].target_trade
+    target_trade.orderStatus.status = "PendingSubmit"
+
+    app.ib.held = [Position("DU1", _contract, 35.0, 4.12)]
+    add_fill(parent_trade, shares=15)
+    app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
+
+    first, second = [r for r in _read_order_history() if r["event"] == "PARENT_FILL"]
+    assert first["is_modify"] is False
+    assert first["known_position"] == 20.0
+    assert first["target_status_before"] is None
+    assert first["ms_since_first_placed_before"] is None
+    assert second["is_modify"] is True
+    assert second["known_position"] == 35.0
+    assert second["target_status_before"] == "PendingSubmit"
+    assert second["target_qty_before"] == 20
+    assert second["stop_qty_before"] == 20
+    assert second["ms_since_first_placed_before"] >= 0
+
+
+def test_ib_error_event_records_leg_and_known_position():
+    state = make_state("CVDK", last=4.12)
+    state.conid = 12345
+    app = fire_live([state])
+    _contract, parent = app.ib.placed[0]
+    parent_trade = Trade(_contract, parent, OrderStatus(orderId=parent.orderId), [], [])
+    app.ib.held = [Position("DU1", _contract, 20.0, 4.12)]
+    add_fill(parent_trade, shares=20)
+    app._on_pad_parent_fill(parent_trade, parent_trade.fills[-1])
+    target_id = app.ib.placed[2][1].orderId
+
+    app._on_ib_order_error(target_id, 404, "Order held while securities are located.", None)
+
+    record = next(r for r in _read_order_history() if r["event"] == "IB_ERROR")
+    assert record["leg"] == "TARGET"
+    assert record["known_position"] == 20.0
+    assert record["target_qty"] == 20
+    assert record["ms_since_first_placed"] >= 0
 
 
 # -- cancellation and IB-side errors ------------------------------------------
@@ -298,6 +357,27 @@ def test_ib_error_on_a_tracked_order_surfaces_on_the_pad():
     app._on_ib_order_error(order_id, 201, "Order rejected - reason", None)
 
     assert any("201" in (r or "") for r in app.pad.results)
+
+
+def test_informational_ib_code_is_not_logged_as_an_error(caplog, monkeypatch):
+    state = make_state("CVDK", last=4.12)
+    state.conid = 12345
+    app = fire_live([state])
+    order_id = next(iter(app._pad_order_ids))
+    events = []
+    monkeypatch.setattr(
+        "momentum_scanner.app.order_history.log_event",
+        lambda ts, event, **fields: events.append(event),
+    )
+    before = list(app.pad.results)
+
+    with caplog.at_level("INFO", logger="momentum_scanner.app"):
+        app._on_ib_order_error(order_id, 2161, "price capped", None)
+
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("2161" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
+    assert events == ["IB_INFO"]
+    assert app.pad.results == before
 
 
 def test_ib_error_on_an_untracked_order_is_ignored():

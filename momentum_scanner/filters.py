@@ -277,10 +277,11 @@ def bump_candidate(
     indefinitely as long as nothing better is waiting for it; hidden from
     display (see display_reason) but otherwise left alone.
 
-    `pinned` holds the order pad's armed symbol (app.py's _pinned): you can't
-    place a bracket against a frozen sizing snapshot whose live quote has
-    been unsubscribed out from under it, so an armed symbol keeps its slot
-    unconditionally until it's disarmed. Unlike spike_held/slot_warmed_up
+    `pinned` holds the pool symbol the order pad is currently borrowing
+    (app.py's _pinned): the pad's numbers are computed live from that
+    symbol's feed, so unsubscribing it out from under a loaded pad would
+    leave it sizing from a dead quote. It keeps its slot unconditionally
+    until the pad releases it. Unlike spike_held/slot_warmed_up
     above, that exemption also has to hold against the two _evict_unqualified
     paths -- see app.py, which checks _pinned there too.
 
